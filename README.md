@@ -14,19 +14,13 @@
 
 ## 一键安装
 
-请先切到 `root` 用户，按系统复制对应命令。
-
-Debian / Ubuntu：
+请先切到 `root` 用户，然后复制这一条：
 
 ```bash
-apt-get update -y && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.2/install.sh -o wvpm.sh && bash wvpm.sh
+curl -L https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.3/install.sh | bash
 ```
 
-CentOS / AlmaLinux：
-
-```bash
-(dnf install -y curl ca-certificates || yum install -y curl ca-certificates) && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.2/install.sh -o wvpm.sh && bash wvpm.sh
-```
+如果系统提示 `curl: command not found`，先安装 `curl` 后再执行上面的命令。
 
 安装前脚本会先检查可用内存。如果可用内存低于 1G 且没有 Swap，会提示你创建 Swap 或自行承担安装失败风险。
 
