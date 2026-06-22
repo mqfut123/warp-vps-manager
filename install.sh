@@ -15,6 +15,7 @@ SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
 APP_VERSION_VALUE="0.1.0"
+APT_LOCK_TIMEOUT=1200
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -174,7 +175,7 @@ pkg_install_apt() {
   esac
 
   export DEBIAN_FRONTEND=noninteractive
-  log "如果系统自动更新正在占用 apt/dpkg，最多等待 5 分钟"
+  log "如果系统自动更新正在占用 apt/dpkg，最多等待 20 分钟"
   apt_get update -y
   apt_get install -y curl ca-certificates gnupg lsb-release nftables iptables iproute2 python3
 
@@ -204,7 +205,7 @@ EOF
 }
 
 apt_get() {
-  apt-get -o DPkg::Lock::Timeout=300 "$@"
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" "$@"
 }
 
 enable_rhel_extra_repos() {
