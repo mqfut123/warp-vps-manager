@@ -684,13 +684,26 @@ wg_ok() {
 }
 
 wait_for_wg_ready() {
-  local timeout="${1:-45}"
+  local timeout="${1:-90}"
   local end=$((SECONDS + timeout))
   while [ "$SECONDS" -le "$end" ]; do
     if wg_interface_exists && route_uses_wg4 8.8.8.8 && wg_ok; then
       return 0
     fi
     sleep 2
+  done
+  return 1
+}
+
+restart_wireguard_runtime() {
+  local attempt
+  for attempt in 1 2; do
+    systemctl restart "wg-quick@${WG_IFACE}.service" || return 1
+    apply_rules || return 1
+    if wait_for_wg_ready 90; then
+      return 0
+    fi
+    warn_line "WireGuard 出口暂未就绪，正在重试"
   done
   return 1
 }
@@ -995,9 +1008,7 @@ cmd_restart() {
   section "正在重启"
   if [ "$WARP_MODE" = "wireguard" ]; then
     info_line "正在重启 WireGuard WARP 网卡和分流路由，请稍等"
-    systemctl restart "wg-quick@${WG_IFACE}.service"
-    apply_rules
-    wait_for_wg_ready 45 || warn_line "WireGuard 已重启，但 WARP 出口暂未就绪"
+    restart_wireguard_runtime || die "重启后 WireGuard 出口不可用"
     systemctl restart warp-vps.service
     cmd_test
     return
@@ -1116,9 +1127,7 @@ reload_runtime_after_update() {
   systemctl daemon-reload || return 1
   if [ "$WARP_MODE" = "wireguard" ]; then
     systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null || return 1
-    systemctl restart "wg-quick@${WG_IFACE}.service" || return 1
-    "$BIN_PATH" apply || return 1
-    "$BIN_PATH" wait-wireguard || return 1
+    restart_wireguard_runtime || return 1
   else
     systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null || return 1
     "$BIN_PATH" apply || return 1
@@ -1167,9 +1176,7 @@ cmd_heal() {
   warn "健康检查失败，正在尝试自动修复"
   load_config
   if [ "$WARP_MODE" = "wireguard" ]; then
-    systemctl restart "wg-quick@${WG_IFACE}.service" || true
-    apply_rules
-    wait_for_wg_ready 45 || true
+    restart_wireguard_runtime || true
     if test_quiet; then
       log "自动修复成功"
     else
@@ -1193,7 +1200,7 @@ cmd_wait_wireguard() {
   require_root
   load_config
   [ "$WARP_MODE" = "wireguard" ] || die "当前不是 WireGuard 模式"
-  wait_for_wg_ready 45
+  wait_for_wg_ready 90
 }
 
 cmd_logs() {
