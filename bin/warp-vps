@@ -322,6 +322,7 @@ cmd_test() {
   require_root
   load_config
   local failed=0
+  local filter_rules=""
 
   printf 'WARP SOCKS port: %s\n' "$WARP_SOCKS_PORT"
   if port_listening "$WARP_SOCKS_PORT"; then
@@ -367,14 +368,15 @@ cmd_test() {
     failed=1
   fi
 
-  if nft list chain inet warp_vps output_filter 2>/dev/null | grep -Eq 'udp dport 443.*reject'; then
+  filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null || true)"
+  if grep -Eq 'udp dport 443.*reject' <<< "$filter_rules"; then
     printf 'Google UDP/443 block: configured\n'
   else
     printf 'Google UDP/443 block: missing\n'
     failed=1
   fi
 
-  if nft list chain inet warp_vps output_filter 2>/dev/null | grep -Eq 'ip6 daddr @google6.*reject'; then
+  if grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"; then
     printf 'IPv6 target leak block: configured\n'
   else
     printf 'IPv6 target leak block: missing\n'
