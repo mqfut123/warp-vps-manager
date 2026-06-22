@@ -174,15 +174,16 @@ pkg_install_apt() {
   esac
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y curl ca-certificates gnupg lsb-release nftables iptables iproute2 python3
+  log "如果系统自动更新正在占用 apt/dpkg，最多等待 5 分钟"
+  apt_get update -y
+  apt_get install -y curl ca-certificates gnupg lsb-release nftables iptables iproute2 python3
 
   if [ "$mode" = "wireguard" ]; then
-    apt-get install -y wireguard-tools
+    apt_get install -y wireguard-tools
     return
   fi
 
-  apt-get install -y redsocks
+  apt_get install -y redsocks
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
     | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -198,8 +199,12 @@ pkg_install_apt() {
   cat > /etc/apt/sources.list.d/cloudflare-client.list <<EOF
 deb [arch=${arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
 EOF
-  apt-get update -y
-  apt-get install -y cloudflare-warp
+  apt_get update -y
+  apt_get install -y cloudflare-warp
+}
+
+apt_get() {
+  apt-get -o DPkg::Lock::Timeout=300 "$@"
 }
 
 enable_rhel_extra_repos() {
