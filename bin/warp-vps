@@ -12,22 +12,58 @@ NFT_CONF="${ETC_DIR}/nftables.conf"
 RULES_DIR="${APP_DIR}/rules"
 BIN_PATH="/usr/local/bin/warp-vps"
 
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET=''
+  C_BOLD=''
+  C_RED=''
+  C_GREEN=''
+  C_YELLOW=''
+  C_CYAN=''
+fi
+
 log() { printf '[warp-vps] %s\n' "$*"; }
-warn() { printf '[warp-vps] WARN: %s\n' "$*" >&2; }
-die() { printf '[warp-vps] ERROR: %s\n' "$*" >&2; exit 1; }
+warn() { printf '[warp-vps] 警告：%s\n' "$*" >&2; }
+die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
+
+section() {
+  printf '\n%b%s%b\n' "$C_BOLD" "$1" "$C_RESET"
+}
+
+info_line() {
+  printf '%b%s%b %s\n' "$C_CYAN" "[信息]" "$C_RESET" "$1"
+}
+
+ok_line() {
+  printf '%b%s%b %s\n' "$C_GREEN" "[通过]" "$C_RESET" "$1"
+}
+
+fail_line() {
+  printf '%b%s%b %s\n' "$C_RED" "[失败]" "$C_RESET" "$1"
+}
+
+warn_line() {
+  printf '%b%s%b %s\n' "$C_YELLOW" "[注意]" "$C_RESET" "$1"
+}
 
 require_root() {
-  [ "$(id -u)" -eq 0 ] || die "must run as root"
+  [ "$(id -u)" -eq 0 ] || die "请使用 root 用户运行"
 }
 
 load_config() {
-  [ -r "$CONFIG_FILE" ] || die "missing config: $CONFIG_FILE"
+  [ -r "$CONFIG_FILE" ] || die "找不到配置文件：$CONFIG_FILE"
   local line key value
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       ''|\#*) continue ;;
       *=*) ;;
-      *) die "invalid config line in $CONFIG_FILE: $line" ;;
+      *) die "配置文件格式错误：$CONFIG_FILE: $line" ;;
     esac
     key="${line%%=*}"
     value="${line#*=}"
@@ -40,20 +76,20 @@ load_config() {
       REDSOCKS_UID) REDSOCKS_UID="$value" ;;
       REDSOCKS_GROUP) REDSOCKS_GROUP="$value" ;;
       REDSOCKS_BIN) REDSOCKS_BIN="$value" ;;
-      *) die "unknown config key in $CONFIG_FILE: $key" ;;
+      *) die "配置文件存在未知字段：$key" ;;
     esac
   done < "$CONFIG_FILE"
-  : "${WARP_SOCKS_PORT:?missing WARP_SOCKS_PORT}"
-  : "${REDSOCKS_PORT:?missing REDSOCKS_PORT}"
-  : "${REDSOCKS_USER:?missing REDSOCKS_USER}"
-  : "${REDSOCKS_UID:?missing REDSOCKS_UID}"
+  [ -n "${WARP_SOCKS_PORT:-}" ] || die "配置缺少 WARP_SOCKS_PORT"
+  [ -n "${REDSOCKS_PORT:-}" ] || die "配置缺少 REDSOCKS_PORT"
+  [ -n "${REDSOCKS_USER:-}" ] || die "配置缺少 REDSOCKS_USER"
+  [ -n "${REDSOCKS_UID:-}" ] || die "配置缺少 REDSOCKS_UID"
   REDSOCKS_GROUP="${REDSOCKS_GROUP:-$REDSOCKS_USER}"
-  : "${REDSOCKS_GROUP:?missing REDSOCKS_GROUP}"
-  : "${REDSOCKS_BIN:?missing REDSOCKS_BIN}"
-  : "${REPO_RAW_BASE:?missing REPO_RAW_BASE}"
-  valid_config_port "$WARP_SOCKS_PORT" || die "invalid WARP_SOCKS_PORT in config"
-  valid_config_port "$REDSOCKS_PORT" || die "invalid REDSOCKS_PORT in config"
-  case "$REDSOCKS_UID" in ''|*[!0-9]*) die "invalid REDSOCKS_UID in config" ;; esac
+  [ -n "${REDSOCKS_GROUP:-}" ] || die "配置缺少 REDSOCKS_GROUP"
+  [ -n "${REDSOCKS_BIN:-}" ] || die "配置缺少 REDSOCKS_BIN"
+  [ -n "${REPO_RAW_BASE:-}" ] || die "配置缺少 REPO_RAW_BASE"
+  valid_config_port "$WARP_SOCKS_PORT" || die "配置里的 WARP_SOCKS_PORT 不是有效端口"
+  valid_config_port "$REDSOCKS_PORT" || die "配置里的 REDSOCKS_PORT 不是有效端口"
+  case "$REDSOCKS_UID" in ''|*[!0-9]*) die "配置里的 REDSOCKS_UID 不是有效数字" ;; esac
   validate_repo_raw_base "$REPO_RAW_BASE"
 }
 
@@ -64,19 +100,19 @@ valid_config_port() {
 
 validate_repo_raw_base() {
   local url="$1"
-  [ -n "$url" ] || die "REPO_RAW_BASE cannot be empty"
+  [ -n "$url" ] || die "REPO_RAW_BASE 不能为空"
   case "$url" in
     https://*) ;;
-    *) die "REPO_RAW_BASE must start with https://" ;;
+    *) die "REPO_RAW_BASE 必须以 https:// 开头" ;;
   esac
   case "$url" in
-    *$'\n'*|*$'\r'*|*$'\t'*|*" "*) die "REPO_RAW_BASE must not contain whitespace" ;;
+    *$'\n'*|*$'\r'*|*$'\t'*|*" "*) die "REPO_RAW_BASE 不能包含空格或换行" ;;
   esac
   local rest="${url#https://}"
   local authority="${rest%%/*}"
   case "$authority" in
-    *@*) die "REPO_RAW_BASE must not contain credentials or userinfo" ;;
-    '') die "REPO_RAW_BASE missing host" ;;
+    *@*) die "REPO_RAW_BASE 不能包含账号密码信息" ;;
+    '') die "REPO_RAW_BASE 缺少域名" ;;
   esac
 }
 
@@ -108,19 +144,19 @@ for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
     if not line or line.startswith("#"):
         continue
     if line != raw or any(ch.isspace() for ch in line):
-        raise SystemExit(f"{path}:{lineno}: invalid whitespace")
+        raise SystemExit(f"{path}:{lineno}: 存在非法空格")
     network = ipaddress.ip_network(line, strict=True)
     if network.version != version:
-        raise SystemExit(f"{path}:{lineno}: expected IPv{version}, got IPv{network.version}")
+        raise SystemExit(f"{path}:{lineno}: 需要 IPv{version}，实际是 IPv{network.version}")
     seen += 1
 if seen == 0:
-    raise SystemExit(f"{path}: no rules")
+    raise SystemExit(f"{path}: 规则为空")
 PY
 }
 
 join_rules() {
   local file="$1"
-  [ -r "$file" ] || die "missing rule file: $file"
+  [ -r "$file" ] || die "找不到规则文件：$file"
   awk 'NF && $1 !~ /^#/ { printf "%s%s", sep, $1; sep=", " } END { print "" }' "$file"
 }
 
@@ -151,8 +187,8 @@ render_nft_conf() {
   validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
   google4="$(join_rules "${RULES_DIR}/google_ipv4.txt")"
   google6="$(join_rules "${RULES_DIR}/google_ipv6.txt")"
-  [ -n "$google4" ] || die "IPv4 rules are empty"
-  [ -n "$google6" ] || die "IPv6 rules are empty"
+  [ -n "$google4" ] || die "IPv4 规则为空"
+  [ -n "$google6" ] || die "IPv6 规则为空"
 
   local table_action
   if table_exists; then
@@ -207,7 +243,7 @@ install_systemd() {
 
   cat > /etc/systemd/system/warp-vps-redsocks.service <<EOF
 [Unit]
-Description=WARP VPS Manager redsocks bridge
+Description=WARP VPS Manager redsocks 转发服务
 After=network-online.target warp-svc.service
 Wants=network-online.target
 
@@ -229,7 +265,7 @@ EOF
 
   cat > /etc/systemd/system/warp-vps.service <<EOF
 [Unit]
-Description=WARP VPS Manager system-level Google split routing
+Description=WARP VPS Manager Google 系统级分流
 After=network-online.target warp-svc.service warp-vps-redsocks.service
 Wants=network-online.target warp-vps-redsocks.service
 
@@ -245,7 +281,7 @@ EOF
 
   cat > /etc/systemd/system/warp-vps-health.service <<EOF
 [Unit]
-Description=WARP VPS Manager health check
+Description=WARP VPS Manager 健康检查
 After=network-online.target warp-vps.service
 
 [Service]
@@ -255,7 +291,7 @@ EOF
 
   cat > /etc/systemd/system/warp-vps-health.timer <<'EOF'
 [Unit]
-Description=Run WARP VPS Manager health check
+Description=定时运行 WARP VPS Manager 健康检查
 
 [Timer]
 OnBootSec=2min
@@ -323,106 +359,136 @@ test_quiet() {
   local before after
   before="$(google_counter)"
   [ -n "$before" ] || return 1
-  curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 || return 1
+  curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1 || return 1
   after="$(google_counter)"
   [ -n "$after" ] || return 1
   [ "$after" -gt "$before" ] || return 1
 }
 
-cmd_test() {
-  require_root
-  load_config
+print_rule_summary() {
+  section "规则快照"
+  if [ ! -r "${RULES_DIR}/rules.meta.json" ]; then
+    warn_line "找不到规则快照：${RULES_DIR}/rules.meta.json"
+    return 1
+  fi
+  python3 - "${RULES_DIR}/rules.meta.json" <<'PY' | while IFS= read -r line; do
+import json
+import pathlib
+import sys
+
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+source = meta.get("source", {})
+print(f"Google 官方发布时间：{source.get('goog_creation_time', '未知')}")
+print(f"本地规则生成时间：{meta.get('generated_at', '未知')}")
+print(f"IPv4 规则数量：{meta.get('ipv4_count', '未知')}")
+print(f"IPv6 规则数量：{meta.get('ipv6_count', '未知')}")
+PY
+    info_line "$line"
+  done
+}
+
+run_self_check() {
   local failed=0
   local filter_rules=""
+  local before after
 
-  printf 'WARP SOCKS port: %s\n' "$WARP_SOCKS_PORT"
+  section "状态自检"
+  info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
+
   if wait_for_socks_listen 8; then
-    printf 'WARP SOCKS listen: ok\n'
+    ok_line "WARP 本地 SOCKS 已启动"
   else
-    printf 'WARP SOCKS listen: failed\n'
+    fail_line "WARP 本地 SOCKS 没有监听"
     failed=1
   fi
 
   if socks_ok; then
-    printf 'WARP trace: ok\n'
+    ok_line "WARP 出口可用"
   else
-    printf 'WARP trace: failed\n'
+    fail_line "WARP 出口不可用"
     failed=1
   fi
 
   if service_active warp-vps-redsocks.service; then
-    printf 'redsocks service: ok\n'
+    ok_line "本地透明转发服务正常"
   else
-    printf 'redsocks service: failed\n'
+    fail_line "本地透明转发服务未运行"
     failed=1
   fi
 
   if table_exists; then
-    printf 'nftables table: ok\n'
+    ok_line "系统分流规则已加载"
   else
-    printf 'nftables table: failed\n'
+    fail_line "系统分流规则未加载"
     failed=1
   fi
 
-  local before after
   before="$(google_counter || true)"
-  if [ -n "$before" ] && curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204; then
+  if [ -n "$before" ] && curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1; then
     after="$(google_counter || true)"
     if [ -n "$after" ] && [ "$after" -gt "$before" ]; then
-      printf 'Google TCP rule hit: ok\n'
+      ok_line "Google 测试流量已走 WARP 分流"
     else
-      printf 'Google TCP rule hit: failed\n'
+      fail_line "Google 测试流量没有命中分流规则"
       failed=1
     fi
   else
-    printf 'Google TCP probe: failed\n'
+    fail_line "Google 测试请求失败"
     failed=1
   fi
 
   filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null || true)"
   if grep -Eq 'udp dport 443.*reject' <<< "$filter_rules"; then
-    printf 'Google UDP/443 block: configured\n'
+    ok_line "已阻断 Google/YouTube QUIC，防止 UDP 直连绕过"
   else
-    printf 'Google UDP/443 block: missing\n'
+    fail_line "未找到 UDP/443 阻断规则"
     failed=1
   fi
 
   if grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"; then
-    printf 'IPv6 target leak block: configured\n'
+    ok_line "已阻断 Google 目标 IPv6，防止 IPv6 泄漏"
   else
-    printf 'IPv6 target leak block: missing\n'
+    fail_line "未找到 Google IPv6 防泄漏规则"
     failed=1
   fi
 
-  [ "$failed" -eq 0 ] || return 1
-  printf 'Result: ok\n'
+  section "结论"
+  if [ "$failed" -eq 0 ]; then
+    ok_line "当前正常。Google、YouTube、Gemini 命中规则的 TCP 流量会走 WARP。"
+    return 0
+  fi
+
+  fail_line "当前异常。请先运行：warp-vps restart"
+  warn_line "如果重启后仍失败，请运行：warp-vps logs"
+  return 1
+}
+
+cmd_test() {
+  require_root
+  load_config
+  run_self_check
 }
 
 cmd_status() {
   require_root
   load_config
-  printf 'Version: %s\n' "${APP_VERSION:-unknown}"
-  printf 'Repo: %s\n' "$(mask_repo_url "$REPO_RAW_BASE")"
-  printf 'WARP SOCKS port: %s\n' "$WARP_SOCKS_PORT"
-  printf 'redsocks port: %s\n' "$REDSOCKS_PORT"
-  printf 'WARP status:\n'
-  timeout 20 warp-cli --accept-tos status 2>/dev/null || timeout 20 warp-cli status 2>/dev/null || true
-  printf '\nServices:\n'
-  systemctl --no-pager --plain --lines=0 status warp-vps-redsocks.service warp-vps.service warp-vps-health.timer 2>/dev/null || true
-  printf '\nRule snapshot:\n'
-  if [ -r "${RULES_DIR}/rules.meta.json" ]; then
-    sed -n '1,120p' "${RULES_DIR}/rules.meta.json"
-  else
-    warn "missing ${RULES_DIR}/rules.meta.json"
-  fi
+  section "当前配置"
+  info_line "工作模式：Google / YouTube / Gemini 走 WARP，普通流量直连"
+  info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
+  info_line "本地转发端口：${REDSOCKS_PORT}"
+  info_line "更新地址：$(mask_repo_url "$REPO_RAW_BASE")"
+  print_rule_summary || true
+  run_self_check
 }
 
 cmd_restart() {
   require_root
   load_config
+  section "正在重启"
+  info_line "正在重启 WARP 和本地分流服务，请稍等"
   systemctl restart warp-svc >/dev/null 2>&1 || true
   ensure_warp_connected
-  wait_for_socks_listen 20 || die "WARP SOCKS port did not listen after restarting warp-svc"
+  wait_for_socks_listen 20 || die "重启后 WARP SOCKS 端口没有监听"
   systemctl restart warp-vps-redsocks.service
   apply_rules
   systemctl restart warp-vps.service
@@ -450,9 +516,9 @@ meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 ipv4 = [line for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
 ipv6 = [line for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
 if meta.get("ipv4_count") != len(ipv4):
-    raise SystemExit("rules.meta.json ipv4_count mismatch")
+    raise SystemExit("rules.meta.json 的 IPv4 数量不一致")
 if meta.get("ipv6_count") != len(ipv6):
-    raise SystemExit("rules.meta.json ipv6_count mismatch")
+    raise SystemExit("rules.meta.json 的 IPv6 数量不一致")
 PY
 }
 
@@ -460,6 +526,8 @@ cmd_update() {
   require_root
   load_config
   local stage="${STATE_DIR}/downloads/$(date -u +%Y%m%dT%H%M%SZ)"
+  section "正在更新"
+  info_line "正在从 GitHub 同步脚本和固定规则快照"
   install -d -m 0755 "${stage}/bin" "${stage}/rules"
   download_update_asset "install.sh" "${stage}/install.sh"
   download_update_asset "bin/warp-vps" "${stage}/bin/warp-vps"
@@ -476,25 +544,26 @@ cmd_update() {
   "$BIN_PATH" apply
   systemctl restart warp-vps-redsocks.service
   systemctl restart warp-vps.service
+  ok_line "更新完成，正在运行自检"
   "$BIN_PATH" test
 }
 
 cmd_heal() {
   require_root
   if test_quiet; then
-    log "health check ok"
+    log "健康检查正常"
     return 0
   fi
-  warn "health check failed; restarting local WARP path"
+  warn "健康检查失败，正在尝试自动修复"
   systemctl restart warp-svc >/dev/null 2>&1 || true
   ensure_warp_connected
-  wait_for_socks_listen 20 || die "WARP SOCKS port did not listen after restarting warp-svc"
+  wait_for_socks_listen 20 || die "自动修复后 WARP SOCKS 端口仍未监听"
   systemctl restart warp-vps-redsocks.service || true
   apply_rules
   if test_quiet; then
-    log "health recovered"
+    log "自动修复成功"
   else
-    die "health recovery failed"
+    die "自动修复失败，请运行 warp-vps logs 查看日志"
   fi
 }
 
@@ -525,25 +594,27 @@ cmd_uninstall() {
   safe_move_if_exists "$APP_DIR" "$backup_dir"
   safe_move_if_exists "$BIN_PATH" "$backup_dir"
   systemctl daemon-reload
-  printf 'WARP VPS Manager files moved to backup: %s\n' "$backup_dir"
-  printf 'Installed packages were left in place.\n'
+  printf 'WARP VPS Manager 已卸载，文件已移动到备份目录：%s\n' "$backup_dir"
+  printf '系统依赖包已保留，不会被删除。\n'
 }
 
 usage() {
   cat <<'EOF'
-Usage: warp-vps <command>
+用法：warp-vps <命令>
 
-Commands:
-  status          Show configuration, services, and rule snapshot
-  test            Verify WARP SOCKS, redsocks, nftables, and Google rule hit
-  restart         Restart WARP path and re-apply rules
-  update          Pull latest project files and fixed rules from GitHub
-  logs            Show recent service logs
-  heal            Run health check and bounded recovery
-  apply           Re-render configs and apply nftables rules
-  stop-rules      Remove only the warp_vps nftables table
-  install-systemd Install systemd unit files
-  uninstall       Stop services and move installed files to backup
+常用命令：
+  status          查看中文状态自检
+  test            运行一次中文自检
+  restart         重启 WARP 分流链路
+  update          更新脚本和固定规则快照
+  logs            查看最近日志
+  uninstall       卸载并移动文件到备份目录
+
+内部命令：
+  heal            健康检查和自动修复
+  apply           重新生成并加载分流规则
+  stop-rules      移除本项目 nftables 规则
+  install-systemd 安装 systemd 服务
 EOF
 }
 

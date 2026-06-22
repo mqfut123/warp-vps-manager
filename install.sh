@@ -13,14 +13,14 @@ REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
 APP_VERSION_VALUE="0.1.0"
 
 log() { printf '[warp-vps] %s\n' "$*"; }
-die() { printf '[warp-vps] ERROR: %s\n' "$*" >&2; exit 1; }
+die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
 
 require_root() {
-  [ "$(id -u)" -eq 0 ] || die "must run as root"
+  [ "$(id -u)" -eq 0 ] || die "请使用 root 用户运行"
 }
 
 load_os_release() {
-  [ -r /etc/os-release ] || die "cannot read /etc/os-release"
+  [ -r /etc/os-release ] || die "无法读取 /etc/os-release"
   # shellcheck disable=SC1091
   . /etc/os-release
   OS_ID="${ID:-}"
@@ -34,17 +34,17 @@ pkg_install_apt() {
     ubuntu)
       case "$OS_VERSION_MAJOR" in
         22|24) ;;
-        *) die "unsupported Ubuntu version: ${OS_VERSION_ID:-unknown}; supported LTS versions: 22.04, 24.04" ;;
+        *) die "不支持当前 Ubuntu 版本：${OS_VERSION_ID:-未知}；支持版本：22.04、24.04" ;;
       esac
       ;;
     debian)
       case "$OS_VERSION_MAJOR" in
         12|13) ;;
-        *) die "unsupported Debian version: ${OS_VERSION_ID:-unknown}; supported versions: 12, 13" ;;
+        *) die "不支持当前 Debian 版本：${OS_VERSION_ID:-未知}；支持版本：12、13" ;;
       esac
       ;;
     *)
-      die "unsupported apt OS: ${OS_ID:-unknown}"
+      die "不支持当前 apt 系统：${OS_ID:-未知}"
       ;;
   esac
 
@@ -60,7 +60,7 @@ pkg_install_apt() {
   if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
     codename="$(lsb_release -cs)"
   fi
-  [ -n "$codename" ] || die "cannot determine apt codename for Cloudflare WARP repository"
+  [ -n "$codename" ] || die "无法识别当前系统代号，不能配置 Cloudflare WARP 软件源"
 
   local arch
   arch="$(dpkg --print-architecture)"
@@ -87,16 +87,19 @@ enable_rhel_extra_repos() {
 pkg_install_rpm() {
   case "$OS_ID" in
     centos)
-      [ "$OS_VERSION_MAJOR" = "8" ] || die "unsupported CentOS version: ${OS_VERSION_ID:-unknown}; Cloudflare WARP officially supports CentOS 8"
+      case "$OS_VERSION_MAJOR" in
+        8|9) ;;
+        *) die "不支持当前 CentOS 版本：${OS_VERSION_ID:-未知}；支持版本：8、9" ;;
+      esac
       ;;
     rhel|rocky|almalinux)
       case "$OS_VERSION_MAJOR" in
         8|9) ;;
-        *) die "unsupported ${OS_ID} version: ${OS_VERSION_ID:-unknown}; supported major versions: 8, 9" ;;
+        *) die "不支持当前 ${OS_ID} 版本：${OS_VERSION_ID:-未知}；支持主版本：8、9" ;;
       esac
       ;;
     *)
-      die "unsupported RPM OS: ${OS_ID:-unknown}"
+      die "不支持当前 RPM 系统：${OS_ID:-未知}"
       ;;
   esac
 
@@ -121,16 +124,16 @@ install_dependencies() {
       pkg_install_rpm
       ;;
     *)
-      die "unsupported OS: ${OS_ID:-unknown}; supported: Debian, Ubuntu, CentOS, RHEL, Rocky, AlmaLinux"
+      die "不支持当前系统：${OS_ID:-未知}；支持 Debian、Ubuntu、CentOS、RHEL、Rocky、AlmaLinux"
       ;;
   esac
 
-  command -v warp-cli >/dev/null 2>&1 || die "cloudflare-warp installed but warp-cli not found"
-  command -v redsocks >/dev/null 2>&1 || die "redsocks not found after dependency installation"
-  command -v nft >/dev/null 2>&1 || die "nft not found after dependency installation"
-  command -v ss >/dev/null 2>&1 || die "ss not found after dependency installation"
-  command -v timeout >/dev/null 2>&1 || die "timeout not found after dependency installation"
-  command -v python3 >/dev/null 2>&1 || die "python3 not found after dependency installation"
+  command -v warp-cli >/dev/null 2>&1 || die "cloudflare-warp 已安装但找不到 warp-cli"
+  command -v redsocks >/dev/null 2>&1 || die "依赖安装后仍找不到 redsocks"
+  command -v nft >/dev/null 2>&1 || die "依赖安装后仍找不到 nftables"
+  command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
+  command -v timeout >/dev/null 2>&1 || die "依赖安装后仍找不到 timeout"
+  command -v python3 >/dev/null 2>&1 || die "依赖安装后仍找不到 python3"
 }
 
 reserved_port() {
@@ -185,7 +188,7 @@ find_free_port() {
     fi
     i=$((i + 1))
   done
-  die "failed to find a free high port"
+  die "没有找到可用的高位端口"
 }
 
 prompt_warp_port() {
@@ -193,7 +196,7 @@ prompt_warp_port() {
   if [ -n "${WARP_SOCKS_PORT:-}" ]; then
     input="$WARP_SOCKS_PORT"
   else
-    printf 'Enter WARP SOCKS port [press Enter for a random free port]: ' >&2
+    printf '请输入 WARP SOCKS 端口（直接回车随机选择空闲端口）：' >&2
     read -r input
   fi
 
@@ -202,9 +205,9 @@ prompt_warp_port() {
     return 0
   fi
 
-  valid_port "$input" || die "invalid port: $input"
-  reserved_port "$input" && die "port $input is reserved by a common service"
-  port_in_use "$input" && die "port $input is already listening"
+  valid_port "$input" || die "端口无效：$input"
+  reserved_port "$input" && die "端口 $input 是常见服务端口，请换一个"
+  port_in_use "$input" && die "端口 $input 已被占用，请换一个"
   printf '%s\n' "$input"
 }
 
@@ -217,19 +220,19 @@ disable_packaged_redsocks_service() {
 
 validate_repo_raw_base() {
   local url="$1"
-  [ -n "$url" ] || die "WARP_VPS_REPO_BASE cannot be empty"
+  [ -n "$url" ] || die "WARP_VPS_REPO_BASE 不能为空"
   case "$url" in
     https://*) ;;
-    *) die "WARP_VPS_REPO_BASE must start with https://" ;;
+    *) die "WARP_VPS_REPO_BASE 必须以 https:// 开头" ;;
   esac
   case "$url" in
-    *$'\n'*|*$'\r'*|*$'\t'*|*" "*) die "WARP_VPS_REPO_BASE must not contain whitespace" ;;
+    *$'\n'*|*$'\r'*|*$'\t'*|*" "*) die "WARP_VPS_REPO_BASE 不能包含空格或换行" ;;
   esac
   local rest="${url#https://}"
   local authority="${rest%%/*}"
   case "$authority" in
-    *@*) die "WARP_VPS_REPO_BASE must not contain credentials or userinfo" ;;
-    '') die "WARP_VPS_REPO_BASE missing host" ;;
+    *@*) die "WARP_VPS_REPO_BASE 不能包含账号密码信息" ;;
+    '') die "WARP_VPS_REPO_BASE 缺少域名" ;;
   esac
 }
 
@@ -283,11 +286,11 @@ configure_warp() {
     || timeout 30 warp-cli proxy port "$port" >/dev/null 2>&1
   timeout 60 warp-cli --accept-tos connect >/dev/null 2>&1 || timeout 60 warp-cli connect >/dev/null 2>&1
   if ! wait_for_tcp_port "$port" 20; then
-    die "warp-cli did not listen on SOCKS port $port"
+    die "warp-cli 没有监听 SOCKS 端口 $port"
   fi
   if ! curl --socks5-hostname "127.0.0.1:${port}" -fsS --connect-timeout 8 --max-time 15 \
     https://www.cloudflare.com/cdn-cgi/trace | grep -Eq '^warp=(on|plus)$'; then
-    die "WARP SOCKS trace did not report warp=on"
+    die "WARP SOCKS 测试没有返回 warp=on"
   fi
 }
 
@@ -313,41 +316,41 @@ EOF
 main() {
   require_root
   validate_repo_raw_base "$REPO_RAW_BASE"
-  log "installing dependencies"
+  log "正在安装依赖"
   install_dependencies
 
   local warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
   warp_port="$(prompt_warp_port)"
-  valid_port "$warp_port" || die "internal error: selected WARP SOCKS port is invalid"
+  valid_port "$warp_port" || die "内部错误：选择的 WARP SOCKS 端口无效"
   redsocks_port="$(find_free_port "$warp_port")"
-  valid_port "$redsocks_port" || die "internal error: selected redsocks port is invalid"
+  valid_port "$redsocks_port" || die "内部错误：选择的 redsocks 端口无效"
   ensure_redsocks_user
   redsocks_uid="$(id -u "$REDSOCKS_USER")"
   redsocks_group="$(id -gn "$REDSOCKS_USER")"
   redsocks_bin="$(command -v redsocks)"
 
-  log "installing project files"
+  log "正在安装项目文件"
   disable_packaged_redsocks_service
   install_project_files
   write_config "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
 
-  log "configuring Cloudflare WARP SOCKS on port $warp_port"
+  log "正在配置 Cloudflare WARP SOCKS，端口：$warp_port"
   configure_warp "$warp_port"
 
-  log "installing services and nftables rules"
+  log "正在安装系统服务和分流规则"
   "$BIN_PATH" install-systemd
   systemctl daemon-reload
   systemctl enable --now warp-vps-redsocks.service
   systemctl enable --now warp-vps.service
   systemctl enable --now warp-vps-health.timer
 
-  log "running final test"
+  log "正在运行最终自检"
   "$BIN_PATH" test
 
-  printf '\nWARP VPS Manager installed.\n'
-  printf 'WARP SOCKS port: %s\n' "$warp_port"
-  printf 'Management command: warp-vps {status|test|restart|update|logs|uninstall}\n'
-  printf 'IPv6 target traffic is blocked to prevent leak.\n'
+  printf '\nWARP VPS Manager 安装完成。\n'
+  printf 'WARP SOCKS 端口：%s\n' "$warp_port"
+  printf '管理命令：warp-vps {status|test|restart|update|logs|uninstall}\n'
+  printf '已默认阻断 Google 目标 IPv6，避免 IPv6 泄漏。\n'
 }
 
 main "$@"

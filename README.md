@@ -39,7 +39,8 @@ sudo -E bash -c 'bash <(curl -fsSL "$WARP_VPS_REPO_BASE/install.sh")'
 - Google 目标 IPv6 默认阻断，避免 IPv6 泄漏。
 - 规则快照固定在本仓库，用户机器不会后台自动抓取 Google 规则。
 - `warp-vps update` 同步脚本和固定规则快照。
-- health timer 定期检测 WARP SOCKS、redsocks、nftables 和 Google 规则命中，异常时做有界恢复。
+- `warp-vps status` 和 `warp-vps test` 使用中文彩色自检输出，小白也能直接看懂是否正常。
+- 健康检查定时器会定期检测 WARP SOCKS、redsocks、nftables 和 Google 规则命中，异常时做有界恢复。
 - 卸载时移动到时间戳备份目录，不永久删除安装文件。
 
 ## 和其他方案有什么不同
@@ -87,12 +88,12 @@ IPv6: 84
 - Debian 12
 - Debian 13
 - Ubuntu 22.04 LTS / 24.04 LTS
-- CentOS 8
+- CentOS 8 / 9
 - RHEL 8 / 9
 - Rocky Linux 8 / 9
 - AlmaLinux 8 / 9
 
-CentOS 7 不支持。Cloudflare WARP 官方 Linux 支持列表当前只覆盖 CentOS 8、RHEL 8/9、Debian 12/13、Ubuntu 22.04/24.04 等现代发行版。
+CentOS 7 不支持。CentOS 9 按 RHEL 9 / CentOS Stream 9 兼容路径安装；如果你的镜像源缺少 EPEL、CRB/PowerTools 或 `nftables` NAT 能力，脚本会 fail-fast。
 
 如果 VPS 或容器内核缺少 `nftables` NAT 能力，安装会 fail-fast。
 
@@ -109,7 +110,8 @@ warp-vps uninstall
 
 常用判断：
 
-- `warp-vps test`：验证 WARP SOCKS、redsocks、nftables、Google TCP 命中、UDP/443 阻断、IPv6 防泄漏规则。
+- `warp-vps status`：显示当前配置、规则快照和中文彩色状态自检。
+- `warp-vps test`：只运行中文彩色状态自检。
 - `warp-vps restart`：重启本地 WARP 分流链路并重新加载规则。
 - `warp-vps update`：从配置的 GitHub raw 地址拉取最新脚本和固定规则快照。
 - `warp-vps uninstall`：停止服务并把安装文件移动到备份目录，系统包保留。
@@ -154,7 +156,7 @@ for name, expected in [("google_ipv4.txt", meta["ipv4_count"]), ("google_ipv6.tx
     assert len(lines) == expected
     for line in lines:
         ipaddress.ip_network(line)
-print("rules ok")
+print("规则检查通过")
 PY
 ```
 
