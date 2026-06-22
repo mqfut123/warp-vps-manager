@@ -17,7 +17,7 @@
 请先切到 `root` 用户，然后复制这一条：
 
 ```bash
-curl -L https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.3/install.sh | bash
+curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.4/install.sh | bash
 ```
 
 如果系统提示 `curl: command not found`，先安装 `curl` 后再执行上面的命令。
