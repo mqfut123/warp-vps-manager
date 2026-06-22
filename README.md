@@ -19,13 +19,13 @@
 Debian / Ubuntu：
 
 ```bash
-apt-get update -y && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1/install.sh -o wvpm.sh && bash wvpm.sh
+apt-get update -y && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.2/install.sh -o wvpm.sh && bash wvpm.sh
 ```
 
 CentOS / AlmaLinux：
 
 ```bash
-(dnf install -y curl ca-certificates || yum install -y curl ca-certificates) && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1/install.sh -o wvpm.sh && bash wvpm.sh
+(dnf install -y curl ca-certificates || yum install -y curl ca-certificates) && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.2/install.sh -o wvpm.sh && bash wvpm.sh
 ```
 
 安装前脚本会先检查可用内存。如果可用内存低于 1G 且没有 Swap，会提示你创建 Swap 或自行承担安装失败风险。
