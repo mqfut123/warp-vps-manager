@@ -11,6 +11,9 @@ REDSOCKS_CONF="${ETC_DIR}/redsocks.conf"
 NFT_CONF="${ETC_DIR}/nftables.conf"
 RULES_DIR="${APP_DIR}/rules"
 BIN_PATH="/usr/local/bin/warp-vps"
+DEFAULT_WG_IFACE="warp-vps-wg"
+DEFAULT_WGCF_BIN="${APP_DIR}/bin/wgcf"
+DEFAULT_WG_CONFIG="/etc/wireguard/${DEFAULT_WG_IFACE}.conf"
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -70,25 +73,39 @@ load_config() {
     case "$key" in
       APP_VERSION) APP_VERSION="$value" ;;
       REPO_RAW_BASE) REPO_RAW_BASE="$value" ;;
+      WARP_MODE) WARP_MODE="$value" ;;
       WARP_SOCKS_PORT) WARP_SOCKS_PORT="$value" ;;
       REDSOCKS_PORT) REDSOCKS_PORT="$value" ;;
       REDSOCKS_USER) REDSOCKS_USER="$value" ;;
       REDSOCKS_UID) REDSOCKS_UID="$value" ;;
       REDSOCKS_GROUP) REDSOCKS_GROUP="$value" ;;
       REDSOCKS_BIN) REDSOCKS_BIN="$value" ;;
+      WG_IFACE) WG_IFACE="$value" ;;
+      WGCF_BIN) WGCF_BIN="$value" ;;
+      WG_CONFIG) WG_CONFIG="$value" ;;
       *) die "配置文件存在未知字段：$key" ;;
     esac
   done < "$CONFIG_FILE"
-  [ -n "${WARP_SOCKS_PORT:-}" ] || die "配置缺少 WARP_SOCKS_PORT"
-  [ -n "${REDSOCKS_PORT:-}" ] || die "配置缺少 REDSOCKS_PORT"
+  WARP_MODE="${WARP_MODE:-socks}"
+  case "$WARP_MODE" in
+    socks|wireguard) ;;
+    *) die "配置里的 WARP_MODE 无效：$WARP_MODE" ;;
+  esac
+  WG_IFACE="${WG_IFACE:-$DEFAULT_WG_IFACE}"
+  WGCF_BIN="${WGCF_BIN:-$DEFAULT_WGCF_BIN}"
+  WG_CONFIG="${WG_CONFIG:-/etc/wireguard/${WG_IFACE}.conf}"
+  [ -n "${WARP_SOCKS_PORT:-}" ] || WARP_SOCKS_PORT=0
+  [ -n "${REDSOCKS_PORT:-}" ] || REDSOCKS_PORT=0
   [ -n "${REDSOCKS_USER:-}" ] || die "配置缺少 REDSOCKS_USER"
   [ -n "${REDSOCKS_UID:-}" ] || die "配置缺少 REDSOCKS_UID"
   REDSOCKS_GROUP="${REDSOCKS_GROUP:-$REDSOCKS_USER}"
   [ -n "${REDSOCKS_GROUP:-}" ] || die "配置缺少 REDSOCKS_GROUP"
   [ -n "${REDSOCKS_BIN:-}" ] || die "配置缺少 REDSOCKS_BIN"
   [ -n "${REPO_RAW_BASE:-}" ] || die "配置缺少 REPO_RAW_BASE"
-  valid_config_port "$WARP_SOCKS_PORT" || die "配置里的 WARP_SOCKS_PORT 不是有效端口"
-  valid_config_port "$REDSOCKS_PORT" || die "配置里的 REDSOCKS_PORT 不是有效端口"
+  if [ "$WARP_MODE" = "socks" ]; then
+    valid_config_port "$WARP_SOCKS_PORT" || die "配置里的 WARP_SOCKS_PORT 不是有效端口"
+    valid_config_port "$REDSOCKS_PORT" || die "配置里的 REDSOCKS_PORT 不是有效端口"
+  fi
   case "$REDSOCKS_UID" in ''|*[!0-9]*) die "配置里的 REDSOCKS_UID 不是有效数字" ;; esac
   validate_repo_raw_base "$REPO_RAW_BASE"
 }
@@ -215,6 +232,122 @@ EOF
   chmod 0644 "$NFT_CONF"
 }
 
+wg_interface_exists() {
+  ip link show "$WG_IFACE" >/dev/null 2>&1
+}
+
+wgcf_asset_keyword() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'linux_amd64\n' ;;
+    aarch64|arm64) printf 'linux_arm64\n' ;;
+    armv7l) printf 'linux_armv7\n' ;;
+    armv6l) printf 'linux_armv6\n' ;;
+    armv5*) printf 'linux_armv5\n' ;;
+    i386|i686) printf 'linux_386\n' ;;
+    *) die "WireGuard 模式暂不支持当前 CPU 架构：$(uname -m)" ;;
+  esac
+}
+
+install_wgcf_binary() {
+  [ -x "$WGCF_BIN" ] && return 0
+  install -d -m 0755 "$(dirname "$WGCF_BIN")"
+  local keyword
+  keyword="$(wgcf_asset_keyword)"
+  python3 - "$keyword" "$WGCF_BIN" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+import urllib.request
+
+keyword = sys.argv[1]
+dest = pathlib.Path(sys.argv[2])
+with urllib.request.urlopen("https://api.github.com/repos/ViRb3/wgcf/releases/latest", timeout=30) as response:
+    release = json.loads(response.read())
+matches = [
+    asset["browser_download_url"]
+    for asset in release.get("assets", [])
+    if keyword in asset.get("name", "") and "sha" not in asset.get("name", "").lower()
+]
+if len(matches) != 1:
+    raise SystemExit(f"无法确定 wgcf 下载地址，匹配数量：{len(matches)}")
+with urllib.request.urlopen(matches[0], timeout=120) as response:
+    data = response.read()
+dest.write_bytes(data)
+dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+print(f"已下载 wgcf：{release.get('tag_name', 'unknown')}")
+PY
+}
+
+generate_wg_config() {
+  [ -r "$WG_CONFIG" ] && return 0
+  install -d -m 0700 /etc/wireguard "${STATE_DIR}/wgcf"
+  install_wgcf_binary
+  (
+    cd "${STATE_DIR}/wgcf"
+    if [ ! -s wgcf-account.toml ]; then
+      printf 'yes\n' | "$WGCF_BIN" register >/dev/null
+    fi
+    "$WGCF_BIN" generate >/dev/null
+  )
+  [ -r "${STATE_DIR}/wgcf/wgcf-profile.conf" ] || die "wgcf 没有生成 WireGuard 配置"
+  python3 - "${STATE_DIR}/wgcf/wgcf-profile.conf" "$WG_CONFIG" <<'PY'
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1])
+dst = pathlib.Path(sys.argv[2])
+lines = src.read_text(encoding="utf-8").splitlines()
+out = []
+inserted = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("DNS"):
+        continue
+    if stripped.startswith("Table"):
+        continue
+    out.append(line)
+    if stripped == "[Interface]" and not inserted:
+        out.append("Table = off")
+        inserted = True
+if not inserted:
+    raise SystemExit("WireGuard 配置缺少 [Interface]")
+dst.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+PY
+  chmod 0600 "$WG_CONFIG"
+}
+
+route_file_lines() {
+  local file="$1"
+  awk 'NF && $1 !~ /^#/ { print $1 }' "$file"
+}
+
+apply_wg_routes() {
+  load_config
+  validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4
+  validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
+  wg_interface_exists || die "WireGuard 网卡不存在：$WG_IFACE"
+  while IFS= read -r cidr; do
+    ip -4 route replace "$cidr" dev "$WG_IFACE"
+  done < <(route_file_lines "${RULES_DIR}/google_ipv4.txt")
+  while IFS= read -r cidr; do
+    ip -6 route replace "$cidr" dev "$WG_IFACE" 2>/dev/null || true
+  done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
+}
+
+stop_wg_routes() {
+  [ -r "${RULES_DIR}/google_ipv4.txt" ] || return 0
+  while IFS= read -r cidr; do
+    ip -4 route del "$cidr" dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" 2>/dev/null || true
+  done < <(route_file_lines "${RULES_DIR}/google_ipv4.txt")
+  if [ -r "${RULES_DIR}/google_ipv6.txt" ]; then
+    while IFS= read -r cidr; do
+      ip -6 route del "$cidr" dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" 2>/dev/null || true
+    done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
+  fi
+}
+
 table_exists() {
   nft list table inet warp_vps >/dev/null 2>&1
 }
@@ -223,6 +356,10 @@ apply_rules() {
   load_config
   validate_repo_raw_base "$REPO_RAW_BASE"
   install -d -m 0755 "$ETC_DIR"
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    apply_wg_routes
+    return
+  fi
   render_redsocks_conf
   render_nft_conf
   nft -c -f "$NFT_CONF"
@@ -230,6 +367,13 @@ apply_rules() {
 }
 
 stop_rules() {
+  if [ -r "$CONFIG_FILE" ]; then
+    load_config
+    if [ "$WARP_MODE" = "wireguard" ]; then
+      stop_wg_routes
+      return
+    fi
+  fi
   if table_exists; then
     nft delete table inet warp_vps
   fi
@@ -239,9 +383,10 @@ install_systemd() {
   require_root
   load_config
   install -d -m 0755 "$ETC_DIR"
-  render_redsocks_conf
+  if [ "$WARP_MODE" = "socks" ]; then
+    render_redsocks_conf
 
-  cat > /etc/systemd/system/warp-vps-redsocks.service <<EOF
+    cat > /etc/systemd/system/warp-vps-redsocks.service <<EOF
 [Unit]
 Description=WARP VPS Manager redsocks 转发服务
 After=network-online.target warp-svc.service
@@ -262,12 +407,20 @@ ProtectSystem=strict
 [Install]
 WantedBy=multi-user.target
 EOF
+  fi
+
+  local route_after="network-online.target warp-svc.service warp-vps-redsocks.service"
+  local route_wants="network-online.target warp-vps-redsocks.service"
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    route_after="network-online.target wg-quick@${WG_IFACE}.service"
+    route_wants="network-online.target wg-quick@${WG_IFACE}.service"
+  fi
 
   cat > /etc/systemd/system/warp-vps.service <<EOF
 [Unit]
 Description=WARP VPS Manager Google 系统级分流
-After=network-online.target warp-svc.service warp-vps-redsocks.service
-Wants=network-online.target warp-vps-redsocks.service
+After=${route_after}
+Wants=${route_wants}
 
 [Service]
 Type=oneshot
@@ -328,6 +481,25 @@ socks_ok() {
   socks_trace 2>/dev/null | grep -Eq '^warp=(on|plus)$'
 }
 
+wg_ok() {
+  wg_interface_exists || return 1
+  curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1 || return 1
+  local latest now
+  latest="$(wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')"
+  case "$latest" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$latest" -gt 0 ] || return 1
+  now="$(date +%s)"
+  [ $((now - latest)) -lt 600 ]
+}
+
+route_uses_wg4() {
+  ip -4 route get "$1" 2>/dev/null | grep -q "dev ${WG_IFACE}"
+}
+
+route_uses_wg6() {
+  ip -6 route get "$1" 2>/dev/null | grep -q "dev ${WG_IFACE}"
+}
+
 google_counter() {
   nft list chain inet warp_vps output_nat 2>/dev/null \
     | awk '/redirect to :/ { for (i=1; i<=NF; i++) if ($i == "packets") { print $(i+1); exit } }'
@@ -350,6 +522,16 @@ ensure_warp_connected() {
 
 test_quiet() {
   load_config
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    wg_interface_exists || return 1
+    wg_ok || return 1
+    route_uses_wg4 8.8.8.8 || return 1
+    curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1 || return 1
+    if route_uses_wg4 1.1.1.1; then
+      return 1
+    fi
+    return 0
+  fi
   wait_for_socks_listen 8 || return 1
   socks_ok || return 1
   service_active warp-vps-redsocks.service || return 1
@@ -393,6 +575,61 @@ run_self_check() {
   local before after
 
   section "状态自检"
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    info_line "当前模式：WireGuard 高级模式"
+    info_line "WireGuard 网卡：${WG_IFACE}"
+
+    if wg_interface_exists; then
+      ok_line "WireGuard 网卡已启动"
+    else
+      fail_line "WireGuard 网卡未启动"
+      failed=1
+    fi
+
+    if wg_ok; then
+      ok_line "WARP WireGuard 出口可用"
+    else
+      fail_line "WARP WireGuard 出口不可用"
+      failed=1
+    fi
+
+    if route_uses_wg4 8.8.8.8; then
+      ok_line "Google IPv4 路由已走 WARP"
+    else
+      fail_line "Google IPv4 路由没有走 WARP"
+      failed=1
+    fi
+
+    if route_uses_wg4 1.1.1.1; then
+      fail_line "普通 IPv4 流量也走了 WARP，分流异常"
+      failed=1
+    else
+      ok_line "普通 IPv4 流量保持直连"
+    fi
+
+    if curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1; then
+      ok_line "Google TCP 测试请求正常"
+    else
+      fail_line "Google TCP 测试请求失败"
+      failed=1
+    fi
+
+    if route_uses_wg6 2001:4860:4860::8888; then
+      ok_line "Google IPv6 路由已走 WARP"
+    else
+      warn_line "未检测到 Google IPv6 路由命中，可能是系统没有 IPv6 或内核不支持"
+    fi
+
+    section "结论"
+    if [ "$failed" -eq 0 ]; then
+      ok_line "当前正常。Google、YouTube、Gemini 命中规则的 TCP/UDP 流量会走 WARP。"
+      return 0
+    fi
+    fail_line "当前异常。请先运行：warp-vps restart"
+    warn_line "如果重启后仍失败，请运行：warp-vps logs"
+    return 1
+  fi
+
   info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
 
   if wait_for_socks_listen 8; then
@@ -473,9 +710,14 @@ cmd_status() {
   require_root
   load_config
   section "当前配置"
-  info_line "工作模式：Google / YouTube / Gemini 走 WARP，普通流量直连"
-  info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
-  info_line "本地转发端口：${REDSOCKS_PORT}"
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    info_line "工作模式：WireGuard 高级模式，Google / YouTube / Gemini 的 TCP+UDP 走 WARP"
+    info_line "WireGuard 网卡：${WG_IFACE}"
+  else
+    info_line "工作模式：Socks5 稳定模式，Google / YouTube / Gemini 的 TCP 走 WARP，UDP/443 阻断回落"
+    info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
+    info_line "本地转发端口：${REDSOCKS_PORT}"
+  fi
   info_line "更新地址：$(mask_repo_url "$REPO_RAW_BASE")"
   print_rule_summary || true
   run_self_check
@@ -485,6 +727,15 @@ cmd_restart() {
   require_root
   load_config
   section "正在重启"
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    info_line "正在重启 WireGuard WARP 网卡和分流路由，请稍等"
+    systemctl restart "wg-quick@${WG_IFACE}.service"
+    apply_rules
+    systemctl restart warp-vps.service
+    cmd_test
+    return
+  fi
+
   info_line "正在重启 WARP 和本地分流服务，请稍等"
   systemctl restart warp-svc >/dev/null 2>&1 || true
   ensure_warp_connected
@@ -493,6 +744,17 @@ cmd_restart() {
   apply_rules
   systemctl restart warp-vps.service
   cmd_test
+}
+
+cmd_setup_wireguard() {
+  require_root
+  load_config
+  [ "$WARP_MODE" = "wireguard" ] || die "当前不是 WireGuard 模式"
+  command -v wg >/dev/null 2>&1 || die "找不到 wg，请先安装 wireguard-tools"
+  command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick，请先安装 wireguard-tools"
+  [ -c /dev/net/tun ] || die "当前系统没有可用 /dev/net/tun，不能使用 WireGuard 模式"
+  generate_wg_config
+  ok_line "WireGuard 配置已准备完成：${WG_CONFIG}"
 }
 
 download_update_asset() {
@@ -541,8 +803,13 @@ cmd_update() {
   install -m 0644 "${stage}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt"
   install -m 0644 "${stage}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json"
   install -m 0755 "${APP_DIR}/bin/warp-vps" "$BIN_PATH"
-  "$BIN_PATH" apply
-  systemctl restart warp-vps-redsocks.service
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    systemctl restart "wg-quick@${WG_IFACE}.service"
+    "$BIN_PATH" apply
+  else
+    "$BIN_PATH" apply
+    systemctl restart warp-vps-redsocks.service
+  fi
   systemctl restart warp-vps.service
   ok_line "更新完成，正在运行自检"
   "$BIN_PATH" test
@@ -555,6 +822,17 @@ cmd_heal() {
     return 0
   fi
   warn "健康检查失败，正在尝试自动修复"
+  load_config
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    systemctl restart "wg-quick@${WG_IFACE}.service" || true
+    apply_rules
+    if test_quiet; then
+      log "自动修复成功"
+    else
+      die "自动修复失败，请运行 warp-vps logs 查看日志"
+    fi
+    return 0
+  fi
   systemctl restart warp-svc >/dev/null 2>&1 || true
   ensure_warp_connected
   wait_for_socks_listen 20 || die "自动修复后 WARP SOCKS 端口仍未监听"
@@ -569,7 +847,7 @@ cmd_heal() {
 
 cmd_logs() {
   require_root
-  journalctl -u warp-svc -u warp-vps-redsocks.service -u warp-vps.service -u warp-vps-health.service --no-pager -n 200
+  journalctl -u warp-svc -u "wg-quick@${DEFAULT_WG_IFACE}.service" -u warp-vps-redsocks.service -u warp-vps.service -u warp-vps-health.service --no-pager -n 200
 }
 
 safe_move_if_exists() {
@@ -583,15 +861,20 @@ cmd_uninstall() {
   require_root
   local backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)"
   install -d -m 0755 "$backup_dir"
-  systemctl stop warp-vps-health.timer warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
-  systemctl disable warp-vps-health.timer warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
+  if [ -r "$CONFIG_FILE" ]; then
+    load_config || true
+  fi
+  systemctl stop warp-vps-health.timer warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
+  systemctl disable warp-vps-health.timer warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
   stop_rules || true
   safe_move_if_exists /etc/systemd/system/warp-vps-redsocks.service "$backup_dir"
   safe_move_if_exists /etc/systemd/system/warp-vps.service "$backup_dir"
   safe_move_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir"
   safe_move_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir"
+  safe_move_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir"
   safe_move_if_exists "$ETC_DIR" "$backup_dir"
   safe_move_if_exists "$APP_DIR" "$backup_dir"
+  safe_move_if_exists "$STATE_DIR" "$backup_dir"
   safe_move_if_exists "$BIN_PATH" "$backup_dir"
   systemctl daemon-reload
   printf 'WARP VPS Manager 已卸载，文件已移动到备份目录：%s\n' "$backup_dir"
@@ -614,6 +897,7 @@ usage() {
   heal            健康检查和自动修复
   apply           重新生成并加载分流规则
   stop-rules      移除本项目 nftables 规则
+  setup-wireguard 准备 WireGuard WARP 配置
   install-systemd 安装 systemd 服务
 EOF
 }
@@ -629,6 +913,7 @@ main() {
     heal) cmd_heal ;;
     apply) require_root; apply_rules ;;
     stop-rules) require_root; stop_rules ;;
+    setup-wireguard) cmd_setup_wireguard ;;
     install-systemd) install_systemd ;;
     uninstall) cmd_uninstall ;;
     -h|--help|help|'') usage ;;

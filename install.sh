@@ -8,6 +8,10 @@ STATE_DIR="/var/lib/${APP_NAME}"
 BIN_PATH="/usr/local/bin/warp-vps"
 CONFIG_FILE="${ETC_DIR}/config.env"
 REDSOCKS_USER="warp-vps-redsocks"
+WG_IFACE="warp-vps-wg"
+WGCF_BIN="${APP_DIR}/bin/wgcf"
+WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
+SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
 APP_VERSION_VALUE="0.1.0"
@@ -29,7 +33,128 @@ load_os_release() {
   OS_CODENAME="${VERSION_CODENAME:-}"
 }
 
+mem_available_mb() {
+  awk '/^MemAvailable:/ { print int($2 / 1024); exit }' /proc/meminfo
+}
+
+swap_total_mb() {
+  awk '/^SwapTotal:/ { print int($2 / 1024); exit }' /proc/meminfo
+}
+
+swap_free_mb() {
+  awk '/^SwapFree:/ { print int($2 / 1024); exit }' /proc/meminfo
+}
+
+root_free_mb() {
+  df -Pm / | awk 'NR == 2 { print $4 }'
+}
+
+format_gb() {
+  local mb="$1"
+  awk -v mb="$mb" 'BEGIN { printf "%.1fG", mb / 1024 }'
+}
+
+max_creatable_swap_mb() {
+  local free_mb
+  free_mb="$(root_free_mb)"
+  if [ "$free_mb" -le 768 ]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$((free_mb - 512))"
+  fi
+}
+
+create_swap_file() {
+  local size_mb="$1"
+  [ "$size_mb" -ge 256 ] || die "Swap 大小过小"
+  [ ! -e "$SWAP_FILE" ] || die "$SWAP_FILE 已存在，请先自行检查后再安装"
+
+  log "正在创建 $(format_gb "$size_mb") Swap：$SWAP_FILE"
+  dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=progress
+  chmod 0600 "$SWAP_FILE"
+  mkswap "$SWAP_FILE" >/dev/null
+  swapon "$SWAP_FILE"
+  if ! grep -qF "$SWAP_FILE" /etc/fstab; then
+    printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab
+  fi
+  log "Swap 创建完成"
+}
+
+prompt_swap_creation() {
+  local mem_mb="$1"
+  local max_mb selected choice custom_gb custom_mb
+  while true; do
+    max_mb="$(max_creatable_swap_mb)"
+    printf '\n检测到当前可用内存只有 %s，且系统没有 Swap。\n' "$(format_gb "$mem_mb")"
+    printf '如果继续安装，Cloudflare WARP 或依赖安装可能因为内存不足失败。\n'
+    printf '当前磁盘最多建议创建约 %s Swap。\n' "$(format_gb "$max_mb")"
+    printf '\n请选择：\n'
+    printf '  1. 创建 1G Swap\n'
+    printf '  2. 创建 2G Swap（推荐）\n'
+    printf '  3. 自定义 Swap 大小\n'
+    printf '  4. 不创建 Swap，接受安装中途失败的风险继续\n'
+    printf '  5. 退出安装\n'
+    printf '请输入选项：'
+    read -r choice
+    case "$choice" in
+      1) selected=1024 ;;
+      2) selected=2048 ;;
+      3)
+        printf '请输入要创建的 Swap 大小，单位 G，例如 2：'
+        read -r custom_gb
+        case "$custom_gb" in
+          ''|*[!0-9]*) die "输入无效，已退出安装" ;;
+        esac
+        selected=$((custom_gb * 1024))
+        ;;
+      4)
+        printf '已选择不创建 Swap，继续安装。\n'
+        return 0
+        ;;
+      5|'')
+        die "已退出安装"
+        ;;
+      *)
+        die "输入无效，已退出安装"
+        ;;
+    esac
+
+    if [ "$selected" -gt "$max_mb" ]; then
+      printf '创建失败：可用空间不足。当前最多建议创建 %s Swap。\n' "$(format_gb "$max_mb")"
+      continue
+    fi
+
+    create_swap_file "$selected"
+    return 0
+  done
+}
+
+check_memory_before_install() {
+  local mem_mb swap_total swap_free total_available
+  mem_mb="$(mem_available_mb)"
+  swap_total="$(swap_total_mb)"
+  swap_free="$(swap_free_mb)"
+  total_available=$((mem_mb + swap_free))
+
+  [ "$mem_mb" -ge 1024 ] && return 0
+
+  if [ "$swap_total" -eq 0 ]; then
+    prompt_swap_creation "$mem_mb"
+    return 0
+  fi
+
+  if [ "$total_available" -lt 1024 ]; then
+    printf '\n检测到当前可用内存 %s，Swap 总量 %s，Swap 可用 %s。\n' \
+      "$(format_gb "$mem_mb")" "$(format_gb "$swap_total")" "$(format_gb "$swap_free")"
+    printf '内存仍然偏低，安装存在失败风险。建议先自行调整 Swap 后再安装。\n'
+    printf '输入 1 表示知道风险并继续，其他输入退出：'
+    read -r choice
+    [ "$choice" = "1" ] || die "已退出安装"
+  fi
+}
+
 pkg_install_apt() {
+  local mode="$1"
   case "$OS_ID" in
     ubuntu)
       case "$OS_VERSION_MAJOR" in
@@ -50,8 +175,14 @@ pkg_install_apt() {
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl ca-certificates gnupg lsb-release nftables iptables iproute2 python3 redsocks
+  apt-get install -y curl ca-certificates gnupg lsb-release nftables iptables iproute2 python3
 
+  if [ "$mode" = "wireguard" ]; then
+    apt-get install -y wireguard-tools
+    return
+  fi
+
+  apt-get install -y redsocks
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
     | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -85,6 +216,7 @@ enable_rhel_extra_repos() {
 }
 
 pkg_install_rpm() {
+  local mode="$1"
   case "$OS_ID" in
     centos)
       case "$OS_VERSION_MAJOR" in
@@ -104,36 +236,55 @@ pkg_install_rpm() {
   esac
 
   enable_rhel_extra_repos
-  rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
-  curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
-    -o /etc/yum.repos.d/cloudflare-warp.repo
   if command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl ca-certificates gnupg2 nftables iptables-nft iproute python3 redsocks cloudflare-warp
+    dnf install -y curl ca-certificates gnupg2 nftables iptables-nft iproute python3
+    if [ "$mode" = "wireguard" ]; then
+      dnf install -y wireguard-tools
+      return
+    fi
+    rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
+    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
+      -o /etc/yum.repos.d/cloudflare-warp.repo
+    dnf install -y redsocks cloudflare-warp
   else
-    yum install -y curl ca-certificates gnupg2 nftables iptables iproute python3 redsocks cloudflare-warp
+    yum install -y curl ca-certificates gnupg2 nftables iptables iproute python3
+    if [ "$mode" = "wireguard" ]; then
+      yum install -y wireguard-tools
+      return
+    fi
+    rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
+    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
+      -o /etc/yum.repos.d/cloudflare-warp.repo
+    yum install -y redsocks cloudflare-warp
   fi
 }
 
 install_dependencies() {
+  local mode="$1"
   load_os_release
   case "$OS_ID" in
     debian|ubuntu)
-      pkg_install_apt
+      pkg_install_apt "$mode"
       ;;
     centos|rhel|rocky|almalinux)
-      pkg_install_rpm
+      pkg_install_rpm "$mode"
       ;;
     *)
       die "不支持当前系统：${OS_ID:-未知}；支持 Debian、Ubuntu、CentOS、RHEL、Rocky、AlmaLinux"
       ;;
   esac
 
-  command -v warp-cli >/dev/null 2>&1 || die "cloudflare-warp 已安装但找不到 warp-cli"
-  command -v redsocks >/dev/null 2>&1 || die "依赖安装后仍找不到 redsocks"
   command -v nft >/dev/null 2>&1 || die "依赖安装后仍找不到 nftables"
   command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
   command -v timeout >/dev/null 2>&1 || die "依赖安装后仍找不到 timeout"
   command -v python3 >/dev/null 2>&1 || die "依赖安装后仍找不到 python3"
+  if [ "$mode" = "wireguard" ]; then
+    command -v wg >/dev/null 2>&1 || die "依赖安装后仍找不到 wg"
+    command -v wg-quick >/dev/null 2>&1 || die "依赖安装后仍找不到 wg-quick"
+  else
+    command -v warp-cli >/dev/null 2>&1 || die "cloudflare-warp 已安装但找不到 warp-cli"
+    command -v redsocks >/dev/null 2>&1 || die "依赖安装后仍找不到 redsocks"
+  fi
 }
 
 reserved_port() {
@@ -174,6 +325,57 @@ wait_for_tcp_port() {
     waited=$((waited + 1))
   done
   tcp_port_listening "$port"
+}
+
+tun_available() {
+  [ -c /dev/net/tun ]
+}
+
+wireguard_recommended() {
+  local kernel_major
+  tun_available || return 1
+  kernel_major="$(uname -r | awk -F. '{ print $1 }')"
+  case "$kernel_major" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$kernel_major" -ge 5 ]
+}
+
+prompt_install_mode() {
+  local recommended choice
+  recommended="socks"
+
+  printf '\n请选择 WARP 分流方案：\n' >&2
+  printf '  1. Socks5 方案：更稳，低风险。Google/YouTube/Gemini 的 TCP 走 WARP，UDP/443 阻断后回落 TCP。\n' >&2
+  printf '  2. WireGuard 方案：高级模式。TCP+UDP 都可按 Google CIDR 走 WARP，但需要 TUN/WireGuard 能力，路由风险更高。\n' >&2
+  printf '  3. 退出安装\n' >&2
+  if wireguard_recommended; then
+    printf '环境检测：TUN 可用，内核版本适合 WireGuard。普通用户推荐 Socks5；明确需要 UDP/QUIC 再选 WireGuard。\n' >&2
+  else
+    printf '环境检测：当前环境不适合 WireGuard，推荐 Socks5。\n' >&2
+  fi
+  printf '直接回车默认选择：Socks5\n' >&2
+  printf '请输入选项：' >&2
+  read -r choice
+
+  case "$choice" in
+    '')
+      printf '%s\n' "$recommended"
+      ;;
+    1)
+      printf 'socks\n'
+      ;;
+    2)
+      tun_available || die "当前系统没有可用 /dev/net/tun，不能安装 WireGuard 方案"
+      printf 'wireguard\n'
+      ;;
+    3)
+      die "已退出安装"
+      ;;
+    *)
+      die "输入无效，已退出安装"
+      ;;
+  esac
 }
 
 find_free_port() {
@@ -295,20 +497,25 @@ configure_warp() {
 }
 
 write_config() {
-  local warp_port="$1"
-  local redsocks_port="$2"
-  local redsocks_uid="$3"
-  local redsocks_group="$4"
-  local redsocks_bin="$5"
+  local mode="$1"
+  local warp_port="$2"
+  local redsocks_port="$3"
+  local redsocks_uid="$4"
+  local redsocks_group="$5"
+  local redsocks_bin="$6"
   cat > "$CONFIG_FILE" <<EOF
 APP_VERSION=${APP_VERSION_VALUE}
 REPO_RAW_BASE=${REPO_RAW_BASE}
+WARP_MODE=${mode}
 WARP_SOCKS_PORT=${warp_port}
 REDSOCKS_PORT=${redsocks_port}
 REDSOCKS_USER=${REDSOCKS_USER}
 REDSOCKS_UID=${redsocks_uid}
 REDSOCKS_GROUP=${redsocks_group}
 REDSOCKS_BIN=${redsocks_bin}
+WG_IFACE=${WG_IFACE}
+WGCF_BIN=${WGCF_BIN}
+WG_CONFIG=${WG_CONFIG}
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
@@ -316,31 +523,52 @@ EOF
 main() {
   require_root
   validate_repo_raw_base "$REPO_RAW_BASE"
+  check_memory_before_install
+
+  local selected_mode
+  selected_mode="$(prompt_install_mode)"
   log "正在安装依赖"
-  install_dependencies
+  install_dependencies "$selected_mode"
 
   local warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
-  warp_port="$(prompt_warp_port)"
-  valid_port "$warp_port" || die "内部错误：选择的 WARP SOCKS 端口无效"
-  redsocks_port="$(find_free_port "$warp_port")"
-  valid_port "$redsocks_port" || die "内部错误：选择的 redsocks 端口无效"
-  ensure_redsocks_user
-  redsocks_uid="$(id -u "$REDSOCKS_USER")"
-  redsocks_group="$(id -gn "$REDSOCKS_USER")"
-  redsocks_bin="$(command -v redsocks)"
+  if [ "$selected_mode" = "socks" ]; then
+    warp_port="$(prompt_warp_port)"
+    valid_port "$warp_port" || die "内部错误：选择的 WARP SOCKS 端口无效"
+    redsocks_port="$(find_free_port "$warp_port")"
+    valid_port "$redsocks_port" || die "内部错误：选择的 redsocks 端口无效"
+    ensure_redsocks_user
+    redsocks_uid="$(id -u "$REDSOCKS_USER")"
+    redsocks_group="$(id -gn "$REDSOCKS_USER")"
+    redsocks_bin="$(command -v redsocks)"
+  else
+    warp_port=0
+    redsocks_port=0
+    redsocks_uid=0
+    redsocks_group=root
+    redsocks_bin=/usr/sbin/redsocks
+  fi
 
   log "正在安装项目文件"
-  disable_packaged_redsocks_service
+  [ "$selected_mode" = "socks" ] && disable_packaged_redsocks_service
   install_project_files
-  write_config "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
+  write_config "$selected_mode" "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
 
-  log "正在配置 Cloudflare WARP SOCKS，端口：$warp_port"
-  configure_warp "$warp_port"
+  if [ "$selected_mode" = "socks" ]; then
+    log "正在配置 Cloudflare WARP SOCKS，端口：$warp_port"
+    configure_warp "$warp_port"
+  else
+    log "正在配置 WireGuard WARP 高级模式"
+    "$BIN_PATH" setup-wireguard
+  fi
 
   log "正在安装系统服务和分流规则"
   "$BIN_PATH" install-systemd
   systemctl daemon-reload
-  systemctl enable --now warp-vps-redsocks.service
+  if [ "$selected_mode" = "socks" ]; then
+    systemctl enable --now warp-vps-redsocks.service
+  else
+    systemctl enable --now "wg-quick@${WG_IFACE}.service"
+  fi
   systemctl enable --now warp-vps.service
   systemctl enable --now warp-vps-health.timer
 
@@ -348,9 +576,16 @@ main() {
   "$BIN_PATH" test
 
   printf '\nWARP VPS Manager 安装完成。\n'
-  printf 'WARP SOCKS 端口：%s\n' "$warp_port"
+  printf '安装模式：%s\n' "$selected_mode"
+  if [ "$selected_mode" = "socks" ]; then
+    printf 'WARP SOCKS 端口：%s\n' "$warp_port"
+  fi
   printf '管理命令：warp-vps {status|test|restart|update|logs|uninstall}\n'
-  printf '已默认阻断 Google 目标 IPv6，避免 IPv6 泄漏。\n'
+  if [ "$selected_mode" = "socks" ]; then
+    printf '已默认阻断 Google 目标 IPv6，避免 IPv6 泄漏。\n'
+  else
+    printf 'WireGuard 模式会把命中 Google CIDR 的 TCP/UDP 流量路由到 WARP。\n'
+  fi
 }
 
 main "$@"
