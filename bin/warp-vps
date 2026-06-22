@@ -16,6 +16,9 @@ DEFAULT_WGCF_BIN="${APP_DIR}/bin/wgcf"
 DEFAULT_WG_CONFIG="/etc/wireguard/${DEFAULT_WG_IFACE}.conf"
 DEFAULT_WGCF_VERSION="v2.2.31"
 MANAGED_SWAP_FILE="/swapfile-warp-vps-manager"
+REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
+REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
+REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -86,6 +89,7 @@ load_config() {
       WGCF_BIN) WGCF_BIN="$value" ;;
       WG_CONFIG) WG_CONFIG="$value" ;;
       MANAGED_WARP_SVC) MANAGED_WARP_SVC="$value" ;;
+      MANAGED_REDSOCKS_BIN) MANAGED_REDSOCKS_BIN="$value" ;;
       *) die "配置文件存在未知字段：$key" ;;
     esac
   done < "$CONFIG_FILE"
@@ -109,6 +113,13 @@ load_config() {
       MANAGED_WARP_SVC=0
     fi
   fi
+  if [ -z "${MANAGED_REDSOCKS_BIN:-}" ]; then
+    MANAGED_REDSOCKS_BIN=0
+    if [ "${REDSOCKS_BIN:-}" = "$REDSOCKS_FALLBACK_BIN" ] \
+      && grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null; then
+      MANAGED_REDSOCKS_BIN=1
+    fi
+  fi
   [ -n "${REDSOCKS_GROUP:-}" ] || die "配置缺少 REDSOCKS_GROUP"
   [ -n "${REDSOCKS_BIN:-}" ] || die "配置缺少 REDSOCKS_BIN"
   [ -n "${REPO_RAW_BASE:-}" ] || die "配置缺少 REPO_RAW_BASE"
@@ -118,6 +129,7 @@ load_config() {
   fi
   case "$REDSOCKS_UID" in ''|*[!0-9]*) die "配置里的 REDSOCKS_UID 不是有效数字" ;; esac
   case "$MANAGED_WARP_SVC" in 0|1) ;; *) die "配置里的 MANAGED_WARP_SVC 不是有效值" ;; esac
+  case "$MANAGED_REDSOCKS_BIN" in 0|1) ;; *) die "配置里的 MANAGED_REDSOCKS_BIN 不是有效值" ;; esac
   valid_config_name "$REDSOCKS_USER" || die "配置里的 REDSOCKS_USER 不是有效用户"
   valid_config_name "$REDSOCKS_GROUP" || die "配置里的 REDSOCKS_GROUP 不是有效用户组"
   valid_config_path "$REDSOCKS_BIN" || die "配置里的 REDSOCKS_BIN 不是安全绝对路径"
@@ -506,7 +518,7 @@ load_uninstall_config() {
   local line key value
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
-      WARP_MODE=*|WG_IFACE=*|MANAGED_WARP_SVC=*) ;;
+      WARP_MODE=*|WG_IFACE=*|MANAGED_WARP_SVC=*|REDSOCKS_BIN=*|MANAGED_REDSOCKS_BIN=*) ;;
       *) continue ;;
     esac
     key="${line%%=*}"
@@ -523,6 +535,14 @@ load_uninstall_config() {
       MANAGED_WARP_SVC)
         case "$value" in 0|1) MANAGED_WARP_SVC="$value" ;; esac
         ;;
+      REDSOCKS_BIN)
+        if valid_config_path "$value"; then
+          REDSOCKS_BIN="$value"
+        fi
+        ;;
+      MANAGED_REDSOCKS_BIN)
+        case "$value" in 0|1) MANAGED_REDSOCKS_BIN="$value" ;; esac
+        ;;
     esac
   done < "$CONFIG_FILE"
   WG_IFACE="${WG_IFACE:-$DEFAULT_WG_IFACE}"
@@ -532,6 +552,13 @@ load_uninstall_config() {
       MANAGED_WARP_SVC=1
     else
       MANAGED_WARP_SVC=0
+    fi
+  fi
+  if [ -z "${MANAGED_REDSOCKS_BIN:-}" ]; then
+    MANAGED_REDSOCKS_BIN=0
+    if [ "${REDSOCKS_BIN:-}" = "$REDSOCKS_FALLBACK_BIN" ] \
+      && grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null; then
+      MANAGED_REDSOCKS_BIN=1
     fi
   fi
 }
@@ -685,6 +712,14 @@ service_active() {
   systemctl is-active --quiet "$1"
 }
 
+service_enabled() {
+  systemctl is-enabled --quiet "$1"
+}
+
+unit_ready() {
+  service_active "$1" && service_enabled "$1"
+}
+
 warp_cli() {
   timeout 60 warp-cli "$@"
 }
@@ -758,6 +793,27 @@ run_self_check() {
     info_line "当前模式：WireGuard 高级模式"
     info_line "WireGuard 网卡：${WG_IFACE}"
 
+    if unit_ready "wg-quick@${WG_IFACE}.service"; then
+      ok_line "WireGuard 开机服务正常"
+    else
+      fail_line "WireGuard 开机服务异常"
+      failed=1
+    fi
+
+    if unit_ready warp-vps.service; then
+      ok_line "分流规则服务正常"
+    else
+      fail_line "分流规则服务异常"
+      failed=1
+    fi
+
+    if unit_ready warp-vps-health.timer; then
+      ok_line "健康检查定时器正常"
+    else
+      fail_line "健康检查定时器异常"
+      failed=1
+    fi
+
     if wg_interface_exists; then
       ok_line "WireGuard 网卡已启动"
     else
@@ -814,6 +870,34 @@ run_self_check() {
 
   info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
 
+  if unit_ready warp-svc.service; then
+    ok_line "WARP 官方客户端服务正常"
+  else
+    fail_line "WARP 官方客户端服务异常"
+    failed=1
+  fi
+
+  if unit_ready warp-vps-redsocks.service; then
+    ok_line "本地透明转发服务正常"
+  else
+    fail_line "本地透明转发服务异常"
+    failed=1
+  fi
+
+  if unit_ready warp-vps.service; then
+    ok_line "分流规则服务正常"
+  else
+    fail_line "分流规则服务异常"
+    failed=1
+  fi
+
+  if unit_ready warp-vps-health.timer; then
+    ok_line "健康检查定时器正常"
+  else
+    fail_line "健康检查定时器异常"
+    failed=1
+  fi
+
   if wait_for_socks_listen 8; then
     ok_line "WARP 本地 SOCKS 已启动"
   else
@@ -829,9 +913,9 @@ run_self_check() {
   fi
 
   if service_active warp-vps-redsocks.service; then
-    ok_line "本地透明转发服务正常"
+    ok_line "本地透明转发进程正常"
   else
-    fail_line "本地透明转发服务未运行"
+    fail_line "本地透明转发进程未运行"
     failed=1
   fi
 
@@ -1028,11 +1112,15 @@ restore_update_backup() {
 }
 
 reload_runtime_after_update() {
+  "$BIN_PATH" install-systemd || return 1
+  systemctl daemon-reload || return 1
   if [ "$WARP_MODE" = "wireguard" ]; then
+    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null || return 1
     systemctl restart "wg-quick@${WG_IFACE}.service" || return 1
     "$BIN_PATH" apply || return 1
     "$BIN_PATH" wait-wireguard || return 1
   else
+    systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null || return 1
     "$BIN_PATH" apply || return 1
     systemctl restart warp-vps-redsocks.service || return 1
   fi
@@ -1153,6 +1241,26 @@ disable_managed_warp_service() {
   systemctl disable warp-svc >/dev/null 2>&1 || true
 }
 
+ensure_wireguard_down_for_uninstall() {
+  [ "${WARP_MODE:-socks}" = "wireguard" ] || return 0
+  wg_interface_exists || return 0
+  info_line "正在关闭 WireGuard 网卡：${WG_IFACE:-$DEFAULT_WG_IFACE}"
+  if command -v wg-quick >/dev/null 2>&1 && [ -r "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" ]; then
+    wg-quick down "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" >/dev/null 2>&1 \
+      || wg-quick down "${WG_IFACE:-$DEFAULT_WG_IFACE}" >/dev/null 2>&1 \
+      || true
+  fi
+  if wg_interface_exists; then
+    die "WireGuard 网卡仍在运行，卸载已中止：${WG_IFACE:-$DEFAULT_WG_IFACE}"
+  fi
+}
+
+managed_redsocks_fallback_exists() {
+  [ "${MANAGED_REDSOCKS_BIN:-0}" = "1" ] || return 1
+  [ "${REDSOCKS_BIN:-}" = "$REDSOCKS_FALLBACK_BIN" ] || return 1
+  [ -e "$REDSOCKS_FALLBACK_BIN" ]
+}
+
 cmd_uninstall() {
   require_root
   local backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -1160,6 +1268,7 @@ cmd_uninstall() {
   load_uninstall_config
   systemctl stop warp-vps-health.timer warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
   systemctl disable warp-vps-health.timer warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
+  ensure_wireguard_down_for_uninstall
   stop_rules_for_uninstall
   disable_managed_warp_service
 
@@ -1174,6 +1283,9 @@ cmd_uninstall() {
   print_move_target_if_exists "$APP_DIR" "$backup_dir" "opt-warp-vps-manager"
   print_move_target_if_exists "$STATE_DIR" "$backup_dir" "var-lib-warp-vps-manager"
   print_move_target_if_exists "$BIN_PATH" "$backup_dir" "usr-local-bin-warp-vps"
+  if managed_redsocks_fallback_exists; then
+    print_move_target_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
+  fi
   print_move_target_if_exists "$MANAGED_SWAP_FILE" "$backup_dir" "swapfile-warp-vps-manager"
 
   uninstall_managed_swap "$backup_dir"
@@ -1186,6 +1298,9 @@ cmd_uninstall() {
   safe_move_if_exists "$APP_DIR" "$backup_dir" "opt-warp-vps-manager"
   safe_move_if_exists "$STATE_DIR" "$backup_dir" "var-lib-warp-vps-manager"
   safe_move_if_exists "$BIN_PATH" "$backup_dir" "usr-local-bin-warp-vps"
+  if managed_redsocks_fallback_exists; then
+    safe_move_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
+  fi
   systemctl daemon-reload
   printf 'WARP VPS Manager 已卸载，文件已移动到备份目录：%s\n' "$backup_dir"
   printf '系统依赖包已保留，不会被删除。\n'

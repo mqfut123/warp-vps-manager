@@ -20,6 +20,9 @@ REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
 REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
 REDSOCKS_SOURCE_SHA256="40acdf4404376a94434f4fcced9d62239ca1a58c759e7998a4fbf519ce8a0a49"
 REDSOCKS_SOURCE_URL="https://github.com/darkk/redsocks/archive/${REDSOCKS_SOURCE_COMMIT}.tar.gz"
+REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
+REDSOCKS_MANAGED_MARKER="${STATE_DIR}/managed-redsocks-fallback"
+MANAGED_REDSOCKS_BIN=0
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -224,6 +227,18 @@ redsocks_path() {
   return 1
 }
 
+mark_managed_redsocks_if_current() {
+  MANAGED_REDSOCKS_BIN=0
+  [ -x "$REDSOCKS_FALLBACK_BIN" ] || return 0
+  if [ -r "$REDSOCKS_MANAGED_MARKER" ]; then
+    MANAGED_REDSOCKS_BIN=1
+    return 0
+  fi
+  if grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null; then
+    MANAGED_REDSOCKS_BIN=1
+  fi
+}
+
 enable_rhel_extra_repos() {
   if command -v dnf >/dev/null 2>&1; then
     dnf install -y dnf-plugins-core || true
@@ -272,13 +287,20 @@ EOF
       base.c base64.c md5.c http-auth.c utils.c redudp.c dnstc.c gen/version.c \
       -levent_core
   )
+  if [ -e "$REDSOCKS_FALLBACK_BIN" ] && [ ! -x "$REDSOCKS_FALLBACK_BIN" ]; then
+    die "目标路径已存在但不是可执行文件：$REDSOCKS_FALLBACK_BIN"
+  fi
   install -m 0755 "$src/redsocks" "$REDSOCKS_FALLBACK_BIN"
+  install -d -m 0755 "$STATE_DIR"
+  printf '%s\n' "$REDSOCKS_MANAGED_VERSION" > "$REDSOCKS_MANAGED_MARKER"
+  MANAGED_REDSOCKS_BIN=1
   [ -x "$REDSOCKS_FALLBACK_BIN" ] || die "redsocks 源码构建后仍找不到可执行文件"
 }
 
 rpm_install_redsocks() {
   local manager="$1"
   if redsocks_path >/dev/null 2>&1; then
+    mark_managed_redsocks_if_current
     return
   fi
   if "$manager" install -y redsocks; then
@@ -618,6 +640,7 @@ WG_IFACE=${WG_IFACE}
 WGCF_BIN=${WGCF_BIN}
 WG_CONFIG=${WG_CONFIG}
 MANAGED_WARP_SVC=${managed_warp_svc}
+MANAGED_REDSOCKS_BIN=${MANAGED_REDSOCKS_BIN:-0}
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
