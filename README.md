@@ -14,30 +14,18 @@
 
 ## 一键安装
 
-请先切到 `root` 用户。生产安装建议使用固定版本 tag，按系统复制对应命令。
+请先切到 `root` 用户，按系统复制对应命令。
 
 Debian / Ubuntu：
 
 ```bash
-apt-get update -y && apt-get install -y curl ca-certificates
-export WARP_VPS_REPO_BASE=https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1
-curl -fsSL $WARP_VPS_REPO_BASE/install.sh -o wvpm.sh && bash wvpm.sh
+apt-get update -y && apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1/install.sh -o wvpm.sh && bash wvpm.sh
 ```
 
 CentOS / AlmaLinux：
 
 ```bash
-(dnf install -y curl ca-certificates || yum install -y curl ca-certificates)
-export WARP_VPS_REPO_BASE=https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1
-curl -fsSL $WARP_VPS_REPO_BASE/install.sh -o wvpm.sh && bash wvpm.sh
-```
-
-安装命令固定到 tag，避免安装过程中 `main` 分支移动导致混装。若要测试最新主线版，把第二行的 `v0.1.1` 改成 `main`。
-
-使用 fork 或自定义 raw 地址时，只需要改第二行：
-
-```bash
-export WARP_VPS_REPO_BASE=https://raw.githubusercontent.com/YOUR_NAME/warp-vps-manager/main
+(dnf install -y curl ca-certificates || yum install -y curl ca-certificates) && curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1/install.sh -o wvpm.sh && bash wvpm.sh
 ```
 
 安装前脚本会先检查可用内存。如果可用内存低于 1G 且没有 Swap，会提示你创建 Swap 或自行承担安装失败风险。
