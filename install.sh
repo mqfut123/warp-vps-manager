@@ -650,6 +650,7 @@ install_project_files() {
 
 configure_warp() {
   local port="$1"
+  local i ok
   systemctl enable --now warp-svc >/dev/null 2>&1 || systemctl start warp-svc >/dev/null 2>&1 || true
   timeout 60 warp-cli --accept-tos registration new >/dev/null 2>&1 \
     || timeout 60 warp-cli --accept-tos register >/dev/null 2>&1 \
@@ -657,16 +658,28 @@ configure_warp() {
   timeout 30 warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 \
     || timeout 30 warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 \
     || true
-  timeout 30 warp-cli --accept-tos mode proxy >/dev/null 2>&1 \
-    || timeout 30 warp-cli mode proxy >/dev/null 2>&1 \
-    || die "无法把 Cloudflare WARP 切换到 SOCKS 代理模式"
-  timeout 30 warp-cli --accept-tos proxy port "$port" >/dev/null 2>&1 \
-    || timeout 30 warp-cli --accept-tos set-proxy-port "$port" >/dev/null 2>&1 \
-    || timeout 30 warp-cli proxy port "$port" >/dev/null 2>&1 \
-    || die "无法设置 WARP SOCKS 端口 $port"
-  timeout 60 warp-cli --accept-tos connect >/dev/null 2>&1 \
-    || timeout 60 warp-cli connect >/dev/null 2>&1 \
-    || log "WARP connect 命令返回非零，继续等待本地 SOCKS 自检"
+  ok=0
+  for i in 1 2 3 4 5 6; do
+    if timeout 30 warp-cli --accept-tos mode proxy >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    sleep 2
+  done
+  [ "$ok" -eq 1 ] || die "无法把 Cloudflare WARP 切换到 SOCKS 代理模式"
+  ok=0
+  for i in 1 2 3 4 5 6; do
+    if timeout 30 warp-cli --accept-tos proxy port "$port" >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    sleep 2
+  done
+  [ "$ok" -eq 1 ] || die "无法设置 WARP SOCKS 端口 $port"
+  for i in 1 2 3; do
+    timeout 60 warp-cli --accept-tos connect >/dev/null 2>&1 && break
+    sleep 2
+  done
   if ! wait_for_tcp_port "$port" 20; then
     die "warp-cli 没有监听 SOCKS 端口 $port"
   fi
