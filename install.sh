@@ -239,6 +239,15 @@ mark_managed_redsocks_if_current() {
   fi
 }
 
+raw_asset_url() {
+  local rel="$1"
+  local base="${REPO_RAW_BASE%/}"
+  local url="${base}/${rel}"
+  local sep="?"
+  case "$url" in *\?*) sep="&" ;; esac
+  printf '%s%swarp_vps_ts=%s\n' "$url" "$sep" "$(date -u +%s)"
+}
+
 enable_rhel_extra_repos() {
   if command -v dnf >/dev/null 2>&1; then
     dnf install -y dnf-plugins-core || true
@@ -580,7 +589,7 @@ fetch_asset() {
     return
   fi
 
-  curl -fsSL "${REPO_RAW_BASE}/${rel}" -o "$dest"
+  curl -fsSL "$(raw_asset_url "$rel")" -o "$dest"
   chmod "$mode" "$dest"
 }
 

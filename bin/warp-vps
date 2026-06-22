@@ -186,6 +186,15 @@ validate_repo_raw_base() {
   esac
 }
 
+raw_asset_url() {
+  local rel="$1"
+  local base="${REPO_RAW_BASE%/}"
+  local url="${base}/${rel}"
+  local sep="?"
+  case "$url" in *\?*) sep="&" ;; esac
+  printf '%s%swarp_vps_ts=%s\n' "$url" "$sep" "$(date -u +%s)"
+}
+
 mask_repo_url() {
   local url="$1"
   local rest authority
@@ -1067,7 +1076,7 @@ cmd_preflight_wireguard() {
 download_update_asset() {
   local rel="$1"
   local dest="$2"
-  curl -fsSL "${REPO_RAW_BASE}/${rel}" -o "$dest"
+  curl -fsSL "$(raw_asset_url "$rel")" -o "$dest"
 }
 
 validate_update_stage() {
