@@ -10,7 +10,7 @@ CONFIG_FILE="${ETC_DIR}/config.env"
 REDSOCKS_USER="warp-vps-redsocks"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
-VERSION="0.1.0"
+APP_VERSION_VALUE="0.1.0"
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -249,7 +249,7 @@ write_config() {
   local redsocks_group="$4"
   local redsocks_bin="$5"
   cat > "$CONFIG_FILE" <<EOF
-APP_VERSION=${VERSION}
+APP_VERSION=${APP_VERSION_VALUE}
 REPO_RAW_BASE=${REPO_RAW_BASE}
 WARP_SOCKS_PORT=${warp_port}
 REDSOCKS_PORT=${redsocks_port}
