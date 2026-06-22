@@ -23,6 +23,8 @@ REDSOCKS_SOURCE_URL="https://github.com/darkk/redsocks/archive/${REDSOCKS_SOURCE
 REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 REDSOCKS_MANAGED_MARKER="${STATE_DIR}/managed-redsocks-fallback"
 MANAGED_REDSOCKS_BIN=0
+RESOLVED_REPO_RAW_BASE=""
+RESOLVED_REPO_COMMIT=""
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -241,11 +243,50 @@ mark_managed_redsocks_if_current() {
 
 raw_asset_url() {
   local rel="$1"
-  local base="${REPO_RAW_BASE%/}"
+  local base="${RESOLVED_REPO_RAW_BASE:-${REPO_RAW_BASE%/}}"
   local url="${base}/${rel}"
   local sep="?"
   case "$url" in *\?*) sep="&" ;; esac
   printf '%s%swarp_vps_ts=%s\n' "$url" "$sep" "$(date -u +%s)"
+}
+
+resolve_github_raw_base() {
+  local base="${REPO_RAW_BASE%/}"
+  local path owner repo ref rest api sha
+  case "$base" in
+    https://raw.githubusercontent.com/*) ;;
+    *) return 1 ;;
+  esac
+  path="${base#https://raw.githubusercontent.com/}"
+  owner="${path%%/*}"
+  path="${path#*/}"
+  repo="${path%%/*}"
+  path="${path#*/}"
+  ref="${path%%/*}"
+  if [ "$path" = "$ref" ]; then
+    rest=""
+  else
+    rest="${path#*/}"
+  fi
+  [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$ref" ] || return 1
+  api="https://api.github.com/repos/${owner}/${repo}/commits/${ref}"
+  sha="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')" || return 1
+  case "$sha" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) return 1 ;;
+  esac
+  RESOLVED_REPO_COMMIT="$sha"
+  if [ -n "$rest" ]; then
+    RESOLVED_REPO_RAW_BASE="https://raw.githubusercontent.com/${owner}/${repo}/${sha}/${rest}"
+  else
+    RESOLVED_REPO_RAW_BASE="https://raw.githubusercontent.com/${owner}/${repo}/${sha}"
+  fi
+}
+
+resolve_repo_raw_base() {
+  RESOLVED_REPO_RAW_BASE="${REPO_RAW_BASE%/}"
+  RESOLVED_REPO_COMMIT=""
+  resolve_github_raw_base || true
 }
 
 enable_rhel_extra_repos() {
@@ -595,6 +636,10 @@ fetch_asset() {
 
 install_project_files() {
   install -d -m 0755 "$APP_DIR" "$APP_DIR/bin" "$APP_DIR/rules" "$ETC_DIR" "$STATE_DIR"
+  resolve_repo_raw_base
+  if [ -n "$RESOLVED_REPO_COMMIT" ]; then
+    log "已锁定 GitHub 提交：${RESOLVED_REPO_COMMIT:0:7}"
+  fi
   fetch_asset "install.sh" "$APP_DIR/install.sh" 0755
   fetch_asset "bin/warp-vps" "$APP_DIR/bin/warp-vps" 0755
   fetch_asset "rules/google_ipv4.txt" "$APP_DIR/rules/google_ipv4.txt" 0644
