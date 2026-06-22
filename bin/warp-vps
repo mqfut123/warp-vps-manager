@@ -21,6 +21,9 @@ REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
 REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 RESOLVED_REPO_RAW_BASE=""
 RESOLVED_REPO_COMMIT=""
+UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+UNLOCK_CONNECT_TIMEOUT=5
+UNLOCK_MAX_TIME=12
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -233,7 +236,11 @@ resolve_github_raw_base() {
 resolve_repo_raw_base() {
   RESOLVED_REPO_RAW_BASE="${REPO_RAW_BASE%/}"
   RESOLVED_REPO_COMMIT=""
-  resolve_github_raw_base || true
+  case "${REPO_RAW_BASE%/}" in
+    https://raw.githubusercontent.com/*)
+      resolve_github_raw_base || die "无法把 GitHub raw 地址锁定到具体提交，请检查 GitHub API 连通性或使用完整可访问的 raw 地址"
+      ;;
+  esac
 }
 
 mask_repo_url() {
@@ -846,6 +853,122 @@ PY
   done
 }
 
+curl_unlock_page() {
+  local url="$1"
+  curl -4 -fsSL --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
+    -A "$UNLOCK_TEST_UA" \
+    -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+    -H 'accept-language: en-US,en;q=0.9' \
+    "$url" 2>/dev/null || true
+}
+
+extract_youtube_region() {
+  local body="$1"
+  local region
+  region="$(sed -n 's/.*"INNERTUBE_CONTEXT_GL"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
+  region="${region%%$'\n'*}"
+  if [ -z "$region" ]; then
+    region="$(sed -n 's/.*"countryCode"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
+    region="${region%%$'\n'*}"
+  fi
+  printf '%s' "$region" | tr '[:lower:]' '[:upper:]'
+  printf '\n'
+}
+
+extract_gemini_region() {
+  local body="$1"
+  awk 'match($0, /,2,1,200,"[A-Z][A-Z][A-Z]"/) { print substr($0, RSTART + 10, 3); exit }' <<< "$body"
+}
+
+probe_gemini_unlock() {
+  local body region
+  body="$(curl_unlock_page "https://gemini.google.com/")"
+  if [ -z "$body" ]; then
+    printf 'unknown|网络连接失败\n'
+    return 0
+  fi
+
+  region="$(extract_gemini_region "$body")"
+  if grep -q '45631641,null,true' <<< "$body"; then
+    if [ -n "$region" ]; then
+      printf 'yes|地区：%s\n' "$region"
+    else
+      printf 'yes|\n'
+    fi
+    return 0
+  fi
+
+  if grep -Eiq 'not available in your country|not currently available|is unavailable|unavailable in your country|Gemini is not available' <<< "$body"; then
+    printf 'no|当前出口不可用\n'
+    return 0
+  fi
+
+  printf 'unknown|页面特征不明确\n'
+}
+
+probe_youtube_premium_unlock() {
+  local body region
+  body="$(curl_unlock_page "https://www.youtube.com/premium")"
+  if [ -z "$body" ]; then
+    printf 'unknown|网络连接失败\n'
+    return 0
+  fi
+
+  region="$(extract_youtube_region "$body")"
+  if grep -q 'www.google.cn' <<< "$body"; then
+    printf 'no|地区：CN\n'
+    return 0
+  fi
+
+  if grep -Eiq 'Premium is not available in your country|Premium is not available' <<< "$body"; then
+    if [ -n "$region" ]; then
+      printf 'no|地区：%s\n' "$region"
+    else
+      printf 'no|当前出口不可用\n'
+    fi
+    return 0
+  fi
+
+  if [ -n "$region" ] && grep -Eiq 'ad-free|YouTube and YouTube Music ad-free' <<< "$body"; then
+    printf 'yes|地区：%s\n' "$region"
+    return 0
+  fi
+
+  if [ -z "$region" ]; then
+    printf 'unknown|未取到地区\n'
+  else
+    printf 'unknown|页面特征不明确\n'
+  fi
+}
+
+print_unlock_result() {
+  local name="$1"
+  local result="$2"
+  local status detail suffix
+  status="${result%%|*}"
+  detail="${result#*|}"
+  [ "$detail" != "$result" ] || detail=""
+  suffix=""
+  [ -n "$detail" ] && suffix="（${detail}）"
+  case "$status" in
+    yes) ok_line "${name}：可用${suffix}" ;;
+    no) warn_line "${name}：不可用${suffix}" ;;
+    *) warn_line "${name}：无法确认${suffix}" ;;
+  esac
+}
+
+run_unlock_checks() {
+  section "服务解锁检测（IPv4）"
+  if ! command -v curl >/dev/null 2>&1; then
+    warn_line "找不到 curl，无法检测 Gemini 和 YouTube Premium"
+    return 0
+  fi
+  info_line "正在检测 Gemini 和 YouTube Premium，请稍等"
+  print_unlock_result "Gemini" "$(probe_gemini_unlock)"
+  print_unlock_result "YouTube Premium" "$(probe_youtube_premium_unlock)"
+  info_line "检测基于公开网页特征和本机 IPv4 出口；若 Google 页面或地区策略变化，可能显示无法确认。"
+}
+
 run_self_check() {
   local failed=0
   local filter_rules=""
@@ -920,6 +1043,8 @@ run_self_check() {
     else
       warn_line "未检测到 Google IPv6 路由命中，可能是系统没有 IPv6 或内核不支持"
     fi
+
+    run_unlock_checks
 
     section "结论"
     if [ "$failed" -eq 0 ]; then
@@ -1017,6 +1142,8 @@ run_self_check() {
     fail_line "未找到 Google IPv6 防泄漏规则"
     failed=1
   fi
+
+  run_unlock_checks
 
   section "结论"
   if [ "$failed" -eq 0 ]; then
@@ -1117,7 +1244,9 @@ cmd_preflight_wireguard() {
 download_update_asset() {
   local rel="$1"
   local dest="$2"
-  curl -fsSL "$(raw_asset_url "$rel")" -o "$dest"
+  local url
+  url="$(raw_asset_url "$rel")"
+  curl -fsSL "$url" -o "$dest" || die "下载项目文件失败：${rel}（${url}）"
 }
 
 validate_update_stage() {

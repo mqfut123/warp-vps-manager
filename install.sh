@@ -25,6 +25,9 @@ REDSOCKS_MANAGED_MARKER="${STATE_DIR}/managed-redsocks-fallback"
 MANAGED_REDSOCKS_BIN=0
 RESOLVED_REPO_RAW_BASE=""
 RESOLVED_REPO_COMMIT=""
+UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+UNLOCK_CONNECT_TIMEOUT=5
+UNLOCK_MAX_TIME=12
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -163,6 +166,122 @@ check_memory_before_install() {
   fi
 }
 
+curl_unlock_page() {
+  local url="$1"
+  curl -4 -fsSL --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
+    -A "$UNLOCK_TEST_UA" \
+    -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+    -H 'accept-language: en-US,en;q=0.9' \
+    "$url" 2>/dev/null || true
+}
+
+extract_youtube_region() {
+  local body="$1"
+  local region
+  region="$(sed -n 's/.*"INNERTUBE_CONTEXT_GL"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
+  region="${region%%$'\n'*}"
+  if [ -z "$region" ]; then
+    region="$(sed -n 's/.*"countryCode"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
+    region="${region%%$'\n'*}"
+  fi
+  printf '%s' "$region" | tr '[:lower:]' '[:upper:]'
+  printf '\n'
+}
+
+extract_gemini_region() {
+  local body="$1"
+  awk 'match($0, /,2,1,200,"[A-Z][A-Z][A-Z]"/) { print substr($0, RSTART + 10, 3); exit }' <<< "$body"
+}
+
+probe_gemini_unlock() {
+  local body region
+  body="$(curl_unlock_page "https://gemini.google.com/")"
+  if [ -z "$body" ]; then
+    printf 'unknown|网络连接失败\n'
+    return 0
+  fi
+
+  region="$(extract_gemini_region "$body")"
+  if grep -q '45631641,null,true' <<< "$body"; then
+    if [ -n "$region" ]; then
+      printf 'yes|地区：%s\n' "$region"
+    else
+      printf 'yes|\n'
+    fi
+    return 0
+  fi
+
+  if grep -Eiq 'not available in your country|not currently available|is unavailable|unavailable in your country|Gemini is not available' <<< "$body"; then
+    printf 'no|当前出口不可用\n'
+    return 0
+  fi
+
+  printf 'unknown|页面特征不明确\n'
+}
+
+probe_youtube_premium_unlock() {
+  local body region
+  body="$(curl_unlock_page "https://www.youtube.com/premium")"
+  if [ -z "$body" ]; then
+    printf 'unknown|网络连接失败\n'
+    return 0
+  fi
+
+  region="$(extract_youtube_region "$body")"
+  if grep -q 'www.google.cn' <<< "$body"; then
+    printf 'no|地区：CN\n'
+    return 0
+  fi
+
+  if grep -Eiq 'Premium is not available in your country|Premium is not available' <<< "$body"; then
+    if [ -n "$region" ]; then
+      printf 'no|地区：%s\n' "$region"
+    else
+      printf 'no|当前出口不可用\n'
+    fi
+    return 0
+  fi
+
+  if [ -n "$region" ] && grep -Eiq 'ad-free|YouTube and YouTube Music ad-free' <<< "$body"; then
+    printf 'yes|地区：%s\n' "$region"
+    return 0
+  fi
+
+  if [ -z "$region" ]; then
+    printf 'unknown|未取到地区\n'
+  else
+    printf 'unknown|页面特征不明确\n'
+  fi
+}
+
+print_install_unlock_result() {
+  local name="$1"
+  local result="$2"
+  local status detail suffix
+  status="${result%%|*}"
+  detail="${result#*|}"
+  [ "$detail" != "$result" ] || detail=""
+  suffix=""
+  [ -n "$detail" ] && suffix="（${detail}）"
+  case "$status" in
+    yes) printf '  %s：可用%s\n' "$name" "$suffix" ;;
+    no) printf '  %s：不可用%s\n' "$name" "$suffix" ;;
+    *) printf '  %s：无法确认%s\n' "$name" "$suffix" ;;
+  esac
+}
+
+pre_install_unlock_probe() {
+  printf '\n安装前当前 IPv4 出口解锁检测：\n'
+  if ! command -v curl >/dev/null 2>&1; then
+    printf '  未找到 curl，跳过安装前检测；安装依赖时会自动补齐。\n'
+    return 0
+  fi
+  printf '  正在检测 Gemini 和 YouTube Premium，请稍等...\n'
+  print_install_unlock_result "Gemini" "$(probe_gemini_unlock)"
+  print_install_unlock_result "YouTube Premium" "$(probe_youtube_premium_unlock)"
+  printf '  说明：这是安装前当前 VPS IPv4 出口结果，安装完成后会再检测 WARP 分流后的 IPv4 出口结果。\n'
+}
+
 pkg_install_apt() {
   local mode="$1"
   case "$OS_ID" in
@@ -286,7 +405,11 @@ resolve_github_raw_base() {
 resolve_repo_raw_base() {
   RESOLVED_REPO_RAW_BASE="${REPO_RAW_BASE%/}"
   RESOLVED_REPO_COMMIT=""
-  resolve_github_raw_base || true
+  case "${REPO_RAW_BASE%/}" in
+    https://raw.githubusercontent.com/*)
+      resolve_github_raw_base || die "无法把 GitHub raw 地址锁定到具体提交，请检查 GitHub API 连通性或使用完整可访问的 raw 地址"
+      ;;
+  esac
 }
 
 enable_rhel_extra_repos() {
@@ -630,7 +753,9 @@ fetch_asset() {
     return
   fi
 
-  curl -fsSL "$(raw_asset_url "$rel")" -o "$dest"
+  local url
+  url="$(raw_asset_url "$rel")"
+  curl -fsSL "$url" -o "$dest" || die "下载项目文件失败：${rel}（${url}）"
   chmod "$mode" "$dest"
 }
 
@@ -721,6 +846,7 @@ main() {
   require_root
   validate_repo_raw_base "$REPO_RAW_BASE"
   check_memory_before_install
+  pre_install_unlock_probe
 
   local selected_mode
   selected_mode="$(prompt_install_mode)"
