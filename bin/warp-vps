@@ -656,6 +656,18 @@ wg_ok() {
   [ $((now - latest)) -lt 600 ]
 }
 
+wait_for_wg_ready() {
+  local timeout="${1:-45}"
+  local end=$((SECONDS + timeout))
+  while [ "$SECONDS" -le "$end" ]; do
+    if wg_interface_exists && route_uses_wg4 8.8.8.8 && wg_ok; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 route_uses_wg4() {
   ip -4 route get "$1" 2>/dev/null | grep -q "dev ${WG_IFACE}"
 }
@@ -901,6 +913,7 @@ cmd_restart() {
     info_line "正在重启 WireGuard WARP 网卡和分流路由，请稍等"
     systemctl restart "wg-quick@${WG_IFACE}.service"
     apply_rules
+    wait_for_wg_ready 45 || warn_line "WireGuard 已重启，但 WARP 出口暂未就绪"
     systemctl restart warp-vps.service
     cmd_test
     return
@@ -1018,6 +1031,7 @@ reload_runtime_after_update() {
   if [ "$WARP_MODE" = "wireguard" ]; then
     systemctl restart "wg-quick@${WG_IFACE}.service" || return 1
     "$BIN_PATH" apply || return 1
+    "$BIN_PATH" wait-wireguard || return 1
   else
     "$BIN_PATH" apply || return 1
     systemctl restart warp-vps-redsocks.service || return 1
@@ -1067,6 +1081,7 @@ cmd_heal() {
   if [ "$WARP_MODE" = "wireguard" ]; then
     systemctl restart "wg-quick@${WG_IFACE}.service" || true
     apply_rules
+    wait_for_wg_ready 45 || true
     if test_quiet; then
       log "自动修复成功"
     else
@@ -1084,6 +1099,13 @@ cmd_heal() {
   else
     die "自动修复失败，请运行 warp-vps logs 查看日志"
   fi
+}
+
+cmd_wait_wireguard() {
+  require_root
+  load_config
+  [ "$WARP_MODE" = "wireguard" ] || die "当前不是 WireGuard 模式"
+  wait_for_wg_ready 45
 }
 
 cmd_logs() {
@@ -1187,6 +1209,7 @@ usage() {
   stop-rules      移除本项目 nftables 规则
   setup-wireguard 准备 WireGuard WARP 配置
   preflight-wireguard 预检 WireGuard 网卡和路由
+  wait-wireguard  等待 WireGuard 出口就绪
   install-systemd 安装 systemd 服务
 EOF
 }
@@ -1204,6 +1227,7 @@ main() {
     stop-rules) require_root; stop_rules ;;
     setup-wireguard) cmd_setup_wireguard ;;
     preflight-wireguard) cmd_preflight_wireguard ;;
+    wait-wireguard) cmd_wait_wireguard ;;
     install-systemd) install_systemd ;;
     uninstall) cmd_uninstall ;;
     -h|--help|help|'') usage ;;
