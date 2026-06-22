@@ -29,6 +29,8 @@ sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-
 
 建议准备至少 1GB 可用磁盘空间。Ubuntu/Debian 上的 `cloudflare-warp` 官方包会拉取较多图形/桌面相关依赖，这是 Cloudflare 官方包依赖链导致的，不是本脚本额外启用 GUI。
 
+CentOS/RHEL/Rocky/AlmaLinux 的部分软件源没有 `redsocks` 包。脚本会先尝试包管理器安装；如果没有可用包，会从 `darkk/redsocks` 固定 commit 源码构建，并校验源码包 SHA256。
+
 使用 fork 或自定义 raw 地址：
 
 ```bash
@@ -104,7 +106,7 @@ IPv6: 84
 - Rocky Linux 8 / 9
 - AlmaLinux 8 / 9
 
-CentOS 7 不支持。CentOS/Rocky/AlmaLinux 9 会按 RHEL 兼容路径尝试安装；Socks5 模式依赖 Cloudflare 官方 RPM 仓库是否提供可用包，失败时会直接中止。WireGuard 模式不依赖官方 `cloudflare-warp` 包，但需要 TUN/WireGuard 内核能力。
+CentOS 7 不支持。CentOS/Rocky/AlmaLinux 9 会按 RHEL 兼容路径尝试安装；Socks5 模式需要 Cloudflare 官方 RPM 仓库可用。若系统仓库缺少 `redsocks`，安装器会用固定源码包构建；源码下载或校验失败会直接中止。WireGuard 模式不依赖官方 `cloudflare-warp` 包，但需要 TUN/WireGuard 内核能力。
 
 如果 VPS 或容器内核缺少 `nftables` NAT 能力，安装会 fail-fast。
 
@@ -135,6 +137,7 @@ warp-vps uninstall
 - Socks5 模式不承诺透明代理 UDP，UDP/443 通过阻断促使多数浏览器回落 TCP；不支持回落的应用可能失败。
 - WireGuard 模式会增加 WARP 网卡和 Google CIDR 路由，可能和已有 WireGuard/TUN 类服务冲突。
 - WireGuard 模式使用第三方开源 `wgcf` 获取 WARP WireGuard 配置，不使用 Cloudflare 官方客户端；脚本固定下载 `wgcf v2.2.31` 并校验 SHA256，不跟随 latest 自动漂移。
+- RPM 系统缺少 `redsocks` 包时，脚本会从 `darkk/redsocks` 固定 commit 构建 `redsocks 0.5` 并校验源码 SHA256。
 - 不后台自动抓取 Google 实时规则。
 - 不永久删除安装文件。
 - 一键安装和 `warp-vps update` 信任配置的 GitHub raw 地址。生产发布前应保护 GitHub 账号、分支和 release 流程。
