@@ -25,10 +25,29 @@ load_os_release() {
   . /etc/os-release
   OS_ID="${ID:-}"
   OS_VERSION_ID="${VERSION_ID:-}"
+  OS_VERSION_MAJOR="${OS_VERSION_ID%%.*}"
   OS_CODENAME="${VERSION_CODENAME:-}"
 }
 
 pkg_install_apt() {
+  case "$OS_ID" in
+    ubuntu)
+      case "$OS_VERSION_MAJOR" in
+        22|24) ;;
+        *) die "unsupported Ubuntu version: ${OS_VERSION_ID:-unknown}; supported LTS versions: 22.04, 24.04" ;;
+      esac
+      ;;
+    debian)
+      case "$OS_VERSION_MAJOR" in
+        12|13) ;;
+        *) die "unsupported Debian version: ${OS_VERSION_ID:-unknown}; supported versions: 12, 13" ;;
+      esac
+      ;;
+    *)
+      die "unsupported apt OS: ${OS_ID:-unknown}"
+      ;;
+  esac
+
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y curl ca-certificates gnupg lsb-release nftables iptables iproute2 python3 redsocks
@@ -66,6 +85,21 @@ enable_rhel_extra_repos() {
 }
 
 pkg_install_rpm() {
+  case "$OS_ID" in
+    centos)
+      [ "$OS_VERSION_MAJOR" = "8" ] || die "unsupported CentOS version: ${OS_VERSION_ID:-unknown}; Cloudflare WARP officially supports CentOS 8"
+      ;;
+    rhel|rocky|almalinux)
+      case "$OS_VERSION_MAJOR" in
+        8|9) ;;
+        *) die "unsupported ${OS_ID} version: ${OS_VERSION_ID:-unknown}; supported major versions: 8, 9" ;;
+      esac
+      ;;
+    *)
+      die "unsupported RPM OS: ${OS_ID:-unknown}"
+      ;;
+  esac
+
   enable_rhel_extra_repos
   rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
   curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
@@ -83,11 +117,11 @@ install_dependencies() {
     debian|ubuntu)
       pkg_install_apt
       ;;
-    rocky|almalinux)
+    centos|rhel|rocky|almalinux)
       pkg_install_rpm
       ;;
     *)
-      die "unsupported OS: ${OS_ID:-unknown}; supported: Debian, Ubuntu, Rocky, AlmaLinux"
+      die "unsupported OS: ${OS_ID:-unknown}; supported: Debian, Ubuntu, CentOS, RHEL, Rocky, AlmaLinux"
       ;;
   esac
 
