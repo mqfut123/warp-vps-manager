@@ -14,19 +14,30 @@
 
 ## 一键安装
 
-生产安装建议使用固定版本 tag：
+请先切到 `root` 用户。生产安装建议使用固定版本 tag，按系统复制对应命令。
+
+Debian / Ubuntu：
 
 ```bash
-WARP_VPS_REPO_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1" \
-sudo -E bash -c 'set -e; if ! command -v curl >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 update -y && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 install -y curl ca-certificates; elif command -v dnf >/dev/null 2>&1; then dnf install -y curl ca-certificates; elif command -v yum >/dev/null 2>&1; then yum install -y curl ca-certificates; else echo "找不到 curl，也找不到 apt/dnf/yum，无法自举安装" >&2; exit 1; fi; fi; t="$(mktemp)"; curl -fsSL "$WARP_VPS_REPO_BASE/install.sh" -o "$t"; bash "$t"'
+apt-get update -y && apt-get install -y curl ca-certificates
+export WARP_VPS_REPO_BASE=https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1
+curl -fsSL $WARP_VPS_REPO_BASE/install.sh -o wvpm.sh && bash wvpm.sh
 ```
 
-这条 bootstrap 命令会在缺少 `curl` 时先尝试用 `apt`、`dnf` 或 `yum` 安装 `curl` 和证书。若脚本下载失败，命令会直接非零退出，不会假装安装成功。生产命令固定到 tag，避免安装过程中 `main` 分支移动导致混装。
-
-如果你要测试最新主线版，可以把 `WARP_VPS_REPO_BASE` 改成：
+CentOS / AlmaLinux：
 
 ```bash
-https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main
+(dnf install -y curl ca-certificates || yum install -y curl ca-certificates)
+export WARP_VPS_REPO_BASE=https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.1
+curl -fsSL $WARP_VPS_REPO_BASE/install.sh -o wvpm.sh && bash wvpm.sh
+```
+
+安装命令固定到 tag，避免安装过程中 `main` 分支移动导致混装。若要测试最新主线版，把第二行的 `v0.1.1` 改成 `main`。
+
+使用 fork 或自定义 raw 地址时，只需要改第二行：
+
+```bash
+export WARP_VPS_REPO_BASE=https://raw.githubusercontent.com/YOUR_NAME/warp-vps-manager/main
 ```
 
 安装前脚本会先检查可用内存。如果可用内存低于 1G 且没有 Swap，会提示你创建 Swap 或自行承担安装失败风险。
@@ -43,13 +54,6 @@ https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main
 建议准备至少 1GB 可用磁盘空间。Ubuntu/Debian 上的 `cloudflare-warp` 官方包会拉取较多图形/桌面相关依赖，这是 Cloudflare 官方包依赖链导致的，不是本脚本额外启用 GUI。
 
 CentOS/RHEL/Rocky/AlmaLinux 的部分软件源没有 `redsocks` 包。脚本会先尝试包管理器安装；如果没有可用包，会从 `darkk/redsocks` 固定 commit 源码构建，并校验源码包 SHA256。
-
-使用 fork 或自定义 raw 地址：
-
-```bash
-WARP_VPS_REPO_BASE="https://raw.githubusercontent.com/YOUR_NAME/warp-vps-manager/main" \
-sudo -E bash -c 'set -e; if ! command -v curl >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 update -y && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1200 install -y curl ca-certificates; elif command -v dnf >/dev/null 2>&1; then dnf install -y curl ca-certificates; elif command -v yum >/dev/null 2>&1; then yum install -y curl ca-certificates; else echo "找不到 curl，也找不到 apt/dnf/yum，无法自举安装" >&2; exit 1; fi; fi; t="$(mktemp)"; curl -fsSL "$WARP_VPS_REPO_BASE/install.sh" -o "$t"; bash "$t"'
-```
 
 ## 核心特性
 
