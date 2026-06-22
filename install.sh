@@ -657,11 +657,16 @@ configure_warp() {
   timeout 30 warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 \
     || timeout 30 warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 \
     || true
-  timeout 30 warp-cli --accept-tos mode proxy >/dev/null 2>&1 || timeout 30 warp-cli mode proxy >/dev/null 2>&1
+  timeout 30 warp-cli --accept-tos mode proxy >/dev/null 2>&1 \
+    || timeout 30 warp-cli mode proxy >/dev/null 2>&1 \
+    || die "无法把 Cloudflare WARP 切换到 SOCKS 代理模式"
   timeout 30 warp-cli --accept-tos proxy port "$port" >/dev/null 2>&1 \
     || timeout 30 warp-cli --accept-tos set-proxy-port "$port" >/dev/null 2>&1 \
-    || timeout 30 warp-cli proxy port "$port" >/dev/null 2>&1
-  timeout 60 warp-cli --accept-tos connect >/dev/null 2>&1 || timeout 60 warp-cli connect >/dev/null 2>&1
+    || timeout 30 warp-cli proxy port "$port" >/dev/null 2>&1 \
+    || die "无法设置 WARP SOCKS 端口 $port"
+  timeout 60 warp-cli --accept-tos connect >/dev/null 2>&1 \
+    || timeout 60 warp-cli connect >/dev/null 2>&1 \
+    || log "WARP connect 命令返回非零，继续等待本地 SOCKS 自检"
   if ! wait_for_tcp_port "$port" 20; then
     die "warp-cli 没有监听 SOCKS 端口 $port"
   fi
