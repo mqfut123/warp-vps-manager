@@ -15,7 +15,7 @@ WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
 SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
-APP_VERSION_VALUE="0.1.4"
+APP_VERSION_VALUE="0.1.5"
 APT_LOCK_TIMEOUT=1200
 REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
 REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
@@ -32,6 +32,15 @@ UNLOCK_MAX_TIME=12
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
+
+read_input() {
+  local var_name="$1"
+  if [ -r /dev/tty ]; then
+    IFS= read -r "$var_name" </dev/tty
+  else
+    IFS= read -r "$var_name"
+  fi
+}
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || die "请使用 root 用户运行"
@@ -138,13 +147,13 @@ prompt_swap_creation() {
     printf '  4. 不创建 Swap，接受安装中途失败的风险继续\n'
     printf '  5. 退出安装\n'
     printf '请输入选项：'
-    read -r choice
+    read_input choice || die "无法读取输入，已退出安装"
     case "$choice" in
       1) selected=1024 ;;
       2) selected=2048 ;;
       3)
         printf '请输入要创建的 Swap 大小，单位 G，例如 2：'
-        read -r custom_gb
+        read_input custom_gb || die "无法读取输入，已退出安装"
         case "$custom_gb" in
           ''|*[!0-9]*) die "输入无效，已退出安装" ;;
         esac
@@ -191,7 +200,7 @@ check_memory_before_install() {
       "$(format_gb "$mem_mb")" "$(format_gb "$swap_total")" "$(format_gb "$swap_free")"
     printf '内存仍然偏低，安装存在失败风险。建议先自行调整 Swap 后再安装。\n'
     printf '输入 1 表示知道风险并继续，其他输入退出：'
-    read -r choice
+    read_input choice || die "无法读取输入，已退出安装"
     [ "$choice" = "1" ] || die "已退出安装"
   fi
 }
@@ -686,7 +695,7 @@ prompt_install_mode() {
   fi
   printf '直接回车默认选择：Socks5\n' >&2
   printf '请输入选项：' >&2
-  read -r choice
+  read_input choice || die "无法读取输入，已退出安装"
 
   case "$choice" in
     '')
@@ -729,7 +738,7 @@ prompt_warp_port() {
     input="$WARP_SOCKS_PORT"
   else
     printf '请输入 WARP SOCKS 端口（直接回车随机选择空闲端口）：' >&2
-    read -r input
+    read_input input || die "无法读取输入，已退出安装"
   fi
 
   if [ -z "$input" ]; then
