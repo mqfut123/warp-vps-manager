@@ -390,14 +390,14 @@ protect_ssh_peer_route() {
   die "无法完成 SSH 来源 IP 路由安全检查"
 }
 
-wgcf_asset_keyword() {
+wgcf_asset_spec() {
   case "$(uname -m)" in
-    x86_64|amd64) printf 'linux_amd64\n' ;;
-    aarch64|arm64) printf 'linux_arm64\n' ;;
-    armv7l) printf 'linux_armv7\n' ;;
-    armv6l) printf 'linux_armv6\n' ;;
-    armv5*) printf 'linux_armv5\n' ;;
-    i386|i686) printf 'linux_386\n' ;;
+    x86_64|amd64) printf 'wgcf_2.2.31_linux_amd64 69147e1a517c66129edd8ac8cb60484d6c9515178d7b4a2f95e3c925f225572a\n' ;;
+    aarch64|arm64) printf 'wgcf_2.2.31_linux_arm64 b9bdbdeaa3f9f4ba741ba55b8bd94c24f7166c27668eb7e8192ccf9746961182\n' ;;
+    armv7l) printf 'wgcf_2.2.31_linux_armv7 207a932daba270dce9a604cda69554e08a25626a1f0b2ab4c00fc841a70b5667\n' ;;
+    armv6l) printf 'wgcf_2.2.31_linux_armv6 1789be271b58b81193ab0931d6e32d473412020a4c3dbf0d27e33126c0122781\n' ;;
+    armv5*) printf 'wgcf_2.2.31_linux_armv5 8e056bb31025c8d40fc2e8788cbc32e62933cfdca4ebcc0d6d26cab42e82fb94\n' ;;
+    i386|i686) printf 'wgcf_2.2.31_linux_386 e446abc089e32bb23c90f07a5967b33704567edd120bcf7bdbf720ce52776117\n' ;;
     *) die "WireGuard 模式暂不支持当前 CPU 架构：$(uname -m)" ;;
   esac
 }
@@ -405,56 +405,31 @@ wgcf_asset_keyword() {
 install_wgcf_binary() {
   [ -x "$WGCF_BIN" ] && return 0
   install -d -m 0755 "$(dirname "$WGCF_BIN")"
-  local keyword wgcf_version
-  keyword="$(wgcf_asset_keyword)"
-  wgcf_version="${WARP_VPS_WGCF_VERSION:-$DEFAULT_WGCF_VERSION}"
-  python3 - "$keyword" "$WGCF_BIN" "$wgcf_version" <<'PY'
+  local asset_name expected_sha url
+  read -r asset_name expected_sha <<EOF
+$(wgcf_asset_spec)
+EOF
+  url="https://github.com/ViRb3/wgcf/releases/download/${DEFAULT_WGCF_VERSION}/${asset_name}"
+  python3 - "$url" "$WGCF_BIN" "$asset_name" "$expected_sha" "$DEFAULT_WGCF_VERSION" <<'PY'
 import hashlib
-import json
-import os
 import pathlib
 import stat
 import sys
 import urllib.request
 
-keyword = sys.argv[1]
+url = sys.argv[1]
 dest = pathlib.Path(sys.argv[2])
-version = sys.argv[3]
-api_url = f"https://api.github.com/repos/ViRb3/wgcf/releases/tags/{version}"
-with urllib.request.urlopen(api_url, timeout=30) as response:
-    release = json.loads(response.read())
-matches = [
-    asset
-    for asset in release.get("assets", [])
-    if keyword in asset.get("name", "") and "sha" not in asset.get("name", "").lower()
-]
-if len(matches) != 1:
-    raise SystemExit(f"无法确定 wgcf 下载地址，匹配数量：{len(matches)}")
-checksum_assets = [
-    asset for asset in release.get("assets", [])
-    if asset.get("name") == "checksums.txt"
-]
-if len(checksum_assets) != 1:
-    raise SystemExit("无法找到 wgcf checksums.txt")
-asset = matches[0]
-with urllib.request.urlopen(asset["browser_download_url"], timeout=120) as response:
+asset_name = sys.argv[3]
+expected = sys.argv[4].lower()
+version = sys.argv[5]
+with urllib.request.urlopen(url, timeout=120) as response:
     data = response.read()
-with urllib.request.urlopen(checksum_assets[0]["browser_download_url"], timeout=30) as response:
-    checksums = response.read().decode("utf-8", errors="replace").splitlines()
-expected = None
-for line in checksums:
-    parts = line.split()
-    if len(parts) >= 2 and parts[1] == asset["name"]:
-        expected = parts[0].lower()
-        break
 actual = hashlib.sha256(data).hexdigest()
-if not expected:
-    raise SystemExit(f"checksums.txt 缺少 {asset['name']} 的校验值")
 if actual != expected:
-    raise SystemExit("wgcf 下载文件 SHA256 校验失败")
+    raise SystemExit(f"wgcf SHA256 校验失败：{asset_name}")
 dest.write_bytes(data)
 dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-print(f"已下载并校验 wgcf：{release.get('tag_name', 'unknown')}")
+print(f"已下载并校验 wgcf：{version} {asset_name}")
 PY
 }
 
@@ -1179,6 +1154,10 @@ cmd_status() {
   run_self_check
 }
 
+cmd_unlock_check() {
+  run_unlock_checks
+}
+
 cmd_restart() {
   require_root
   load_config
@@ -1235,8 +1214,13 @@ cmd_preflight_wireguard() {
       failed=1
     fi
   fi
-  stop_wg_routes || true
+  if ! stop_wg_routes; then
+    failed=1
+  fi
   wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
+  if wg_interface_exists; then
+    failed=1
+  fi
   [ "$failed" -eq 0 ] || die "WireGuard 预检失败，未写入开机服务"
   ok_line "WireGuard 预检通过"
 }
@@ -1504,6 +1488,7 @@ usage() {
   status          查看中文状态自检
   test            运行一次中文自检
   restart         重启 WARP 分流链路
+  unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
   update          更新脚本和固定规则快照
   logs            查看最近日志
   uninstall       卸载并移动文件到备份目录
@@ -1524,6 +1509,7 @@ main() {
   case "$cmd" in
     status) cmd_status ;;
     test) cmd_test ;;
+    unlock-check) cmd_unlock_check ;;
     restart) cmd_restart ;;
     update) cmd_update ;;
     logs) cmd_logs ;;

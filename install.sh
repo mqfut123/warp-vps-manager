@@ -5,6 +5,7 @@ APP_NAME="warp-vps-manager"
 APP_DIR="/opt/${APP_NAME}"
 ETC_DIR="/etc/${APP_NAME}"
 STATE_DIR="/var/lib/${APP_NAME}"
+BACKUP_ROOT="/var/backups/${APP_NAME}"
 BIN_PATH="/usr/local/bin/warp-vps"
 CONFIG_FILE="${ETC_DIR}/config.env"
 REDSOCKS_USER="warp-vps-redsocks"
@@ -14,7 +15,7 @@ WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
 SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
-APP_VERSION_VALUE="0.1.0"
+APP_VERSION_VALUE="0.1.1"
 APT_LOCK_TIMEOUT=1200
 REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
 REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
@@ -83,14 +84,43 @@ create_swap_file() {
   [ ! -e "$SWAP_FILE" ] || die "$SWAP_FILE 已存在，请先自行检查后再安装"
 
   log "正在创建 $(format_gb "$size_mb") Swap：$SWAP_FILE"
-  dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=progress
-  chmod 0600 "$SWAP_FILE"
-  mkswap "$SWAP_FILE" >/dev/null
-  swapon "$SWAP_FILE"
+  if ! dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=progress; then
+    rollback_swap_file "写入 Swap 文件失败"
+    die "Swap 创建失败：写入文件失败"
+  fi
+  if ! chmod 0600 "$SWAP_FILE"; then
+    rollback_swap_file "设置 Swap 权限失败"
+    die "Swap 创建失败：无法设置权限"
+  fi
+  if ! mkswap "$SWAP_FILE" >/dev/null; then
+    rollback_swap_file "格式化 Swap 失败"
+    die "Swap 创建失败：mkswap 失败"
+  fi
+  if ! swapon "$SWAP_FILE"; then
+    rollback_swap_file "启用 Swap 失败"
+    die "Swap 创建失败：swapon 失败"
+  fi
   if ! grep -qF "$SWAP_FILE" /etc/fstab; then
-    printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab
+    if ! printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab; then
+      rollback_swap_file "写入 /etc/fstab 失败"
+      die "Swap 创建失败：无法写入 /etc/fstab"
+    fi
   fi
   log "Swap 创建完成"
+}
+
+rollback_swap_file() {
+  local reason="$1"
+  local backup_dir="${BACKUP_ROOT}/swap-failed-$(date -u +%Y%m%dT%H%M%SZ)"
+  log "$reason，正在撤销本次 Swap 创建"
+  if grep -qF "$SWAP_FILE" /proc/swaps 2>/dev/null; then
+    swapoff "$SWAP_FILE" >/dev/null 2>&1 || true
+  fi
+  if [ -e "$SWAP_FILE" ]; then
+    install -d -m 0755 "$backup_dir"
+    mv "$SWAP_FILE" "${backup_dir}/swapfile-warp-vps-manager"
+    log "半成品 Swap 文件已移动到：${backup_dir}/swapfile-warp-vps-manager"
+  fi
 }
 
 prompt_swap_creation() {
@@ -567,6 +597,12 @@ ensure_no_existing_redsocks_service() {
   fi
 }
 
+ensure_no_existing_warp_client() {
+  if command -v warp-cli >/dev/null 2>&1 || systemctl list-unit-files warp-svc.service >/dev/null 2>&1; then
+    die "检测到系统已有 Cloudflare WARP 官方客户端。为避免接管或停用用户原有 WARP，请先自行确认并清理后再安装 Socks5 模式"
+  fi
+}
+
 preflight_nft_nat() {
   local table="warp_vps_preflight_$$"
   nft delete table inet "$table" >/dev/null 2>&1 || true
@@ -842,6 +878,17 @@ EOF
   chmod 0600 "$CONFIG_FILE"
 }
 
+run_final_self_check() {
+  if "$BIN_PATH" test; then
+    return 0
+  fi
+  log "最终自检失败，正在撤销已启用的服务和分流规则"
+  if "$BIN_PATH" uninstall; then
+    die "最终自检失败，已撤销本项目运行态并把文件移动到备份目录"
+  fi
+  die "最终自检失败，自动撤销也失败；请检查 systemd 和 nftables 状态"
+}
+
 main() {
   require_root
   validate_repo_raw_base "$REPO_RAW_BASE"
@@ -850,7 +897,10 @@ main() {
 
   local selected_mode
   selected_mode="$(prompt_install_mode)"
-  [ "$selected_mode" = "socks" ] && ensure_no_existing_redsocks_service
+  if [ "$selected_mode" = "socks" ]; then
+    ensure_no_existing_redsocks_service
+    ensure_no_existing_warp_client
+  fi
   log "正在安装依赖"
   install_dependencies "$selected_mode"
   [ "$selected_mode" = "socks" ] && preflight_nft_nat
@@ -899,7 +949,7 @@ main() {
   systemctl enable --now warp-vps-health.timer
 
   log "正在运行最终自检"
-  "$BIN_PATH" test
+  run_final_self_check
 
   printf '\nWARP VPS Manager 安装完成。\n'
   if [ "$selected_mode" = "socks" ]; then
