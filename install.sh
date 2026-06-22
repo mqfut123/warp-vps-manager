@@ -123,6 +123,22 @@ port_in_use() {
   ss -H -ltnu "sport = :$1" 2>/dev/null | grep -q .
 }
 
+tcp_port_listening() {
+  ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
+}
+
+wait_for_tcp_port() {
+  local port="$1"
+  local max_wait="${2:-20}"
+  local waited=0
+  while [ "$waited" -lt "$max_wait" ]; do
+    tcp_port_listening "$port" && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  tcp_port_listening "$port"
+}
+
 find_free_port() {
   local avoid="${1:-}"
   local candidate
@@ -232,8 +248,7 @@ configure_warp() {
     || timeout 30 warp-cli --accept-tos set-proxy-port "$port" >/dev/null 2>&1 \
     || timeout 30 warp-cli proxy port "$port" >/dev/null 2>&1
   timeout 60 warp-cli --accept-tos connect >/dev/null 2>&1 || timeout 60 warp-cli connect >/dev/null 2>&1
-  sleep 3
-  if ! ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
+  if ! wait_for_tcp_port "$port" 20; then
     die "warp-cli did not listen on SOCKS port $port"
   fi
   if ! curl --socks5-hostname "127.0.0.1:${port}" -fsS --connect-timeout 8 --max-time 15 \

@@ -272,6 +272,17 @@ port_listening() {
   ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
 }
 
+wait_for_socks_listen() {
+  local max_wait="${1:-20}"
+  local waited=0
+  while [ "$waited" -lt "$max_wait" ]; do
+    port_listening "$WARP_SOCKS_PORT" && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  port_listening "$WARP_SOCKS_PORT"
+}
+
 socks_trace() {
   curl --socks5-hostname "127.0.0.1:${WARP_SOCKS_PORT}" -fsS --connect-timeout 8 --max-time 15 \
     https://www.cloudflare.com/cdn-cgi/trace
@@ -303,7 +314,7 @@ ensure_warp_connected() {
 
 test_quiet() {
   load_config
-  port_listening "$WARP_SOCKS_PORT" || return 1
+  wait_for_socks_listen 8 || return 1
   socks_ok || return 1
   service_active warp-vps-redsocks.service || return 1
   table_exists || return 1
@@ -325,7 +336,7 @@ cmd_test() {
   local filter_rules=""
 
   printf 'WARP SOCKS port: %s\n' "$WARP_SOCKS_PORT"
-  if port_listening "$WARP_SOCKS_PORT"; then
+  if wait_for_socks_listen 8; then
     printf 'WARP SOCKS listen: ok\n'
   else
     printf 'WARP SOCKS listen: failed\n'
@@ -411,6 +422,7 @@ cmd_restart() {
   load_config
   systemctl restart warp-svc >/dev/null 2>&1 || true
   ensure_warp_connected
+  wait_for_socks_listen 20 || die "WARP SOCKS port did not listen after restarting warp-svc"
   systemctl restart warp-vps-redsocks.service
   apply_rules
   systemctl restart warp-vps.service
@@ -476,6 +488,7 @@ cmd_heal() {
   warn "health check failed; restarting local WARP path"
   systemctl restart warp-svc >/dev/null 2>&1 || true
   ensure_warp_connected
+  wait_for_socks_listen 20 || die "WARP SOCKS port did not listen after restarting warp-svc"
   systemctl restart warp-vps-redsocks.service || true
   apply_rules
   if test_quiet; then
