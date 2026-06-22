@@ -143,7 +143,7 @@ prompt_warp_port() {
   if [ -n "${WARP_SOCKS_PORT:-}" ]; then
     input="$WARP_SOCKS_PORT"
   else
-    printf 'Enter WARP SOCKS port [press Enter for a random free port]: '
+    printf 'Enter WARP SOCKS port [press Enter for a random free port]: ' >&2
     read -r input
   fi
 
@@ -156,6 +156,13 @@ prompt_warp_port() {
   reserved_port "$input" && die "port $input is reserved by a common service"
   port_in_use "$input" && die "port $input is already listening"
   printf '%s\n' "$input"
+}
+
+disable_packaged_redsocks_service() {
+  if systemctl list-unit-files redsocks.service >/dev/null 2>&1; then
+    systemctl stop redsocks.service >/dev/null 2>&1 || true
+    systemctl disable redsocks.service >/dev/null 2>&1 || true
+  fi
 }
 
 validate_repo_raw_base() {
@@ -262,13 +269,16 @@ main() {
 
   local warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
   warp_port="$(prompt_warp_port)"
+  valid_port "$warp_port" || die "internal error: selected WARP SOCKS port is invalid"
   redsocks_port="$(find_free_port "$warp_port")"
+  valid_port "$redsocks_port" || die "internal error: selected redsocks port is invalid"
   ensure_redsocks_user
   redsocks_uid="$(id -u "$REDSOCKS_USER")"
   redsocks_group="$(id -gn "$REDSOCKS_USER")"
   redsocks_bin="$(command -v redsocks)"
 
   log "installing project files"
+  disable_packaged_redsocks_service
   install_project_files
   write_config "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
 
