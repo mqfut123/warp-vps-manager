@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="warp-vps-manager"
+APP_DIR="/opt/${APP_NAME}"
+ETC_DIR="/etc/${APP_NAME}"
+STATE_DIR="/var/lib/${APP_NAME}"
+BACKUP_ROOT="/var/backups/${APP_NAME}"
+CONFIG_FILE="${ETC_DIR}/config.env"
+REDSOCKS_CONF="${ETC_DIR}/redsocks.conf"
+NFT_CONF="${ETC_DIR}/nftables.conf"
+RULES_DIR="${APP_DIR}/rules"
+BIN_PATH="/usr/local/bin/warp-vps"
+
+log() { printf '[warp-vps] %s\n' "$*"; }
+warn() { printf '[warp-vps] WARN: %s\n' "$*" >&2; }
+die() { printf '[warp-vps] ERROR: %s\n' "$*" >&2; exit 1; }
+
+require_root() {
+  [ "$(id -u)" -eq 0 ] || die "must run as root"
+}
+
+load_config() {
+  [ -r "$CONFIG_FILE" ] || die "missing config: $CONFIG_FILE"
+  local line key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+      *=*) ;;
+      *) die "invalid config line in $CONFIG_FILE: $line" ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      APP_VERSION) APP_VERSION="$value" ;;
+      REPO_RAW_BASE) REPO_RAW_BASE="$value" ;;
+      WARP_SOCKS_PORT) WARP_SOCKS_PORT="$value" ;;
+      REDSOCKS_PORT) REDSOCKS_PORT="$value" ;;
+      REDSOCKS_USER) REDSOCKS_USER="$value" ;;
+      REDSOCKS_UID) REDSOCKS_UID="$value" ;;
+      REDSOCKS_GROUP) REDSOCKS_GROUP="$value" ;;
+      REDSOCKS_BIN) REDSOCKS_BIN="$value" ;;
+      *) die "unknown config key in $CONFIG_FILE: $key" ;;
+    esac
+  done < "$CONFIG_FILE"
+  : "${WARP_SOCKS_PORT:?missing WARP_SOCKS_PORT}"
+  : "${REDSOCKS_PORT:?missing REDSOCKS_PORT}"
+  : "${REDSOCKS_USER:?missing REDSOCKS_USER}"
+  : "${REDSOCKS_UID:?missing REDSOCKS_UID}"
+  REDSOCKS_GROUP="${REDSOCKS_GROUP:-$REDSOCKS_USER}"
+  : "${REDSOCKS_GROUP:?missing REDSOCKS_GROUP}"
+  : "${REDSOCKS_BIN:?missing REDSOCKS_BIN}"
+  : "${REPO_RAW_BASE:?missing REPO_RAW_BASE}"
+  valid_config_port "$WARP_SOCKS_PORT" || die "invalid WARP_SOCKS_PORT in config"
+  valid_config_port "$REDSOCKS_PORT" || die "invalid REDSOCKS_PORT in config"
+  case "$REDSOCKS_UID" in ''|*[!0-9]*) die "invalid REDSOCKS_UID in config" ;; esac
+  validate_repo_raw_base "$REPO_RAW_BASE"
+}
+
+valid_config_port() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+validate_repo_raw_base() {
+  local url="$1"
+  [ -n "$url" ] || die "REPO_RAW_BASE cannot be empty"
+  case "$url" in
+    https://*) ;;
+    *) die "REPO_RAW_BASE must start with https://" ;;
+  esac
+  case "$url" in
+    *$'\n'*|*$'\r'*|*$'\t'*|*" "*) die "REPO_RAW_BASE must not contain whitespace" ;;
+  esac
+  local rest="${url#https://}"
+  local authority="${rest%%/*}"
+  case "$authority" in
+    *@*) die "REPO_RAW_BASE must not contain credentials or userinfo" ;;
+    '') die "REPO_RAW_BASE missing host" ;;
+  esac
+}
+
+mask_repo_url() {
+  local url="$1"
+  local rest authority
+  rest="${url#https://}"
+  authority="${rest%%/*}"
+  if [ "$rest" = "$authority" ]; then
+    printf 'https://%s\n' "$authority"
+  else
+    printf 'https://%s/%s\n' "$authority" "${rest#*/}"
+  fi
+}
+
+validate_rules_file() {
+  local file="$1"
+  local version="$2"
+  python3 - "$file" "$version" <<'PY'
+import ipaddress
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+version = int(sys.argv[2])
+seen = 0
+for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line != raw or any(ch.isspace() for ch in line):
+        raise SystemExit(f"{path}:{lineno}: invalid whitespace")
+    network = ipaddress.ip_network(line, strict=True)
+    if network.version != version:
+        raise SystemExit(f"{path}:{lineno}: expected IPv{version}, got IPv{network.version}")
+    seen += 1
+if seen == 0:
+    raise SystemExit(f"{path}: no rules")
+PY
+}
+
+join_rules() {
+  local file="$1"
+  [ -r "$file" ] || die "missing rule file: $file"
+  awk 'NF && $1 !~ /^#/ { printf "%s%s", sep, $1; sep=", " } END { print "" }' "$file"
+}
+
+render_redsocks_conf() {
+  cat > "$REDSOCKS_CONF" <<EOF
+base {
+  log_debug = off;
+  log_info = on;
+  log = "syslog:daemon";
+  daemon = off;
+  redirector = iptables;
+}
+
+redsocks {
+  local_ip = 127.0.0.1;
+  local_port = ${REDSOCKS_PORT};
+  ip = 127.0.0.1;
+  port = ${WARP_SOCKS_PORT};
+  type = socks5;
+}
+EOF
+  chmod 0644 "$REDSOCKS_CONF"
+}
+
+render_nft_conf() {
+  local google4 google6
+  validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4
+  validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
+  google4="$(join_rules "${RULES_DIR}/google_ipv4.txt")"
+  google6="$(join_rules "${RULES_DIR}/google_ipv6.txt")"
+  [ -n "$google4" ] || die "IPv4 rules are empty"
+  [ -n "$google6" ] || die "IPv6 rules are empty"
+
+  local table_action
+  if table_exists; then
+    table_action="flush table inet warp_vps"
+  else
+    table_action="add table inet warp_vps"
+  fi
+
+  cat > "$NFT_CONF" <<EOF
+${table_action}
+add set inet warp_vps google4 { type ipv4_addr; flags interval; auto-merge; elements = { ${google4} }; }
+add set inet warp_vps google6 { type ipv6_addr; flags interval; auto-merge; elements = { ${google6} }; }
+add chain inet warp_vps output_nat { type nat hook output priority dstnat; policy accept; }
+add rule inet warp_vps output_nat meta skuid ${REDSOCKS_UID} return
+add rule inet warp_vps output_nat oifname "lo" return
+add rule inet warp_vps output_nat ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 } return
+add rule inet warp_vps output_nat ip daddr @google4 meta l4proto tcp counter comment "warp-vps-google-tcp" redirect to :${REDSOCKS_PORT}
+add chain inet warp_vps output_filter { type filter hook output priority filter; policy accept; }
+add rule inet warp_vps output_filter meta skuid ${REDSOCKS_UID} return
+add rule inet warp_vps output_filter oifname "lo" return
+add rule inet warp_vps output_filter ip daddr @google4 udp dport 443 counter comment "warp-vps-google-quic-block" reject with icmpx type admin-prohibited
+add rule inet warp_vps output_filter ip6 daddr @google6 counter comment "warp-vps-google-ipv6-block" reject with icmpx type admin-prohibited
+EOF
+  chmod 0644 "$NFT_CONF"
+}
+
+table_exists() {
+  nft list table inet warp_vps >/dev/null 2>&1
+}
+
+apply_rules() {
+  load_config
+  validate_repo_raw_base "$REPO_RAW_BASE"
+  install -d -m 0755 "$ETC_DIR"
+  render_redsocks_conf
+  render_nft_conf
+  nft -c -f "$NFT_CONF"
+  nft -f "$NFT_CONF"
+}
+
+stop_rules() {
+  if table_exists; then
+    nft delete table inet warp_vps
+  fi
+}
+
+install_systemd() {
+  require_root
+  load_config
+  install -d -m 0755 "$ETC_DIR"
+  render_redsocks_conf
+
+  cat > /etc/systemd/system/warp-vps-redsocks.service <<EOF
+[Unit]
+Description=WARP VPS Manager redsocks bridge
+After=network-online.target warp-svc.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${REDSOCKS_USER}
+Group=${REDSOCKS_GROUP}
+ExecStart=${REDSOCKS_BIN} -c ${REDSOCKS_CONF}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/warp-vps.service <<EOF
+[Unit]
+Description=WARP VPS Manager system-level Google split routing
+After=network-online.target warp-svc.service warp-vps-redsocks.service
+Wants=network-online.target warp-vps-redsocks.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${BIN_PATH} apply
+ExecStop=${BIN_PATH} stop-rules
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/warp-vps-health.service <<EOF
+[Unit]
+Description=WARP VPS Manager health check
+After=network-online.target warp-vps.service
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} heal
+EOF
+
+  cat > /etc/systemd/system/warp-vps-health.timer <<'EOF'
+[Unit]
+Description=Run WARP VPS Manager health check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+port_listening() {
+  ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
+}
+
+socks_trace() {
+  curl --socks5-hostname "127.0.0.1:${WARP_SOCKS_PORT}" -fsS --connect-timeout 8 --max-time 15 \
+    https://www.cloudflare.com/cdn-cgi/trace
+}
+
+socks_ok() {
+  socks_trace 2>/dev/null | grep -Eq '^warp=(on|plus)$'
+}
+
+google_counter() {
+  nft list chain inet warp_vps output_nat 2>/dev/null \
+    | awk '/warp-vps-google-tcp/ { for (i=1; i<=NF; i++) if ($i == "packets") { print $(i+1); exit } }'
+}
+
+service_active() {
+  systemctl is-active --quiet "$1"
+}
+
+warp_cli() {
+  timeout 60 warp-cli "$@"
+}
+
+ensure_warp_connected() {
+  warp_cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 \
+    || warp_cli tunnel protocol set MASQUE >/dev/null 2>&1 \
+    || true
+  warp_cli --accept-tos connect >/dev/null 2>&1 || warp_cli connect >/dev/null 2>&1 || true
+}
+
+test_quiet() {
+  load_config
+  port_listening "$WARP_SOCKS_PORT" || return 1
+  socks_ok || return 1
+  service_active warp-vps-redsocks.service || return 1
+  table_exists || return 1
+  nft list chain inet warp_vps output_filter >/dev/null 2>&1 || return 1
+
+  local before after
+  before="$(google_counter)"
+  [ -n "$before" ] || return 1
+  curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 || return 1
+  after="$(google_counter)"
+  [ -n "$after" ] || return 1
+  [ "$after" -gt "$before" ] || return 1
+}
+
+cmd_test() {
+  require_root
+  load_config
+  local failed=0
+
+  printf 'WARP SOCKS port: %s\n' "$WARP_SOCKS_PORT"
+  if port_listening "$WARP_SOCKS_PORT"; then
+    printf 'WARP SOCKS listen: ok\n'
+  else
+    printf 'WARP SOCKS listen: failed\n'
+    failed=1
+  fi
+
+  if socks_ok; then
+    printf 'WARP trace: ok\n'
+  else
+    printf 'WARP trace: failed\n'
+    failed=1
+  fi
+
+  if service_active warp-vps-redsocks.service; then
+    printf 'redsocks service: ok\n'
+  else
+    printf 'redsocks service: failed\n'
+    failed=1
+  fi
+
+  if table_exists; then
+    printf 'nftables table: ok\n'
+  else
+    printf 'nftables table: failed\n'
+    failed=1
+  fi
+
+  local before after
+  before="$(google_counter || true)"
+  if [ -n "$before" ] && curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204; then
+    after="$(google_counter || true)"
+    if [ -n "$after" ] && [ "$after" -gt "$before" ]; then
+      printf 'Google TCP rule hit: ok\n'
+    else
+      printf 'Google TCP rule hit: failed\n'
+      failed=1
+    fi
+  else
+    printf 'Google TCP probe: failed\n'
+    failed=1
+  fi
+
+  if nft list chain inet warp_vps output_filter 2>/dev/null | grep -q 'warp-vps-google-quic-block'; then
+    printf 'Google UDP/443 block: configured\n'
+  else
+    printf 'Google UDP/443 block: missing\n'
+    failed=1
+  fi
+
+  if nft list chain inet warp_vps output_filter 2>/dev/null | grep -q 'warp-vps-google-ipv6-block'; then
+    printf 'IPv6 target leak block: configured\n'
+  else
+    printf 'IPv6 target leak block: missing\n'
+    failed=1
+  fi
+
+  [ "$failed" -eq 0 ] || return 1
+  printf 'Result: ok\n'
+}
+
+cmd_status() {
+  require_root
+  load_config
+  printf 'Version: %s\n' "${APP_VERSION:-unknown}"
+  printf 'Repo: %s\n' "$(mask_repo_url "$REPO_RAW_BASE")"
+  printf 'WARP SOCKS port: %s\n' "$WARP_SOCKS_PORT"
+  printf 'redsocks port: %s\n' "$REDSOCKS_PORT"
+  printf 'WARP status:\n'
+  timeout 20 warp-cli --accept-tos status 2>/dev/null || timeout 20 warp-cli status 2>/dev/null || true
+  printf '\nServices:\n'
+  systemctl --no-pager --plain --lines=0 status warp-vps-redsocks.service warp-vps.service warp-vps-health.timer 2>/dev/null || true
+  printf '\nRule snapshot:\n'
+  if [ -r "${RULES_DIR}/rules.meta.json" ]; then
+    sed -n '1,120p' "${RULES_DIR}/rules.meta.json"
+  else
+    warn "missing ${RULES_DIR}/rules.meta.json"
+  fi
+}
+
+cmd_restart() {
+  require_root
+  load_config
+  systemctl restart warp-svc >/dev/null 2>&1 || true
+  ensure_warp_connected
+  systemctl restart warp-vps-redsocks.service
+  apply_rules
+  systemctl restart warp-vps.service
+  cmd_test
+}
+
+download_update_asset() {
+  local rel="$1"
+  local dest="$2"
+  curl -fsSL "${REPO_RAW_BASE}/${rel}" -o "$dest"
+}
+
+validate_update_stage() {
+  local stage="$1"
+  bash -n "${stage}/install.sh"
+  bash -n "${stage}/bin/warp-vps"
+  validate_rules_file "${stage}/rules/google_ipv4.txt" 4
+  validate_rules_file "${stage}/rules/google_ipv6.txt" 6
+  python3 - "${stage}/rules/rules.meta.json" "${stage}/rules/google_ipv4.txt" "${stage}/rules/google_ipv6.txt" <<'PY'
+import json
+import pathlib
+import sys
+
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+ipv4 = [line for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
+ipv6 = [line for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
+if meta.get("ipv4_count") != len(ipv4):
+    raise SystemExit("rules.meta.json ipv4_count mismatch")
+if meta.get("ipv6_count") != len(ipv6):
+    raise SystemExit("rules.meta.json ipv6_count mismatch")
+PY
+}
+
+cmd_update() {
+  require_root
+  load_config
+  local stage="${STATE_DIR}/downloads/$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0755 "${stage}/bin" "${stage}/rules"
+  download_update_asset "install.sh" "${stage}/install.sh"
+  download_update_asset "bin/warp-vps" "${stage}/bin/warp-vps"
+  download_update_asset "rules/google_ipv4.txt" "${stage}/rules/google_ipv4.txt"
+  download_update_asset "rules/google_ipv6.txt" "${stage}/rules/google_ipv6.txt"
+  download_update_asset "rules/rules.meta.json" "${stage}/rules/rules.meta.json"
+  validate_update_stage "$stage"
+  install -m 0755 "${stage}/install.sh" "${APP_DIR}/install.sh"
+  install -m 0755 "${stage}/bin/warp-vps" "${APP_DIR}/bin/warp-vps"
+  install -m 0644 "${stage}/rules/google_ipv4.txt" "${RULES_DIR}/google_ipv4.txt"
+  install -m 0644 "${stage}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt"
+  install -m 0644 "${stage}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json"
+  install -m 0755 "${APP_DIR}/bin/warp-vps" "$BIN_PATH"
+  "$BIN_PATH" apply
+  systemctl restart warp-vps-redsocks.service
+  systemctl restart warp-vps.service
+  "$BIN_PATH" test
+}
+
+cmd_heal() {
+  require_root
+  if test_quiet; then
+    log "health check ok"
+    return 0
+  fi
+  warn "health check failed; restarting local WARP path"
+  systemctl restart warp-svc >/dev/null 2>&1 || true
+  ensure_warp_connected
+  systemctl restart warp-vps-redsocks.service || true
+  apply_rules
+  if test_quiet; then
+    log "health recovered"
+  else
+    die "health recovery failed"
+  fi
+}
+
+cmd_logs() {
+  require_root
+  journalctl -u warp-svc -u warp-vps-redsocks.service -u warp-vps.service -u warp-vps-health.service --no-pager -n 200
+}
+
+safe_move_if_exists() {
+  local path="$1"
+  local backup_dir="$2"
+  [ -e "$path" ] || return 0
+  mv "$path" "${backup_dir}/$(basename "$path")"
+}
+
+cmd_uninstall() {
+  require_root
+  local backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0755 "$backup_dir"
+  systemctl stop warp-vps-health.timer warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
+  systemctl disable warp-vps-health.timer warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
+  stop_rules || true
+  safe_move_if_exists /etc/systemd/system/warp-vps-redsocks.service "$backup_dir"
+  safe_move_if_exists /etc/systemd/system/warp-vps.service "$backup_dir"
+  safe_move_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir"
+  safe_move_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir"
+  safe_move_if_exists "$ETC_DIR" "$backup_dir"
+  safe_move_if_exists "$APP_DIR" "$backup_dir"
+  safe_move_if_exists "$BIN_PATH" "$backup_dir"
+  systemctl daemon-reload
+  printf 'WARP VPS Manager files moved to backup: %s\n' "$backup_dir"
+  printf 'Installed packages were left in place.\n'
+}
+
+usage() {
+  cat <<'EOF'
+Usage: warp-vps <command>
+
+Commands:
+  status          Show configuration, services, and rule snapshot
+  test            Verify WARP SOCKS, redsocks, nftables, and Google rule hit
+  restart         Restart WARP path and re-apply rules
+  update          Pull latest project files and fixed rules from GitHub
+  logs            Show recent service logs
+  heal            Run health check and bounded recovery
+  apply           Re-render configs and apply nftables rules
+  stop-rules      Remove only the warp_vps nftables table
+  install-systemd Install systemd unit files
+  uninstall       Stop services and move installed files to backup
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    status) cmd_status ;;
+    test) cmd_test ;;
+    restart) cmd_restart ;;
+    update) cmd_update ;;
+    logs) cmd_logs ;;
+    heal) cmd_heal ;;
+    apply) require_root; apply_rules ;;
+    stop-rules) require_root; stop_rules ;;
+    install-systemd) install_systemd ;;
+    uninstall) cmd_uninstall ;;
+    -h|--help|help|'') usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

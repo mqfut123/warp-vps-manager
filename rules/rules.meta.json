@@ -1,0 +1,12 @@
+{
+  "source": {
+    "goog": "https://www.gstatic.com/ipranges/goog.json",
+    "cloud": "https://www.gstatic.com/ipranges/cloud.json",
+    "goog_creation_time": "2026-06-21T19:03:53.490008",
+    "cloud_creation_time": "2026-06-21T19:03:53.490008",
+    "method": "goog.json minus cloud.json"
+  },
+  "generated_at": "2026-06-22T03:47:54.626495+00:00",
+  "ipv4_count": 261,
+  "ipv6_count": 84
+}
