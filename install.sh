@@ -287,6 +287,28 @@ install_dependencies() {
   fi
 }
 
+ensure_no_existing_redsocks_service() {
+  if systemctl list-unit-files redsocks.service >/dev/null 2>&1; then
+    if systemctl is-active --quiet redsocks.service || systemctl is-enabled --quiet redsocks.service; then
+      die "检测到系统已有启用中的 redsocks.service。为避免影响现有业务，请先自行确认后再安装"
+    fi
+  fi
+}
+
+preflight_nft_nat() {
+  local table="warp_vps_preflight_$$"
+  nft delete table inet "$table" >/dev/null 2>&1 || true
+  if ! nft -f - <<EOF
+add table inet ${table}
+add chain inet ${table} output_nat { type nat hook output priority -100; policy accept; }
+delete table inet ${table}
+EOF
+  then
+    nft delete table inet "$table" >/dev/null 2>&1 || true
+    die "当前系统不支持 nftables OUTPUT NAT，不能安装 Socks5 透明分流方案"
+  fi
+}
+
 reserved_port() {
   case "$1" in
     22|25|53|80|110|123|143|443|465|587|853|993|995|3306|5432|6379|8080|8443)
@@ -346,7 +368,7 @@ prompt_install_mode() {
   recommended="socks"
 
   printf '\n请选择 WARP 分流方案：\n' >&2
-  printf '  1. Socks5 方案：更稳，低风险。Google/YouTube/Gemini 的 TCP 走 WARP，UDP/443 阻断后回落 TCP。\n' >&2
+  printf '  1. Socks5 方案：更稳，低风险。命中规则的 Google IPv4 TCP 走 WARP，UDP/443 阻断后通常回落 TCP。\n' >&2
   printf '  2. WireGuard 方案：高级模式。TCP+UDP 都可按 Google CIDR 走 WARP，但需要 TUN/WireGuard 能力，路由风险更高。\n' >&2
   printf '  3. 退出安装\n' >&2
   if wireguard_recommended; then
@@ -503,6 +525,8 @@ write_config() {
   local redsocks_uid="$4"
   local redsocks_group="$5"
   local redsocks_bin="$6"
+  local managed_warp_svc=0
+  [ "$mode" = "socks" ] && managed_warp_svc=1
   cat > "$CONFIG_FILE" <<EOF
 APP_VERSION=${APP_VERSION_VALUE}
 REPO_RAW_BASE=${REPO_RAW_BASE}
@@ -516,6 +540,7 @@ REDSOCKS_BIN=${redsocks_bin}
 WG_IFACE=${WG_IFACE}
 WGCF_BIN=${WGCF_BIN}
 WG_CONFIG=${WG_CONFIG}
+MANAGED_WARP_SVC=${managed_warp_svc}
 EOF
   chmod 0600 "$CONFIG_FILE"
 }
@@ -527,8 +552,10 @@ main() {
 
   local selected_mode
   selected_mode="$(prompt_install_mode)"
+  [ "$selected_mode" = "socks" ] && ensure_no_existing_redsocks_service
   log "正在安装依赖"
   install_dependencies "$selected_mode"
+  [ "$selected_mode" = "socks" ] && preflight_nft_nat
 
   local warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
   if [ "$selected_mode" = "socks" ]; then
@@ -559,6 +586,7 @@ main() {
   else
     log "正在配置 WireGuard WARP 高级模式"
     "$BIN_PATH" setup-wireguard
+    "$BIN_PATH" preflight-wireguard
   fi
 
   log "正在安装系统服务和分流规则"
@@ -576,7 +604,11 @@ main() {
   "$BIN_PATH" test
 
   printf '\nWARP VPS Manager 安装完成。\n'
-  printf '安装模式：%s\n' "$selected_mode"
+  if [ "$selected_mode" = "socks" ]; then
+    printf '安装模式：Socks5 稳定模式\n'
+  else
+    printf '安装模式：WireGuard 高级模式\n'
+  fi
   if [ "$selected_mode" = "socks" ]; then
     printf 'WARP SOCKS 端口：%s\n' "$warp_port"
   fi
