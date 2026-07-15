@@ -27,10 +27,12 @@ Socks5 对现有网络改动较少。WireGuard 会增加网卡和路由，如果
 
 ## 和其他方案的区别
 
+最大的区别是分流规则的精度。WARP VPS Manager 使用 Google 官方 IP 列表，并排除 Google Cloud 客户地址，尽量只处理 Google 自有服务流量。
+
 | 方案 | 适合场景 | 主要区别 |
 |---|---|---|
-| WARP VPS Manager | 只想处理 Google 相关流量 | 系统级 IP 分流，提供 Socks5 和 WireGuard 两种模式，不需要修改代理配置 |
-| [warp-google-unlock](https://github.com/vps8899/warp-google-unlock) | 想用预设模式处理 Google、Gemini 或流媒体 | 使用 WireGuard 和系统路由，提供多组服务范围选项 |
+| WARP VPS Manager | 只想处理 Google 相关流量 | 规则从 `goog.json` 中减去 `cloud.json`，不会把 Google Cloud 客户地址整段塞进 WARP |
+| [warp-google-unlock](https://github.com/vps8899/warp-google-unlock) | 想快速处理 Google 或 Gemini | [直接使用 `34.0.0.0/9` 等大网段](https://github.com/vps8899/warp-google-unlock/blob/main/warp-google.sh#L177-L199)，规则较粗，与 Google Cloud 客户地址存在重叠，可能把无关 IP 一起送进 WARP |
 | [warp-yg](https://github.com/yonggekkk/warp-yg) | 想要完整的 WARP 工具箱 | 功能更多，可管理 wgcf、warp-go、WARP+、团队账户和对端 IP |
 | Xray 或 sing-box 分流 | 愿意自己维护代理配置 | 可以按域名精细分流，但只对经过代理程序的流量生效 |
 | 全局 WARP | 整台 VPS 都要使用 WARP 出口 | 配置直接，但所有业务流量都会更换出口 |
