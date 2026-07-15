@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test doubles and variables below are consumed by functions loaded with eval.
-# shellcheck disable=SC2016,SC2034,SC2329
+# shellcheck disable=SC2016,SC2034,SC2317,SC2329
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
