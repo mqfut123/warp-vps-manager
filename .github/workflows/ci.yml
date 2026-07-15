@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          bash -n install.sh
+          bash -n bin/warp-vps
+          bash -n tests/run.sh
+      - name: Validate Python and CIDR snapshots
+        run: |
+          python3 -m py_compile scripts/generate-google-rules.py
+          python3 - <<'PY'
+          import ipaddress
+          import pathlib
+
+          for path, expected_version in (
+              (pathlib.Path("rules/google_ipv4.txt"), 4),
+              (pathlib.Path("rules/google_ipv6.txt"), 6),
+          ):
+              networks = []
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  line = raw.strip()
+                  if line and not line.startswith("#"):
+                      networks.append(ipaddress.ip_network(line, strict=True))
+              assert networks, f"{path} is empty"
+              assert all(network.version == expected_version for network in networks), (
+                  f"{path} contains an unexpected IP version"
+              )
+          PY
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Run ShellCheck
+        run: shellcheck install.sh bin/warp-vps tests/*.sh
+      - name: Run regression tests
+        run: bash tests/run.sh

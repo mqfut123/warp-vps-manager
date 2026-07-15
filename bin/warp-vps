@@ -15,12 +15,11 @@ DEFAULT_WG_IFACE="warp-vps-wg"
 DEFAULT_WGCF_BIN="${APP_DIR}/bin/wgcf"
 DEFAULT_WG_CONFIG="/etc/wireguard/${DEFAULT_WG_IFACE}.conf"
 DEFAULT_WGCF_VERSION="v2.2.31"
+DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 MANAGED_SWAP_FILE="/swapfile-warp-vps-manager"
 REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
 REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
 REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
-RESOLVED_REPO_RAW_BASE=""
-RESOLVED_REPO_COMMIT=""
 UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 UNLOCK_CONNECT_TIMEOUT=5
 UNLOCK_MAX_TIME=12
@@ -81,8 +80,8 @@ load_config() {
     key="${line%%=*}"
     value="${line#*=}"
     case "$key" in
-      APP_VERSION) APP_VERSION="$value" ;;
-      REPO_RAW_BASE) REPO_RAW_BASE="$value" ;;
+      APP_VERSION) : ;;
+      REPO_RAW_BASE) : ;;
       WARP_MODE) WARP_MODE="$value" ;;
       WARP_SOCKS_PORT) WARP_SOCKS_PORT="$value" ;;
       REDSOCKS_PORT) REDSOCKS_PORT="$value" ;;
@@ -127,7 +126,7 @@ load_config() {
   fi
   [ -n "${REDSOCKS_GROUP:-}" ] || die "配置缺少 REDSOCKS_GROUP"
   [ -n "${REDSOCKS_BIN:-}" ] || die "配置缺少 REDSOCKS_BIN"
-  [ -n "${REPO_RAW_BASE:-}" ] || die "配置缺少 REPO_RAW_BASE"
+  REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
   if [ "$WARP_MODE" = "socks" ]; then
     valid_config_port "$WARP_SOCKS_PORT" || die "配置里的 WARP_SOCKS_PORT 不是有效端口"
     valid_config_port "$REDSOCKS_PORT" || die "配置里的 REDSOCKS_PORT 不是有效端口"
@@ -193,54 +192,7 @@ validate_repo_raw_base() {
 
 raw_asset_url() {
   local rel="$1"
-  local base="${RESOLVED_REPO_RAW_BASE:-${REPO_RAW_BASE%/}}"
-  local url="${base}/${rel}"
-  local sep="?"
-  case "$url" in *\?*) sep="&" ;; esac
-  printf '%s%swarp_vps_ts=%s\n' "$url" "$sep" "$(date -u +%s)"
-}
-
-resolve_github_raw_base() {
-  local base="${REPO_RAW_BASE%/}"
-  local path owner repo ref rest api sha
-  case "$base" in
-    https://raw.githubusercontent.com/*) ;;
-    *) return 1 ;;
-  esac
-  path="${base#https://raw.githubusercontent.com/}"
-  owner="${path%%/*}"
-  path="${path#*/}"
-  repo="${path%%/*}"
-  path="${path#*/}"
-  ref="${path%%/*}"
-  if [ "$path" = "$ref" ]; then
-    rest=""
-  else
-    rest="${path#*/}"
-  fi
-  [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$ref" ] || return 1
-  api="https://api.github.com/repos/${owner}/${repo}/commits/${ref}"
-  sha="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')" || return 1
-  case "$sha" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-    *) return 1 ;;
-  esac
-  RESOLVED_REPO_COMMIT="$sha"
-  if [ -n "$rest" ]; then
-    RESOLVED_REPO_RAW_BASE="https://raw.githubusercontent.com/${owner}/${repo}/${sha}/${rest}"
-  else
-    RESOLVED_REPO_RAW_BASE="https://raw.githubusercontent.com/${owner}/${repo}/${sha}"
-  fi
-}
-
-resolve_repo_raw_base() {
-  RESOLVED_REPO_RAW_BASE="${REPO_RAW_BASE%/}"
-  RESOLVED_REPO_COMMIT=""
-  case "${REPO_RAW_BASE%/}" in
-    https://raw.githubusercontent.com/*)
-      resolve_github_raw_base || die "无法把 GitHub raw 地址锁定到具体提交，请检查 GitHub API 连通性或使用完整可访问的 raw 地址"
-      ;;
-  esac
+  printf '%s/%s\n' "${REPO_RAW_BASE%/}" "$rel"
 }
 
 mask_repo_url() {
@@ -380,24 +332,28 @@ protect_ssh_peer_route() {
   local peer rc
   peer="$(ssh_peer_ip || true)"
   [ -n "$peer" ] || return 0
-  if ip_in_google_rules "$peer"; then
-    return 0
-  fi
-  rc=$?
-  if [ "$rc" -eq 2 ]; then
-    die "当前 SSH 来源 IP 命中 Google 规则，WireGuard 路由可能导致 SSH 失联，已中止"
-  fi
-  die "无法完成 SSH 来源 IP 路由安全检查"
+  rc=0
+  ip_in_google_rules "$peer" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) die "当前 SSH 来源 IP 命中 Google 规则，WireGuard 路由可能导致 SSH 失联，已中止" ;;
+    *) die "无法完成 SSH 来源 IP 路由安全检查" ;;
+  esac
 }
 
 wgcf_asset_spec() {
   case "$(uname -m)" in
-    x86_64|amd64) printf 'wgcf_2.2.31_linux_amd64 69147e1a517c66129edd8ac8cb60484d6c9515178d7b4a2f95e3c925f225572a\n' ;;
-    aarch64|arm64) printf 'wgcf_2.2.31_linux_arm64 b9bdbdeaa3f9f4ba741ba55b8bd94c24f7166c27668eb7e8192ccf9746961182\n' ;;
-    armv7l) printf 'wgcf_2.2.31_linux_armv7 207a932daba270dce9a604cda69554e08a25626a1f0b2ab4c00fc841a70b5667\n' ;;
-    armv6l) printf 'wgcf_2.2.31_linux_armv6 1789be271b58b81193ab0931d6e32d473412020a4c3dbf0d27e33126c0122781\n' ;;
-    armv5*) printf 'wgcf_2.2.31_linux_armv5 8e056bb31025c8d40fc2e8788cbc32e62933cfdca4ebcc0d6d26cab42e82fb94\n' ;;
-    i386|i686) printf 'wgcf_2.2.31_linux_386 e446abc089e32bb23c90f07a5967b33704567edd120bcf7bdbf720ce52776117\n' ;;
+    x86_64|amd64) printf 'wgcf_2.2.31_linux_amd64\n' ;;
+    aarch64|arm64) printf 'wgcf_2.2.31_linux_arm64\n' ;;
+    armv7l) printf 'wgcf_2.2.31_linux_armv7\n' ;;
+    armv6l) printf 'wgcf_2.2.31_linux_armv6\n' ;;
+    armv5*) printf 'wgcf_2.2.31_linux_armv5\n' ;;
+    i386|i486|i586|i686) printf 'wgcf_2.2.31_linux_386\n' ;;
+    mips) printf 'wgcf_2.2.31_linux_mips_softfloat\n' ;;
+    mipsel|mipsle) printf 'wgcf_2.2.31_linux_mipsle_softfloat\n' ;;
+    mips64) printf 'wgcf_2.2.31_linux_mips64_softfloat\n' ;;
+    mips64el|mips64le) printf 'wgcf_2.2.31_linux_mips64le_softfloat\n' ;;
+    s390x) printf 'wgcf_2.2.31_linux_s390x\n' ;;
     *) die "WireGuard 模式暂不支持当前 CPU 架构：$(uname -m)" ;;
   esac
 }
@@ -405,32 +361,13 @@ wgcf_asset_spec() {
 install_wgcf_binary() {
   [ -x "$WGCF_BIN" ] && return 0
   install -d -m 0755 "$(dirname "$WGCF_BIN")"
-  local asset_name expected_sha url
-  read -r asset_name expected_sha <<EOF
-$(wgcf_asset_spec)
-EOF
+  local asset_name url
+  asset_name="$(wgcf_asset_spec)"
   url="https://github.com/ViRb3/wgcf/releases/download/${DEFAULT_WGCF_VERSION}/${asset_name}"
-  python3 - "$url" "$WGCF_BIN" "$asset_name" "$expected_sha" "$DEFAULT_WGCF_VERSION" <<'PY'
-import hashlib
-import pathlib
-import stat
-import sys
-import urllib.request
-
-url = sys.argv[1]
-dest = pathlib.Path(sys.argv[2])
-asset_name = sys.argv[3]
-expected = sys.argv[4].lower()
-version = sys.argv[5]
-with urllib.request.urlopen(url, timeout=120) as response:
-    data = response.read()
-actual = hashlib.sha256(data).hexdigest()
-if actual != expected:
-    raise SystemExit(f"wgcf SHA256 校验失败：{asset_name}")
-dest.write_bytes(data)
-dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-print(f"已下载并校验 wgcf：{version} {asset_name}")
-PY
+  curl -LfsS --connect-timeout 10 --max-time 120 "$url" -o "$WGCF_BIN" \
+    || die "wgcf 下载失败：$asset_name"
+  chmod 0755 "$WGCF_BIN"
+  log "已下载 wgcf：${DEFAULT_WGCF_VERSION} ${asset_name}"
 }
 
 generate_wg_config() {
@@ -735,7 +672,7 @@ restart_wireguard_runtime() {
     if wait_for_wg_ready 90; then
       return 0
     fi
-    warn_line "WireGuard 出口暂未就绪，正在重试"
+    warn_line "WireGuard 出口第 ${attempt} 次检查未就绪，正在重试"
   done
   return 1
 }
@@ -837,6 +774,14 @@ curl_unlock_page() {
     "$url" 2>/dev/null || true
 }
 
+curl_gemini_location() {
+  curl -4 -fsSL --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
+    -A "$UNLOCK_TEST_UA" \
+    -H 'accept-language: en-US' \
+    --data-raw 'f.req=[[["K4WWud","[[0],[\"en-US\"]]",null,"generic"]]]' \
+    'https://gemini.google.com/_/BardChatUi/data/batchexecute' 2>/dev/null || true
+}
+
 extract_youtube_region() {
   local body="$1"
   local region
@@ -850,35 +795,96 @@ extract_youtube_region() {
   printf '\n'
 }
 
-extract_gemini_region() {
+parse_gemini_location() {
+  local response="$1"
+  [ -n "$response" ] || return 1
+  python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read()
+start = raw.find("[")
+if start < 0:
+    raise SystemExit(1)
+try:
+    outer, _ = json.JSONDecoder().raw_decode(raw[start:])
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+if not isinstance(outer, list):
+    raise SystemExit(1)
+for row in outer:
+    if not isinstance(row, list) or len(row) < 3:
+        continue
+    if row[0] != "wrb.fr" or row[1] != "K4WWud" or not isinstance(row[2], str):
+        continue
+    try:
+        inner = json.loads(row[2])
+    except (json.JSONDecodeError, IndexError, TypeError):
+        raise SystemExit(1)
+    if not isinstance(inner, list) or not inner or not isinstance(inner[0], list) or not inner[0]:
+        raise SystemExit(1)
+    location = inner[0][0]
+    if not isinstance(location, str):
+        raise SystemExit(1)
+    location = location.strip()
+    if len(location) < 3 or len(location) > 160 or "|" in location or any(ord(ch) < 32 for ch in location):
+        raise SystemExit(1)
+    print(location)
+    raise SystemExit(0)
+raise SystemExit(1)
+' <<< "$response"
+}
+
+mainland_china_location() {
+  local location
+  location="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$location" in
+    *hong\ kong*|*macao*|*macau*|*taiwan*) return 1 ;;
+    china|*,\ china|*mainland\ china*|*people\'s\ republic\ of\ china*|prc|*,\ prc|*中国大陆*|中国) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+gemini_page_normal() {
   local body="$1"
-  awk 'match($0, /,2,1,200,"[A-Z][A-Z][A-Z]"/) { print substr($0, RSTART + 10, 3); exit }' <<< "$body"
+  grep -Fq '<base href="https://gemini.google.com/">' <<< "$body" \
+    && grep -Eq 'BardChatUi|property="og:site_name" content="Gemini"' <<< "$body"
+}
+
+evaluate_gemini_unlock() {
+  local body="$1"
+  local location_response="$2"
+  local location
+
+  if grep -Eiq "gemini (is not|isn.t)( currently)? available in your (country|region)|not( currently)? available in your (country|region)|unavailable in your (country|region)" <<< "$body"; then
+    printf 'no|当前出口地区受限\n'
+    return 0
+  fi
+  if [ -z "$body" ] || [ -z "$location_response" ]; then
+    printf 'unknown|请求失败或未返回完整响应\n'
+    return 0
+  fi
+  location="$(parse_gemini_location "$location_response" 2>/dev/null || true)"
+  if [ -z "$location" ]; then
+    printf 'unknown|位置响应无法解析\n'
+    return 0
+  fi
+  if mainland_china_location "$location"; then
+    printf 'no|位置：%s；个人版不可用，Workspace 账号例外\n' "$location"
+    return 0
+  fi
+  if ! gemini_page_normal "$body"; then
+    printf 'unknown|页面特征不明确\n'
+    return 0
+  fi
+  printf 'yes|位置：%s\n' "$location"
 }
 
 probe_gemini_unlock() {
-  local body region
+  local body location_response
   body="$(curl_unlock_page "https://gemini.google.com/")"
-  if [ -z "$body" ]; then
-    printf 'unknown|网络连接失败\n'
-    return 0
-  fi
-
-  region="$(extract_gemini_region "$body")"
-  if grep -q '45631641,null,true' <<< "$body"; then
-    if [ -n "$region" ]; then
-      printf 'yes|地区：%s\n' "$region"
-    else
-      printf 'yes|\n'
-    fi
-    return 0
-  fi
-
-  if grep -Eiq 'not available in your country|not currently available|is unavailable|unavailable in your country|Gemini is not available' <<< "$body"; then
-    printf 'no|当前出口不可用\n'
-    return 0
-  fi
-
-  printf 'unknown|页面特征不明确\n'
+  location_response="$(curl_gemini_location)"
+  evaluate_gemini_unlock "$body" "$location_response"
 }
 
 probe_youtube_premium_unlock() {
@@ -1019,8 +1025,6 @@ run_self_check() {
       warn_line "未检测到 Google IPv6 路由命中，可能是系统没有 IPv6 或内核不支持"
     fi
 
-    run_unlock_checks
-
     section "结论"
     if [ "$failed" -eq 0 ]; then
       ok_line "本机分流链路正常。命中规则的 Google 相关 TCP/UDP 流量会走 WARP。"
@@ -1118,8 +1122,6 @@ run_self_check() {
     failed=1
   fi
 
-  run_unlock_checks
-
   section "结论"
   if [ "$failed" -eq 0 ]; then
     ok_line "本机分流链路正常。命中规则的 Google 相关 IPv4 TCP 流量会走 WARP。"
@@ -1186,7 +1188,6 @@ cmd_setup_wireguard() {
   [ "$WARP_MODE" = "wireguard" ] || die "当前不是 WireGuard 模式"
   command -v wg >/dev/null 2>&1 || die "找不到 wg，请先安装 wireguard-tools"
   command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick，请先安装 wireguard-tools"
-  [ -c /dev/net/tun ] || die "当前系统没有可用 /dev/net/tun，不能使用 WireGuard 模式"
   generate_wg_config
   ok_line "WireGuard 配置已准备完成：${WG_CONFIG}"
 }
@@ -1198,7 +1199,15 @@ cmd_preflight_wireguard() {
   [ -r "$WG_CONFIG" ] || die "找不到 WireGuard 配置：$WG_CONFIG"
   command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick，请先安装 wireguard-tools"
   if wg_interface_exists; then
-    die "WireGuard 网卡已经存在，不能执行安装前预检：$WG_IFACE"
+    info_line "正在停止上次安装留下的 WireGuard 网卡：$WG_IFACE"
+    stop_wg_routes || true
+    wg-quick down "$WG_CONFIG" >/dev/null 2>&1 \
+      || wg-quick down "$WG_IFACE" >/dev/null 2>&1 \
+      || true
+    if wg_interface_exists; then
+      ip link delete dev "$WG_IFACE" >/dev/null 2>&1 \
+        || die "无法停止本项目 WireGuard 网卡：$WG_IFACE"
+    fi
   fi
 
   local failed
@@ -1239,19 +1248,7 @@ validate_update_stage() {
   bash -n "${stage}/bin/warp-vps"
   validate_rules_file "${stage}/rules/google_ipv4.txt" 4
   validate_rules_file "${stage}/rules/google_ipv6.txt" 6
-  python3 - "${stage}/rules/rules.meta.json" "${stage}/rules/google_ipv4.txt" "${stage}/rules/google_ipv6.txt" <<'PY'
-import json
-import pathlib
-import sys
-
-meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-ipv4 = [line for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
-ipv6 = [line for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
-if meta.get("ipv4_count") != len(ipv4):
-    raise SystemExit("rules.meta.json 的 IPv4 数量不一致")
-if meta.get("ipv6_count") != len(ipv6):
-    raise SystemExit("rules.meta.json 的 IPv6 数量不一致")
-PY
+  python3 -m json.tool "${stage}/rules/rules.meta.json" >/dev/null
 }
 
 backup_current_installation() {
@@ -1303,14 +1300,11 @@ reload_runtime_after_update() {
 cmd_update() {
   require_root
   load_config
-  local stage="${STATE_DIR}/downloads/$(date -u +%Y%m%dT%H%M%SZ)"
-  local backup="${STATE_DIR}/rollback/$(date -u +%Y%m%dT%H%M%SZ)"
+  local stage backup
+  stage="${STATE_DIR}/downloads/$(date -u +%Y%m%dT%H%M%SZ)"
+  backup="${STATE_DIR}/rollback/$(date -u +%Y%m%dT%H%M%SZ)"
   section "正在更新"
   info_line "正在从 GitHub 同步脚本和固定规则快照"
-  resolve_repo_raw_base
-  if [ -n "$RESOLVED_REPO_COMMIT" ]; then
-    info_line "已锁定 GitHub 提交：${RESOLVED_REPO_COMMIT:0:7}"
-  fi
   install -d -m 0755 "${stage}/bin" "${stage}/rules"
   download_update_asset "install.sh" "${stage}/install.sh"
   download_update_asset "bin/warp-vps" "${stage}/bin/warp-vps"
@@ -1437,7 +1431,8 @@ managed_redsocks_fallback_exists() {
 
 cmd_uninstall() {
   require_root
-  local backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)"
+  local backup_dir
+  backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)"
   install -d -m 0755 "$backup_dir"
   load_uninstall_config
   systemctl stop warp-vps-health.timer warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
@@ -1526,4 +1521,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

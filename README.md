@@ -1,209 +1,107 @@
 # WARP VPS Manager
 
-一键把命中 Google 官方 IP 快照的 Google、YouTube、Gemini 相关出站流量切到 Cloudflare WARP，普通网站继续直连。
+把命中 Google 官方 IP 快照的出站流量转到 Cloudflare WARP，其他流量继续使用 VPS 原生出口。
 
-这个项目面向空 VPS、代理落地机、客户自助环境。你不需要改 Xray、sing-box、Hysteria、3x-ui 配置，也不需要给每个业务单独写分流规则。脚本安装时会自动检查环境，并让你选择 Socks5 稳定模式或 WireGuard 高级模式。
+脚本在系统出站层处理分流，不修改 Xray、sing-box、Hysteria 或 3x-ui 配置。安装时可以选择 Socks5 或 WireGuard 模式。
 
-## 解决什么问题
+## 安装
 
-- VPS 原生 IP 访问 Google Search、Gemini、Play、YouTube Premium 体验不稳定。
-- 客户机器上已经跑了 Xray / sing-box / Hysteria，不想让安装脚本改业务配置。
-- 不想走全局 WARP，只希望 Google 默认服务相关流量走 WARP。
-- 不想靠手写十几条老 Google IP 段赌覆盖率。
-- WARP、redsocks 或规则异常时，需要明确报错并尝试恢复本机链路。
-
-## 一键安装
-
-请先切到 `root` 用户，然后复制这一条：
+切换到 `root` 用户，运行：
 
 ```bash
-curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/v0.1.5/install.sh | bash
+curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash
 ```
 
-如果系统提示 `curl: command not found`，先安装 `curl` 后再执行上面的命令。
+如果系统没有 `curl`，请先通过系统包管理器安装。
 
-安装前脚本会先检查可用内存。如果可用内存低于 1G 且没有 Swap，会提示你创建 Swap 或自行承担安装失败风险。
+模式选择直接回车时使用 Socks5。Socks5 端口也可以直接回车，脚本会选择一个空闲的高位端口。
 
-在弹出模式选择前，脚本会先检测当前 VPS 原生 IPv4 出口的 Gemini 和 YouTube Premium 解锁状态，安装完成后会再用 WARP 分流后的 IPv4 出口显式检测一次。
+脚本会先收齐所有选项，再修改系统。普通输入错误会留在当前问题重新询问。开始安装依赖前，`warp-vps` 命令已经写入系统；后续失败时可以查看日志、卸载，或直接重跑安装器。
 
-随后脚本会让你选择模式。普通用户直接回车默认使用 Socks5 稳定模式；明确需要 UDP/QUIC 也走 WARP 时再选择 WireGuard 高级模式：
+## 两种模式
 
-- **Socks5 稳定模式**：使用 Cloudflare 官方 WARP 客户端本地 SOCKS + `redsocks` + `nftables`，命中规则的 Google IPv4 TCP 走 WARP；UDP/443 会被阻断，通常会促使浏览器回落 TCP，少数不支持回落的客户端可能失败。
-- **WireGuard 高级模式**：使用固定版本 `wgcf` 生成 WARP WireGuard 配置，只把 Google CIDR 路由到 WARP 网卡，TCP+UDP 都可走 WARP，但需要 TUN/WireGuard 内核能力，路由风险更高。
+| 模式 | 适合场景 | 分流行为 |
+|---|---|---|
+| Socks5 | 默认选择，适合大多数 VPS | Google IPv4 TCP 经 WARP 转发。Google UDP/443 和目标 IPv6 会被阻断，让支持回落的客户端改用 TCP |
+| WireGuard | 明确需要 UDP 或 QUIC | 命中 Google CIDR 的 IPv4、IPv6、TCP 和 UDP 都经 WARP 转发 |
 
-选择 Socks5 模式时会询问 WARP SOCKS 端口。直接回车会随机选择一个未被占用的高位端口，安装完成后会显示实际端口。
+Socks5 使用 Cloudflare 官方 WARP 客户端、redsocks 和 nftables，不接管默认路由。WireGuard 会增加单独的网卡及目标路由，安装器通过实际拉起接口、握手和路由结果判断系统是否支持。
 
-建议准备至少 1GB 可用磁盘空间。Ubuntu/Debian 上的 `cloudflare-warp` 官方包会拉取较多图形/桌面相关依赖，这是 Cloudflare 官方包依赖链导致的，不是本脚本额外启用 GUI。
+## 支持环境
 
-CentOS/RHEL/Rocky/AlmaLinux 的部分软件源没有 `redsocks` 包。脚本会先尝试包管理器安装；如果没有可用包，会从 `darkk/redsocks` 固定 commit 源码构建，并校验源码包 SHA256。
+系统必须运行 `systemd`，并提供 `apt-get`、`dnf` 或 `yum`。安装器按这些实际能力选择安装路径，不按发行版名称或版本号提前拒绝。
 
-## 核心特性
+Debian、Ubuntu 及其 APT 衍生系统走 APT 路径。Fedora、CentOS、RHEL、Rocky Linux、AlmaLinux 及其他 RPM 系统走 DNF 或 YUM 路径。Socks5 模式还要求 nftables `OUTPUT` NAT 和当前系统、架构可用的 Cloudflare WARP 包。Cloudflare 的实际发布范围以其 [Linux 软件包页面](https://pkg.cloudflareclient.com/) 为准。
 
-- root 一键安装，缺依赖自动补齐，关键步骤失败时直接中止。
-- 安装时自动检查内存、Swap、TUN 和内核能力，并给出模式推荐。
-- Socks5 稳定模式使用 Cloudflare 官方 WARP 客户端 SOCKS，不接管全局默认路由。
-- WireGuard 高级模式使用固定版本 `wgcf` 生成标准 WireGuard 配置，只给 Google CIDR 加路由。
-- Socks5 模式安装前会检查已有 Cloudflare WARP 官方客户端，避免接管或停用用户原有 WARP。
-- 命中规则的 Google / YouTube / Gemini 相关出站流量走 WARP。
-- 普通网站、普通客户业务、Google Cloud 客户外部 IP 默认直连。
-- Socks5 模式下 Google/YouTube UDP/443 默认阻断，通常促使 QUIC 回落 TCP，避免常见浏览器绕过 WARP。
-- Socks5 模式下 Google 目标 IPv6 默认阻断，避免 IPv6 泄漏。
-- WireGuard 模式下命中 Google CIDR 的 TCP/UDP 都走 WARP。
-- 规则快照固定在本仓库，用户机器不会后台自动抓取 Google 规则。
-- `warp-vps update` 同步脚本和固定规则快照；更新后自检失败会恢复旧版本。
-- `warp-vps status` 和 `warp-vps test` 使用中文彩色自检输出，小白也能直接看懂是否正常。
-- 安装前和安装后都会检测 Gemini、YouTube Premium 的 IPv4 出口结果，并明确显示“可用 / 不可用 / 无法确认”。
-- 健康检查定时器会定期检测 WARP SOCKS、redsocks、nftables 和 Google 规则命中，链路异常时做有界恢复。
-- 最终自检失败时会自动撤销已启用的本项目服务和分流规则，并把已安装文件移动到备份目录。
-- 卸载时移动到时间戳备份目录，不永久删除安装文件。
+WireGuard 模式不依赖 nftables、iptables 或 `/dev/net/tun`。系统必须能通过 `wg-quick` 实际创建并配置项目网卡。
 
-## 和其他方案有什么不同
-
-| 方案 | 适合场景 | 分流方式 | IP 规则 | 主要区别 |
-|---|---|---|---|---|
-| 本项目 Socks5 模式 | VPS 上稳定分流 Google 默认服务相关流量 | 系统 `OUTPUT` 透明 TCP 分流 | Google 官方 `goog.json - cloud.json` 固定快照 | 架构接近 `warp-google-unlock`，但规则更系统，使用 nftables、随机端口、IPv6/UDP 边界、自检、更新和安全卸载 |
-| 本项目 WireGuard 模式 | 需要 Google/YouTube UDP 也走 WARP | WireGuard 网卡 + Google CIDR 路由 | Google 官方 `goog.json - cloud.json` 固定快照 | TCP+UDP 都可走 WARP，但需要 TUN/WireGuard 能力 |
-| `vps8899/warp-google-unlock` | 快速修复 Google/Gemini 访问 | 系统级 iptables + redsocks | 手写经典 Google 段和若干大网段 | 简单直接，但部分 `34/35` 大段可能把 Google Cloud 客户资源也带进 WARP |
-| `yonggekkk/warp-yg` | WARP 多功能工具箱、wgcf/warp-go、全局或多模式玩法 | WireGuard/WARP 多模式 | 侧重 WARP 接入和解锁检测 | 功能丰富，但不是专门为“Google consumer IP 级透明分流且不改业务代理配置”收敛设计 |
-| Xray/sing-box 域名分流 | 你愿意维护代理核心配置 | 应用层域名/geosite 分流 | geosite / geodata | 域名语义更强，但需要改现有代理配置，无法覆盖所有系统出站进程 |
-| WARP 全局模式 | 整台机器都想走 WARP | 默认路由或 WireGuard 全局接管 | 不需要目标规则 | 简单，但会影响所有业务流量，不适合落地机客户环境 |
-
-本项目的取舍很明确：不追求大而全，只做空 VPS 上可复制、可排障、可更新的 Google 默认服务系统级 IP 分流。普通用户优先选 Socks5；明确需要 UDP/QUIC 的用户再选 WireGuard。
-
-## IP 规则来源
-
-规则来自 Google 官方发布的两个文件：
-
-- `https://www.gstatic.com/ipranges/goog.json`
-- `https://www.gstatic.com/ipranges/cloud.json`
-
-生成方式：
-
-```text
-Google 默认域名公网 CIDR 快照 = goog.json - cloud.json
-```
-
-这和 Google 官方文档建议一致：从 Google-owned 全量公网段中减去 Google Cloud 客户资源外部 IP，得到 Google APIs 和 Google services default domains 使用的净范围。它是 IP 近似分流，不是域名识别，也不是 YouTube/Gemini 专属服务清单。
-
-当前快照：
-
-```text
-goog/cloud creationTime: 2026-06-21T19:03:53.490008
-generated_at: 2026-06-22T03:47:54.626495+00:00
-IPv4: 261
-IPv6: 84
-```
-
-边界也要说清楚：这是 IP/CIDR 系统级分流，不是域名级分流。Google 会动态调整 IP，维护者需要定期重新生成规则并提交，用户通过 `warp-vps update` 获取新快照。`warp-vps test/status` 会同时显示本机链路、规则命中、Gemini 和 YouTube Premium 检测结果；其中服务解锁检测基于公开网页特征和本机 IPv4 出口，Google 页面或地区策略变化时可能显示“无法确认”。服务解锁结果是信息项，不参与安装、更新、重启命令的退出码判断。
-
-## 支持系统
-
-优先支持：
-
-- Debian 12
-- Debian 13
-- Ubuntu 22.04 LTS / 24.04 LTS
-- CentOS 8 / 9
-- RHEL 8 / 9
-- Rocky Linux 8 / 9
-- AlmaLinux 8 / 9
-
-CentOS 7 不支持。CentOS/RHEL/Rocky/AlmaLinux 8/9 会按 RHEL 兼容路径尝试安装；Socks5 模式需要 Cloudflare 官方 RPM 仓库存在可用 `cloudflare-warp` 包，包不可用时会 fail-fast。Cloudflare 官方包页面当前只明确列出 RHEL/CentOS 8；9 系生产环境建议优先准备 WireGuard 模式，或先在目标镜像上实测官方包可用性。若系统仓库缺少 `redsocks`，安装器会用固定源码包构建；源码下载或校验失败会直接中止。WireGuard 模式不依赖官方 `cloudflare-warp` 包，但需要 TUN/WireGuard 内核能力。
-
-如果 VPS 或容器内核缺少 `nftables` NAT 能力，安装会 fail-fast。
+建议至少保留 1 GB 可用磁盘空间。Cloudflare 官方软件包可能安装桌面相关依赖，这是其软件包本身的依赖关系。
 
 ## 管理命令
 
+| 命令 | 用途 |
+|---|---|
+| `warp-vps status` | 查看当前模式、规则快照和链路状态 |
+| `warp-vps test` | 运行一次链路自检 |
+| `warp-vps unlock-check` | 检测当前 IPv4 出口的 Gemini 和 YouTube Premium 状态 |
+| `warp-vps restart` | 重启 WARP 分流链路并重新加载规则 |
+| `warp-vps update` | 更新脚本和仓库中的 Google IP 快照 |
+| `warp-vps logs` | 查看最近的服务日志 |
+| `warp-vps uninstall` | 停止服务、撤销规则，并把项目文件移到备份目录 |
+
+卸载不会删除系统依赖包。项目文件和脚本创建的 Swap 会移到 `/var/backups/warp-vps-manager/` 下的时间戳目录。
+
+## 工作方式
+
+- Socks5 模式只处理本机发起的出站流量。WireGuard 模式把 Google CIDR 写入主路由表，也会影响经过 VPS 转发到这些地址的流量。
+- Google Cloud 客户外部 IP 从规则中排除，普通网站和其他业务流量继续直连。
+- 规则快照随项目发布，不会在后台自行抓取实时 IP 列表。
+- `warp-vps update` 获取仓库中的最新脚本和规则快照。
+- 健康检查定时器会检查本项目的服务和分流规则。
+
+## IP 规则来源
+
+规则使用 Google 官方发布的两个文件：
+
+- [Google 公网 IP 列表](https://www.gstatic.com/ipranges/goog.json)
+- [Google Cloud 公网 IP 列表](https://www.gstatic.com/ipranges/cloud.json)
+
+仓库中的快照按下面的方式生成：
+
+```text
+Google 默认服务 CIDR = goog.json - cloud.json
+```
+
+这是 IP 近似分流，不是域名识别，也不是 YouTube 或 Gemini 的专属地址清单。Google 调整地址后，需要通过项目更新取得新的快照。
+
+## 使用边界
+
+- 默认不做全局 WARP，也不修改现有代理程序的配置。
+- Socks5 模式不能透明转发 UDP。它会阻断 Google UDP/443，支持回落的客户端会改用 TCP，不支持回落的客户端可能无法连接。
+- Socks5 模式会阻断命中规则的目标 IPv6，避免客户端绕过 IPv4 分流。
+- WireGuard 模式可能与已有的 WireGuard 网卡或策略路由配置冲突。
+- 已有的 `redsocks.service` 保持不动，项目使用自己的 `warp-vps-redsocks.service` 和独立配置。
+- 选择 Socks5 会把现有 Cloudflare WARP 客户端切换到本地代理模式。安装前已存在的 `warp-svc` 在卸载时不会被停用，客户端原来的模式也不会被猜测或恢复。
+- Gemini 和 YouTube Premium 检测依赖公开网页和 Google 返回的位置。网络或响应无法解析时会显示无法确认。
+- Google 将中国大陆列为 Gemini Workspace 例外地区；检测到中国大陆出口时，脚本把个人版显示为不可用，并注明 Workspace 例外。地区范围以 [Google 官方说明](https://support.google.com/gemini/answer/13575153?hl=en) 为准。
+- 解锁检测用于提供信息，不决定安装、更新或重启命令是否成功。
+
+## 排查
+
+安装完成后先运行：
+
 ```bash
 warp-vps status
-warp-vps test
-warp-vps unlock-check
-warp-vps restart
-warp-vps update
 warp-vps logs
-warp-vps uninstall
 ```
 
-常用判断：
+如果安装尚未完成，请查看安装器最后一条错误，处理后重新运行安装命令，不需要先执行卸载。
 
-- `warp-vps status`：显示当前配置、规则快照和中文彩色状态自检。
-- `warp-vps test`：只运行中文彩色状态自检。
-- `warp-vps unlock-check`：不读取配置，只检测当前 IPv4 出口的 Gemini / YouTube Premium。
-- `warp-vps restart`：重启本地 WARP 分流链路并重新加载规则。
-- `warp-vps update`：从配置的 GitHub raw 地址拉取脚本和固定规则快照，失败时回滚到旧版本。使用 tag 安装时会继续停留在该 tag；升级到新版本时请改用新的 tag 安装地址。
-- `warp-vps uninstall`：停止服务并把安装文件移动到备份目录，系统包保留；如果安装时创建过 `/swapfile-warp-vps-manager`，会停用并移动到备份目录。
+## 相关项目和文档
 
-## 重要边界
+- [Cloudflare WARP Linux 文档](https://developers.cloudflare.com/warp-client/get-started/linux/)
+- [Google IP 地址范围说明](https://knowledge.workspace.google.com/admin/security/obtain-google-ip-address-ranges)
+- [wgcf](https://github.com/ViRb3/wgcf)
+- [redsocks](https://github.com/darkk/redsocks)
 
-- 默认不做全局 WARP。
-- 不修改 Xray、sing-box、Hysteria、3x-ui 等业务配置。
-- 不做域名级 DNS 分流。
-- Socks5 模式不承诺透明代理 UDP，UDP/443 通过阻断促使多数浏览器回落 TCP；不支持回落的应用可能失败。
-- WireGuard 模式会增加 WARP 网卡和 Google CIDR 路由，可能和已有 WireGuard/TUN 类服务冲突。
-- WireGuard 模式使用第三方开源 `wgcf` 获取 WARP WireGuard 配置，不使用 Cloudflare 官方客户端；脚本固定下载 `wgcf v2.2.31`，并使用仓库内置的 Linux 架构 SHA256 校验，不跟随 latest 自动漂移。
-- RPM 系统缺少 `redsocks` 包时，脚本会从 `darkk/redsocks` 固定 commit 构建 `redsocks 0.5` 并校验源码 SHA256。
-- 不后台自动抓取 Google 实时规则。
-- 不永久删除安装文件。
-- 一键安装和 `warp-vps update` 信任配置的 GitHub raw 地址。生产发布前应保护 GitHub 账号、分支和 release 流程。
-- 安装过程中若最终自检失败，脚本会自动运行卸载流程撤销本项目运行态；Cloudflare WARP / WireGuard 等系统包会保留，便于排障或再次安装。
-
-## 更新规则快照
-
-维护者手动更新固定规则：
-
-```bash
-python3 scripts/generate-google-rules.py --output rules
-```
-
-检查 diff 后提交到 GitHub。用户侧通过下面命令获取新快照：
-
-```bash
-warp-vps update
-```
-
-## 发布前检查
-
-发布前至少执行：
-
-```bash
-bash -n install.sh
-bash -n bin/warp-vps
-python3 -m py_compile scripts/generate-google-rules.py
-bash bin/warp-vps unlock-check
-python3 - <<'PY'
-import ipaddress, json
-from pathlib import Path
-meta = json.loads(Path("rules/rules.meta.json").read_text())
-for name, expected in [("google_ipv4.txt", meta["ipv4_count"]), ("google_ipv6.txt", meta["ipv6_count"])]:
-    lines = [line.strip() for line in Path("rules", name).read_text().splitlines() if line.strip()]
-    assert len(lines) == expected
-    for line in lines:
-        ipaddress.ip_network(line)
-print("规则检查通过")
-PY
-curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash -n
-curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/bin/warp-vps | bash -n
-```
-
-最终发布前还应在干净 Debian/Ubuntu/CentOS/RHEL/Rocky/AlmaLinux VPS 上做真实安装测试，并记录以下结果：
-
-- `warp-vps test` 的分流链路、Gemini、YouTube Premium 输出。
-- `warp-vps restart` 后再次 `warp-vps test`。
-- `warp-vps update` 的自检与失败回滚路径。
-- `warp-vps uninstall` 是否停止服务、撤销规则，并把文件移动到备份目录。
-
-## 参考项目
-
-本项目受到以下项目启发并参考了部分思路：
-
-- https://github.com/vps8899/warp-google-unlock
-- https://github.com/yonggekkk/warp-yg
-- https://github.com/lmc999/RegionRestrictionCheck
-- https://github.com/ViRb3/wgcf
-
-相关官方文档：
-
-- https://developers.cloudflare.com/warp-client/get-started/linux/
-- https://developers.cloudflare.com/warp-client/get-started/
-- https://knowledge.workspace.google.com/admin/security/obtain-google-ip-address-ranges
-- https://docs.cloud.google.com/appengine/docs/standard/outbound-ip-addresses
+本项目使用 [MIT License](LICENSE)。

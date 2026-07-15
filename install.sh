@@ -15,20 +15,18 @@ WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
 SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
-APP_VERSION_VALUE="0.1.5"
 APT_LOCK_TIMEOUT=1200
 REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
 REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
-REDSOCKS_SOURCE_SHA256="40acdf4404376a94434f4fcced9d62239ca1a58c759e7998a4fbf519ce8a0a49"
 REDSOCKS_SOURCE_URL="https://github.com/darkk/redsocks/archive/${REDSOCKS_SOURCE_COMMIT}.tar.gz"
 REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 REDSOCKS_MANAGED_MARKER="${STATE_DIR}/managed-redsocks-fallback"
 MANAGED_REDSOCKS_BIN=0
-RESOLVED_REPO_RAW_BASE=""
-RESOLVED_REPO_COMMIT=""
-UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-UNLOCK_CONNECT_TIMEOUT=5
-UNLOCK_MAX_TIME=12
+MANAGED_WARP_SVC_VALUE=0
+REDSOCKS_UNIT_PREEXISTED=0
+WARP_CLIENT_PREEXISTED=0
+SWAP_ACTION="none"
+SWAP_SIZE_MB=0
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -36,8 +34,10 @@ die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
 read_input() {
   local var_name="$1"
   if [ -r /dev/tty ]; then
+    # shellcheck disable=SC2229
     IFS= read -r "$var_name" </dev/tty
   else
+    # shellcheck disable=SC2229
     IFS= read -r "$var_name"
   fi
 }
@@ -46,14 +46,23 @@ require_root() {
   [ "$(id -u)" -eq 0 ] || die "请使用 root 用户运行"
 }
 
+require_systemd() {
+  command -v systemctl >/dev/null 2>&1 || die "当前系统没有 systemctl，本项目需要 systemd"
+  [ -d /run/systemd/system ] || die "当前系统没有运行 systemd，不能安装本项目"
+  systemctl list-unit-files --no-legend >/dev/null 2>&1 \
+    || die "无法连接 systemd，不能安装本项目"
+}
+
 load_os_release() {
-  [ -r /etc/os-release ] || die "无法读取 /etc/os-release"
-  # shellcheck disable=SC1091
-  . /etc/os-release
+  ID=""
+  VERSION_CODENAME=""
+  UBUNTU_CODENAME=""
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+  fi
   OS_ID="${ID:-}"
-  OS_VERSION_ID="${VERSION_ID:-}"
-  OS_VERSION_MAJOR="${OS_VERSION_ID%%.*}"
-  OS_CODENAME="${VERSION_CODENAME:-}"
+  OS_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
 }
 
 mem_available_mb() {
@@ -89,30 +98,33 @@ max_creatable_swap_mb() {
 
 create_swap_file() {
   local size_mb="$1"
-  [ "$size_mb" -ge 256 ] || die "Swap 大小过小"
-  [ ! -e "$SWAP_FILE" ] || die "$SWAP_FILE 已存在，请先自行检查后再安装"
+  [ "$size_mb" -ge 256 ] || return 1
+  if [ -e "$SWAP_FILE" ]; then
+    log "$SWAP_FILE 已存在，不能覆盖"
+    return 1
+  fi
 
   log "正在创建 $(format_gb "$size_mb") Swap：$SWAP_FILE"
   if ! dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=progress; then
     rollback_swap_file "写入 Swap 文件失败"
-    die "Swap 创建失败：写入文件失败"
+    return 1
   fi
   if ! chmod 0600 "$SWAP_FILE"; then
     rollback_swap_file "设置 Swap 权限失败"
-    die "Swap 创建失败：无法设置权限"
+    return 1
   fi
   if ! mkswap "$SWAP_FILE" >/dev/null; then
     rollback_swap_file "格式化 Swap 失败"
-    die "Swap 创建失败：mkswap 失败"
+    return 1
   fi
   if ! swapon "$SWAP_FILE"; then
     rollback_swap_file "启用 Swap 失败"
-    die "Swap 创建失败：swapon 失败"
+    return 1
   fi
   if ! grep -qF "$SWAP_FILE" /etc/fstab; then
     if ! printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab; then
       rollback_swap_file "写入 /etc/fstab 失败"
-      die "Swap 创建失败：无法写入 /etc/fstab"
+      return 1
     fi
   fi
   log "Swap 创建完成"
@@ -120,7 +132,8 @@ create_swap_file() {
 
 rollback_swap_file() {
   local reason="$1"
-  local backup_dir="${BACKUP_ROOT}/swap-failed-$(date -u +%Y%m%dT%H%M%SZ)"
+  local backup_dir
+  backup_dir="${BACKUP_ROOT}/swap-failed-$(date -u +%Y%m%dT%H%M%SZ)"
   log "$reason，正在撤销本次 Swap 创建"
   if grep -qF "$SWAP_FILE" /proc/swaps 2>/dev/null; then
     swapoff "$SWAP_FILE" >/dev/null 2>&1 || true
@@ -134,7 +147,7 @@ rollback_swap_file() {
 
 prompt_swap_creation() {
   local mem_mb="$1"
-  local max_mb selected choice custom_gb custom_mb
+  local max_mb selected choice custom_gb
   while true; do
     max_mb="$(max_creatable_swap_mb)"
     printf '\n检测到当前可用内存只有 %s，且系统没有 Swap。\n' "$(format_gb "$mem_mb")"
@@ -152,22 +165,28 @@ prompt_swap_creation() {
       1) selected=1024 ;;
       2) selected=2048 ;;
       3)
-        printf '请输入要创建的 Swap 大小，单位 G，例如 2：'
-        read_input custom_gb || die "无法读取输入，已退出安装"
-        case "$custom_gb" in
-          ''|*[!0-9]*) die "输入无效，已退出安装" ;;
-        esac
+        while true; do
+          printf '请输入要创建的 Swap 大小，单位 G，例如 2：'
+          read_input custom_gb || die "无法读取输入，已退出安装"
+          case "$custom_gb" in
+            ''|*[!0-9]*|0) printf '输入无效，请输入大于 0 的整数。\n' ; continue ;;
+          esac
+          break
+        done
         selected=$((custom_gb * 1024))
         ;;
       4)
         printf '已选择不创建 Swap，继续安装。\n'
+        SWAP_ACTION="none"
+        SWAP_SIZE_MB=0
         return 0
         ;;
-      5|'')
+      5)
         die "已退出安装"
         ;;
       *)
-        die "输入无效，已退出安装"
+        printf '输入无效，请输入 1、2、3、4 或 5。\n'
+        continue
         ;;
     esac
 
@@ -176,13 +195,16 @@ prompt_swap_creation() {
       continue
     fi
 
-    create_swap_file "$selected"
+    SWAP_ACTION="create"
+    SWAP_SIZE_MB="$selected"
     return 0
   done
 }
 
-check_memory_before_install() {
-  local mem_mb swap_total swap_free total_available
+collect_swap_choice() {
+  local mem_mb swap_total swap_free total_available choice
+  SWAP_ACTION="none"
+  SWAP_SIZE_MB=0
   mem_mb="$(mem_available_mb)"
   swap_total="$(swap_total_mb)"
   swap_free="$(swap_free_mb)"
@@ -199,159 +221,46 @@ check_memory_before_install() {
     printf '\n检测到当前可用内存 %s，Swap 总量 %s，Swap 可用 %s。\n' \
       "$(format_gb "$mem_mb")" "$(format_gb "$swap_total")" "$(format_gb "$swap_free")"
     printf '内存仍然偏低，安装存在失败风险。建议先自行调整 Swap 后再安装。\n'
-    printf '输入 1 表示知道风险并继续，其他输入退出：'
-    read_input choice || die "无法读取输入，已退出安装"
-    [ "$choice" = "1" ] || die "已退出安装"
+    while true; do
+      printf '输入 1 表示知道风险并继续，输入 2 退出：'
+      read_input choice || die "无法读取输入，已退出安装"
+      case "$choice" in
+        1) return 0 ;;
+        2) die "已退出安装" ;;
+        *) printf '输入无效，请输入 1 或 2。\n' ;;
+      esac
+    done
   fi
 }
 
-curl_unlock_page() {
-  local url="$1"
-  curl -4 -fsSL --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
-    -A "$UNLOCK_TEST_UA" \
-    -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
-    -H 'accept-language: en-US,en;q=0.9' \
-    "$url" 2>/dev/null || true
-}
-
-extract_youtube_region() {
-  local body="$1"
-  local region
-  region="$(sed -n 's/.*"INNERTUBE_CONTEXT_GL"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
-  region="${region%%$'\n'*}"
-  if [ -z "$region" ]; then
-    region="$(sed -n 's/.*"countryCode"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
-    region="${region%%$'\n'*}"
-  fi
-  printf '%s' "$region" | tr '[:lower:]' '[:upper:]'
-  printf '\n'
-}
-
-extract_gemini_region() {
-  local body="$1"
-  awk 'match($0, /,2,1,200,"[A-Z][A-Z][A-Z]"/) { print substr($0, RSTART + 10, 3); exit }' <<< "$body"
-}
-
-probe_gemini_unlock() {
-  local body region
-  body="$(curl_unlock_page "https://gemini.google.com/")"
-  if [ -z "$body" ]; then
-    printf 'unknown|网络连接失败\n'
-    return 0
-  fi
-
-  region="$(extract_gemini_region "$body")"
-  if grep -q '45631641,null,true' <<< "$body"; then
-    if [ -n "$region" ]; then
-      printf 'yes|地区：%s\n' "$region"
-    else
-      printf 'yes|\n'
+apply_swap_choice() {
+  local mem_mb
+  while [ "$SWAP_ACTION" = "create" ]; do
+    if create_swap_file "$SWAP_SIZE_MB"; then
+      return 0
     fi
-    return 0
-  fi
-
-  if grep -Eiq 'not available in your country|not currently available|is unavailable|unavailable in your country|Gemini is not available' <<< "$body"; then
-    printf 'no|当前出口不可用\n'
-    return 0
-  fi
-
-  printf 'unknown|页面特征不明确\n'
-}
-
-probe_youtube_premium_unlock() {
-  local body region
-  body="$(curl_unlock_page "https://www.youtube.com/premium")"
-  if [ -z "$body" ]; then
-    printf 'unknown|网络连接失败\n'
-    return 0
-  fi
-
-  region="$(extract_youtube_region "$body")"
-  if grep -q 'www.google.cn' <<< "$body"; then
-    printf 'no|地区：CN\n'
-    return 0
-  fi
-
-  if grep -Eiq 'Premium is not available in your country|Premium is not available' <<< "$body"; then
-    if [ -n "$region" ]; then
-      printf 'no|地区：%s\n' "$region"
-    else
-      printf 'no|当前出口不可用\n'
-    fi
-    return 0
-  fi
-
-  if [ -n "$region" ] && grep -Eiq 'ad-free|YouTube and YouTube Music ad-free' <<< "$body"; then
-    printf 'yes|地区：%s\n' "$region"
-    return 0
-  fi
-
-  if [ -z "$region" ]; then
-    printf 'unknown|未取到地区\n'
-  else
-    printf 'unknown|页面特征不明确\n'
-  fi
-}
-
-print_install_unlock_result() {
-  local name="$1"
-  local result="$2"
-  local status detail suffix
-  status="${result%%|*}"
-  detail="${result#*|}"
-  [ "$detail" != "$result" ] || detail=""
-  suffix=""
-  [ -n "$detail" ] && suffix="（${detail}）"
-  case "$status" in
-    yes) printf '  %s：可用%s\n' "$name" "$suffix" ;;
-    no) printf '  %s：不可用%s\n' "$name" "$suffix" ;;
-    *) printf '  %s：无法确认%s\n' "$name" "$suffix" ;;
-  esac
-}
-
-pre_install_unlock_probe() {
-  printf '\n安装前当前 IPv4 出口解锁检测：\n'
-  if ! command -v curl >/dev/null 2>&1; then
-    printf '  未找到 curl，跳过安装前检测；安装依赖时会自动补齐。\n'
-    return 0
-  fi
-  printf '  正在检测 Gemini 和 YouTube Premium，请稍等...\n'
-  print_install_unlock_result "Gemini" "$(probe_gemini_unlock)"
-  print_install_unlock_result "YouTube Premium" "$(probe_youtube_premium_unlock)"
-  printf '  说明：这是安装前当前 VPS IPv4 出口结果，安装完成后会再检测 WARP 分流后的 IPv4 出口结果。\n'
+    printf 'Swap 创建失败，已撤销本次创建。请重新选择。\n'
+    mem_mb="$(mem_available_mb)"
+    prompt_swap_creation "$mem_mb"
+  done
 }
 
 pkg_install_apt() {
   local mode="$1"
-  case "$OS_ID" in
-    ubuntu)
-      case "$OS_VERSION_MAJOR" in
-        22|24) ;;
-        *) die "不支持当前 Ubuntu 版本：${OS_VERSION_ID:-未知}；支持版本：22.04、24.04" ;;
-      esac
-      ;;
-    debian)
-      case "$OS_VERSION_MAJOR" in
-        12|13) ;;
-        *) die "不支持当前 Debian 版本：${OS_VERSION_ID:-未知}；支持版本：12、13" ;;
-      esac
-      ;;
-    *)
-      die "不支持当前 apt 系统：${OS_ID:-未知}"
-      ;;
-  esac
-
   export DEBIAN_FRONTEND=noninteractive
   log "如果系统自动更新正在占用 apt/dpkg，最多等待 20 分钟"
   apt_get update -y
-  apt_get install -y curl ca-certificates gnupg lsb-release nftables iptables iproute2 python3
 
   if [ "$mode" = "wireguard" ]; then
-    apt_get install -y wireguard-tools
+    apt_get install -y curl ca-certificates coreutils iproute2 python3 wireguard-tools
     return
   fi
 
-  apt_get install -y redsocks
+  apt_get install -y curl ca-certificates coreutils gnupg lsb-release nftables iproute2 python3 redsocks
+  if command -v warp-cli >/dev/null 2>&1; then
+    return
+  fi
+
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
     | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -401,54 +310,7 @@ mark_managed_redsocks_if_current() {
 
 raw_asset_url() {
   local rel="$1"
-  local base="${RESOLVED_REPO_RAW_BASE:-${REPO_RAW_BASE%/}}"
-  local url="${base}/${rel}"
-  local sep="?"
-  case "$url" in *\?*) sep="&" ;; esac
-  printf '%s%swarp_vps_ts=%s\n' "$url" "$sep" "$(date -u +%s)"
-}
-
-resolve_github_raw_base() {
-  local base="${REPO_RAW_BASE%/}"
-  local path owner repo ref rest api sha
-  case "$base" in
-    https://raw.githubusercontent.com/*) ;;
-    *) return 1 ;;
-  esac
-  path="${base#https://raw.githubusercontent.com/}"
-  owner="${path%%/*}"
-  path="${path#*/}"
-  repo="${path%%/*}"
-  path="${path#*/}"
-  ref="${path%%/*}"
-  if [ "$path" = "$ref" ]; then
-    rest=""
-  else
-    rest="${path#*/}"
-  fi
-  [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$ref" ] || return 1
-  api="https://api.github.com/repos/${owner}/${repo}/commits/${ref}"
-  sha="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')" || return 1
-  case "$sha" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-    *) return 1 ;;
-  esac
-  RESOLVED_REPO_COMMIT="$sha"
-  if [ -n "$rest" ]; then
-    RESOLVED_REPO_RAW_BASE="https://raw.githubusercontent.com/${owner}/${repo}/${sha}/${rest}"
-  else
-    RESOLVED_REPO_RAW_BASE="https://raw.githubusercontent.com/${owner}/${repo}/${sha}"
-  fi
-}
-
-resolve_repo_raw_base() {
-  RESOLVED_REPO_RAW_BASE="${REPO_RAW_BASE%/}"
-  RESOLVED_REPO_COMMIT=""
-  case "${REPO_RAW_BASE%/}" in
-    https://raw.githubusercontent.com/*)
-      resolve_github_raw_base || die "无法把 GitHub raw 地址锁定到具体提交，请检查 GitHub API 连通性或使用完整可访问的 raw 地址"
-      ;;
-  esac
+  printf '%s/%s\n' "${REPO_RAW_BASE%/}" "$rel"
 }
 
 enable_rhel_extra_repos() {
@@ -465,10 +327,9 @@ enable_rhel_extra_repos() {
 }
 
 build_redsocks_from_source() {
-  local build_root archive actual src
+  local build_root archive src
   command -v gcc >/dev/null 2>&1 || die "源码构建 redsocks 需要 gcc"
   command -v tar >/dev/null 2>&1 || die "源码构建 redsocks 需要 tar"
-  command -v sha256sum >/dev/null 2>&1 || die "源码构建 redsocks 需要 sha256sum"
 
   build_root="${STATE_DIR}/build/redsocks-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   archive="${build_root}/redsocks.tar.gz"
@@ -476,8 +337,6 @@ build_redsocks_from_source() {
 
   log "正在下载固定版本 redsocks 源码：${REDSOCKS_SOURCE_COMMIT}"
   curl -LfsS "$REDSOCKS_SOURCE_URL" -o "$archive"
-  actual="$(sha256sum "$archive" | awk '{ print $1 }')"
-  [ "$actual" = "$REDSOCKS_SOURCE_SHA256" ] || die "redsocks 源码校验失败，期望 ${REDSOCKS_SOURCE_SHA256}，实际 ${actual}"
 
   tar -xzf "$archive" -C "$build_root"
   src="${build_root}/redsocks-${REDSOCKS_SOURCE_COMMIT}"
@@ -515,77 +374,57 @@ rpm_install_redsocks() {
     mark_managed_redsocks_if_current
     return
   fi
-  if "$manager" install -y redsocks; then
+
+  if [ "$OS_ID" = "fedora" ]; then
+    "$manager" install -y redsocks
     return
   fi
 
-  log "当前 RPM 软件源没有可用 redsocks，改用固定源码构建"
+  log "当前 RPM 系统使用固定上游源码构建 redsocks"
   "$manager" install -y gcc tar gzip libevent-devel
   build_redsocks_from_source
 }
 
 pkg_install_rpm() {
   local mode="$1"
-  case "$OS_ID" in
-    centos)
-      case "$OS_VERSION_MAJOR" in
-        8|9) ;;
-        *) die "不支持当前 CentOS 版本：${OS_VERSION_ID:-未知}；支持版本：8、9" ;;
-      esac
-      ;;
-    rhel|rocky|almalinux)
-      case "$OS_VERSION_MAJOR" in
-        8|9) ;;
-        *) die "不支持当前 ${OS_ID} 版本：${OS_VERSION_ID:-未知}；支持主版本：8、9" ;;
-      esac
-      ;;
-    *)
-      die "不支持当前 RPM 系统：${OS_ID:-未知}"
-      ;;
-  esac
+  local manager="$2"
+  if [ "$OS_ID" != "fedora" ]; then
+    enable_rhel_extra_repos
+  fi
 
-  enable_rhel_extra_repos
-  if command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl ca-certificates gnupg2 nftables iptables-nft iproute python3
-    if [ "$mode" = "wireguard" ]; then
-      dnf install -y wireguard-tools
-      return
-    fi
+  if [ "$mode" = "wireguard" ]; then
+    "$manager" install -y curl ca-certificates coreutils iproute python3 wireguard-tools
+    return
+  fi
+
+  "$manager" install -y curl ca-certificates coreutils nftables iproute python3
+  rpm_install_redsocks "$manager"
+  if ! command -v warp-cli >/dev/null 2>&1; then
     rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
     curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
       -o /etc/yum.repos.d/cloudflare-warp.repo
-    rpm_install_redsocks dnf
-    dnf install -y cloudflare-warp
-  else
-    yum install -y curl ca-certificates gnupg2 nftables iptables iproute python3
-    if [ "$mode" = "wireguard" ]; then
-      yum install -y wireguard-tools
-      return
-    fi
-    rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
-    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
-      -o /etc/yum.repos.d/cloudflare-warp.repo
-    rpm_install_redsocks yum
-    yum install -y cloudflare-warp
+    "$manager" install -y cloudflare-warp
   fi
 }
 
 install_dependencies() {
   local mode="$1"
+  local manager
   load_os_release
-  case "$OS_ID" in
-    debian|ubuntu)
-      pkg_install_apt "$mode"
-      ;;
-    centos|rhel|rocky|almalinux)
-      pkg_install_rpm "$mode"
-      ;;
-    *)
-      die "不支持当前系统：${OS_ID:-未知}；支持 Debian、Ubuntu、CentOS、RHEL、Rocky、AlmaLinux"
-      ;;
-  esac
+  if command -v apt-get >/dev/null 2>&1; then
+    pkg_install_apt "$mode"
+  elif command -v dnf >/dev/null 2>&1; then
+    manager="dnf"
+    pkg_install_rpm "$mode" "$manager"
+  elif command -v yum >/dev/null 2>&1; then
+    manager="yum"
+    pkg_install_rpm "$mode" "$manager"
+  else
+    die "找不到 apt-get、dnf 或 yum，无法安装依赖"
+  fi
 
-  command -v nft >/dev/null 2>&1 || die "依赖安装后仍找不到 nftables"
+  command -v curl >/dev/null 2>&1 || die "依赖安装后仍找不到 curl"
+  command -v ip >/dev/null 2>&1 || die "依赖安装后仍找不到 ip"
   command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
   command -v timeout >/dev/null 2>&1 || die "依赖安装后仍找不到 timeout"
   command -v python3 >/dev/null 2>&1 || die "依赖安装后仍找不到 python3"
@@ -593,23 +432,43 @@ install_dependencies() {
     command -v wg >/dev/null 2>&1 || die "依赖安装后仍找不到 wg"
     command -v wg-quick >/dev/null 2>&1 || die "依赖安装后仍找不到 wg-quick"
   else
+    command -v nft >/dev/null 2>&1 || die "依赖安装后仍找不到 nftables"
     command -v warp-cli >/dev/null 2>&1 || die "cloudflare-warp 已安装但找不到 warp-cli"
     redsocks_path >/dev/null 2>&1 || die "依赖安装后仍找不到 redsocks"
   fi
 }
 
-ensure_no_existing_redsocks_service() {
-  if systemctl list-unit-files redsocks.service >/dev/null 2>&1; then
-    if systemctl is-active --quiet redsocks.service || systemctl is-enabled --quiet redsocks.service; then
-      die "检测到系统已有启用中的 redsocks.service。为避免影响现有业务，请先自行确认后再安装"
-    fi
+unit_file_exists() {
+  local unit="$1"
+  systemctl list-unit-files "$unit" --no-legend 2>/dev/null \
+    | awk -v unit="$unit" '$1 == unit { found=1 } END { exit !found }'
+}
+
+capture_service_ownership() {
+  local mode="$1"
+  REDSOCKS_UNIT_PREEXISTED=0
+  WARP_CLIENT_PREEXISTED=0
+  MANAGED_WARP_SVC_VALUE=0
+  if [ -r "$CONFIG_FILE" ] && grep -qx 'MANAGED_WARP_SVC=1' "$CONFIG_FILE"; then
+    MANAGED_WARP_SVC_VALUE=1
+  fi
+  [ "$mode" = "socks" ] || return 0
+
+  if unit_file_exists redsocks.service; then
+    REDSOCKS_UNIT_PREEXISTED=1
+  fi
+  if command -v warp-cli >/dev/null 2>&1 || unit_file_exists warp-svc.service; then
+    WARP_CLIENT_PREEXISTED=1
+  fi
+  if [ "$WARP_CLIENT_PREEXISTED" -eq 0 ]; then
+    MANAGED_WARP_SVC_VALUE=1
   fi
 }
 
-ensure_no_existing_warp_client() {
-  if command -v warp-cli >/dev/null 2>&1 || systemctl list-unit-files warp-svc.service >/dev/null 2>&1; then
-    die "检测到系统已有 Cloudflare WARP 官方客户端。为避免接管或停用用户原有 WARP，请先自行确认并清理后再安装 Socks5 模式"
-  fi
+disable_new_packaged_redsocks_service() {
+  [ "$REDSOCKS_UNIT_PREEXISTED" -eq 0 ] || return 0
+  unit_file_exists redsocks.service || return 0
+  systemctl disable --now redsocks.service >/dev/null 2>&1 || true
 }
 
 preflight_nft_nat() {
@@ -626,17 +485,6 @@ EOF
   fi
 }
 
-reserved_port() {
-  case "$1" in
-    22|25|53|80|110|123|143|443|465|587|853|993|995|3306|5432|6379|8080|8443)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 valid_port() {
   case "$1" in
     ''|*[!0-9]*)
@@ -647,7 +495,24 @@ valid_port() {
 }
 
 port_in_use() {
-  ss -H -ltnu "sport = :$1" 2>/dev/null | grep -q .
+  local port="$1"
+  local port_hex file
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltnu "sport = :${port}" 2>/dev/null | grep -q .
+    return
+  fi
+
+  printf -v port_hex '%04X' "$port"
+  for file in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+    [ -r "$file" ] || continue
+    if awk -v port="$port_hex" '
+      NR > 1 { split($2, address, ":"); if (toupper(address[2]) == port) found=1 }
+      END { exit !found }
+    ' "$file"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 tcp_port_listening() {
@@ -666,55 +531,27 @@ wait_for_tcp_port() {
   tcp_port_listening "$port"
 }
 
-tun_available() {
-  [ -c /dev/net/tun ]
-}
-
-wireguard_recommended() {
-  local kernel_major
-  tun_available || return 1
-  kernel_major="$(uname -r | awk -F. '{ print $1 }')"
-  case "$kernel_major" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$kernel_major" -ge 5 ]
-}
-
 prompt_install_mode() {
   local recommended choice
   recommended="socks"
 
   printf '\n请选择 WARP 分流方案：\n' >&2
   printf '  1. Socks5 方案：更稳，低风险。命中规则的 Google IPv4 TCP 走 WARP，UDP/443 阻断后通常回落 TCP。\n' >&2
-  printf '  2. WireGuard 方案：高级模式。TCP+UDP 都可按 Google CIDR 走 WARP，但需要 TUN/WireGuard 能力，路由风险更高。\n' >&2
+  printf '  2. WireGuard 方案：高级模式。TCP+UDP 都可按 Google CIDR 走 WARP，安装时会实际拉起接口做预检。\n' >&2
   printf '  3. 退出安装\n' >&2
-  if wireguard_recommended; then
-    printf '环境检测：TUN 可用，内核版本适合 WireGuard。普通用户推荐 Socks5；明确需要 UDP/QUIC 再选 WireGuard。\n' >&2
-  else
-    printf '环境检测：当前环境不适合 WireGuard，推荐 Socks5。\n' >&2
-  fi
+  printf '普通用户推荐 Socks5；明确需要 UDP/QUIC 再选 WireGuard。\n' >&2
   printf '直接回车默认选择：Socks5\n' >&2
-  printf '请输入选项：' >&2
-  read_input choice || die "无法读取输入，已退出安装"
-
-  case "$choice" in
-    '')
-      printf '%s\n' "$recommended"
-      ;;
-    1)
-      printf 'socks\n'
-      ;;
-    2)
-      tun_available || die "当前系统没有可用 /dev/net/tun，不能安装 WireGuard 方案"
-      printf 'wireguard\n'
-      ;;
-    3)
-      die "已退出安装"
-      ;;
-    *)
-      die "输入无效，已退出安装"
-      ;;
-  esac
+  while true; do
+    printf '请输入选项：' >&2
+    read_input choice || die "无法读取输入，已退出安装"
+    case "$choice" in
+      '') printf '%s\n' "$recommended"; return 0 ;;
+      1) printf 'socks\n'; return 0 ;;
+      2) printf 'wireguard\n'; return 0 ;;
+      3) die "已退出安装" ;;
+      *) printf '输入无效，请输入 1、2、3，或直接回车。\n' >&2 ;;
+    esac
+  done
 }
 
 find_free_port() {
@@ -723,7 +560,7 @@ find_free_port() {
   local i=0
   while [ "$i" -lt 400 ]; do
     candidate=$((20000 + (((RANDOM << 15) + RANDOM) % 41000)))
-    if [ "$candidate" != "$avoid" ] && ! reserved_port "$candidate" && ! port_in_use "$candidate"; then
+    if [ "$candidate" != "$avoid" ] && ! port_in_use "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -736,27 +573,30 @@ prompt_warp_port() {
   local input
   if [ -n "${WARP_SOCKS_PORT:-}" ]; then
     input="$WARP_SOCKS_PORT"
-  else
-    printf '请输入 WARP SOCKS 端口（直接回车随机选择空闲端口）：' >&2
-    read_input input || die "无法读取输入，已退出安装"
-  fi
-
-  if [ -z "$input" ]; then
-    find_free_port
+    valid_port "$input" || die "环境变量 WARP_SOCKS_PORT 不是有效端口：$input"
+    port_in_use "$input" && die "环境变量 WARP_SOCKS_PORT 指定的端口已被占用：$input"
+    printf '%s\n' "$input"
     return 0
   fi
 
-  valid_port "$input" || die "端口无效：$input"
-  reserved_port "$input" && die "端口 $input 是常见服务端口，请换一个"
-  port_in_use "$input" && die "端口 $input 已被占用，请换一个"
-  printf '%s\n' "$input"
-}
-
-disable_packaged_redsocks_service() {
-  if systemctl list-unit-files redsocks.service >/dev/null 2>&1; then
-    systemctl stop redsocks.service >/dev/null 2>&1 || true
-    systemctl disable redsocks.service >/dev/null 2>&1 || true
-  fi
+  while true; do
+    printf '请输入 WARP SOCKS 端口（直接回车随机选择空闲端口）：' >&2
+    read_input input || die "无法读取输入，已退出安装"
+    if [ -z "$input" ]; then
+      find_free_port
+      return 0
+    fi
+    if ! valid_port "$input"; then
+      printf '端口无效，请输入 1-65535 的数字。\n' >&2
+      continue
+    fi
+    if port_in_use "$input"; then
+      printf '端口 %s 已被占用，请换一个。\n' "$input" >&2
+      continue
+    fi
+    printf '%s\n' "$input"
+    return 0
+  done
 }
 
 validate_repo_raw_base() {
@@ -791,7 +631,9 @@ fetch_asset() {
   local dest="$2"
   local mode="$3"
   local script_dir
-  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || pwd)"
+  if ! script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null)"; then
+    script_dir="$PWD"
+  fi
 
   if [ -f "${script_dir}/${rel}" ]; then
     install -m "$mode" "${script_dir}/${rel}" "$dest"
@@ -806,10 +648,6 @@ fetch_asset() {
 
 install_project_files() {
   install -d -m 0755 "$APP_DIR" "$APP_DIR/bin" "$APP_DIR/rules" "$ETC_DIR" "$STATE_DIR"
-  resolve_repo_raw_base
-  if [ -n "$RESOLVED_REPO_COMMIT" ]; then
-    log "已锁定 GitHub 提交：${RESOLVED_REPO_COMMIT:0:7}"
-  fi
   fetch_asset "install.sh" "$APP_DIR/install.sh" 0755
   fetch_asset "bin/warp-vps" "$APP_DIR/bin/warp-vps" 0755
   fetch_asset "rules/google_ipv4.txt" "$APP_DIR/rules/google_ipv4.txt" 0644
@@ -818,25 +656,47 @@ install_project_files() {
   install -m 0755 "$APP_DIR/bin/warp-vps" "$BIN_PATH"
 }
 
-configure_warp() {
-  local port="$1"
-  local i ok
-  systemctl enable --now warp-svc >/dev/null 2>&1 || systemctl start warp-svc >/dev/null 2>&1 || true
-  timeout 60 warp-cli --accept-tos registration new >/dev/null 2>&1 \
-    || timeout 60 warp-cli --accept-tos register >/dev/null 2>&1 \
-    || true
-  timeout 30 warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 \
-    || timeout 30 warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 \
-    || true
-  ok=0
+warp_registration_missing() {
+  local output status_output
+  if output="$(timeout 30 warp-cli --accept-tos registration show 2>&1)"; then
+    return 1
+  fi
+  status_output="$(timeout 30 warp-cli --accept-tos status 2>&1 || true)"
+  output="${output}"$'\n'"${status_output}"
+  grep -Eiq 'registration.*(missing|required|not found)|not registered|no .*registration' <<< "$output"
+}
+
+set_warp_proxy_mode() {
+  local i
   for i in 1 2 3 4 5 6; do
     if timeout 30 warp-cli --accept-tos mode proxy >/dev/null 2>&1; then
-      ok=1
-      break
+      return 0
     fi
     sleep 2
   done
-  [ "$ok" -eq 1 ] || die "无法把 Cloudflare WARP 切换到 SOCKS 代理模式"
+  return 1
+}
+
+configure_warp() {
+  local port="$1"
+  local i ok
+  systemctl enable --now warp-svc >/dev/null 2>&1 \
+    || die "无法启动 Cloudflare WARP 服务"
+
+  if ! set_warp_proxy_mode; then
+    if ! warp_registration_missing; then
+      die "无法把已注册的 Cloudflare WARP 切换到 SOCKS 代理模式"
+    fi
+    log "Cloudflare WARP 尚未注册，正在创建注册"
+    timeout 60 warp-cli --accept-tos registration new >/dev/null 2>&1 \
+      || timeout 60 warp-cli --accept-tos register >/dev/null 2>&1 \
+      || die "Cloudflare WARP 注册失败"
+    set_warp_proxy_mode || die "注册后仍无法把 Cloudflare WARP 切换到 SOCKS 代理模式"
+  fi
+
+  timeout 30 warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 \
+    || timeout 30 warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 \
+    || true
   ok=0
   for i in 1 2 3 4 5 6; do
     if timeout 30 warp-cli --accept-tos proxy port "$port" >/dev/null 2>&1; then
@@ -866,10 +726,7 @@ write_config() {
   local redsocks_uid="$4"
   local redsocks_group="$5"
   local redsocks_bin="$6"
-  local managed_warp_svc=0
-  [ "$mode" = "socks" ] && managed_warp_svc=1
   cat > "$CONFIG_FILE" <<EOF
-APP_VERSION=${APP_VERSION_VALUE}
 REPO_RAW_BASE=${REPO_RAW_BASE}
 WARP_MODE=${mode}
 WARP_SOCKS_PORT=${warp_port}
@@ -881,60 +738,93 @@ REDSOCKS_BIN=${redsocks_bin}
 WG_IFACE=${WG_IFACE}
 WGCF_BIN=${WGCF_BIN}
 WG_CONFIG=${WG_CONFIG}
-MANAGED_WARP_SVC=${managed_warp_svc}
+MANAGED_WARP_SVC=${MANAGED_WARP_SVC_VALUE}
 MANAGED_REDSOCKS_BIN=${MANAGED_REDSOCKS_BIN:-0}
 EOF
   chmod 0600 "$CONFIG_FILE"
+}
+
+stop_project_runtime() {
+  systemctl disable --now warp-vps-health.timer warp-vps-health.service \
+    warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE}.service" \
+    >/dev/null 2>&1 || true
+  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ]; then
+    systemctl disable --now warp-svc.service >/dev/null 2>&1 || true
+  fi
+  if [ -x "$BIN_PATH" ] && [ -r "$CONFIG_FILE" ]; then
+    "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet warp_vps >/dev/null 2>&1 || true
+  fi
+  if command -v ip >/dev/null 2>&1 && ip link show "$WG_IFACE" >/dev/null 2>&1; then
+    if command -v wg-quick >/dev/null 2>&1; then
+      wg-quick down "$WG_CONFIG" >/dev/null 2>&1 \
+        || wg-quick down "$WG_IFACE" >/dev/null 2>&1 \
+        || true
+    fi
+    if ip link show "$WG_IFACE" >/dev/null 2>&1; then
+      ip link delete dev "$WG_IFACE" >/dev/null 2>&1 \
+        || die "无法停止本项目 WireGuard 网卡：$WG_IFACE"
+    fi
+  fi
 }
 
 run_final_self_check() {
   if "$BIN_PATH" test; then
     return 0
   fi
-  log "最终自检失败，正在撤销已启用的服务和分流规则"
-  if "$BIN_PATH" uninstall; then
-    die "最终自检失败，已撤销本项目运行态并把文件移动到备份目录"
-  fi
-  die "最终自检失败，自动撤销也失败；请检查 systemd 和 nftables 状态"
+  log "最终自检失败，正在停止本项目服务和分流规则"
+  stop_project_runtime
+  die "最终自检失败；已停止本项目运行态，CLI、配置和日志已保留。请运行 warp-vps logs 排查，修复后可直接重跑安装器"
 }
 
 main() {
   require_root
+  require_systemd
   validate_repo_raw_base "$REPO_RAW_BASE"
-  check_memory_before_install
-  pre_install_unlock_probe
 
-  local selected_mode
+  local selected_mode warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
   selected_mode="$(prompt_install_mode)"
-  if [ "$selected_mode" = "socks" ]; then
-    ensure_no_existing_redsocks_service
-    ensure_no_existing_warp_client
-  fi
-  log "正在安装依赖"
-  install_dependencies "$selected_mode"
-  [ "$selected_mode" = "socks" ] && preflight_nft_nat
-
-  local warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
+  collect_swap_choice
   if [ "$selected_mode" = "socks" ]; then
     warp_port="$(prompt_warp_port)"
     valid_port "$warp_port" || die "内部错误：选择的 WARP SOCKS 端口无效"
     redsocks_port="$(find_free_port "$warp_port")"
     valid_port "$redsocks_port" || die "内部错误：选择的 redsocks 端口无效"
+  else
+    warp_port=0
+    redsocks_port=0
+  fi
+
+  capture_service_ownership "$selected_mode"
+  stop_project_runtime
+
+  log "正在安装项目文件和管理命令"
+  install_project_files
+  write_config "$selected_mode" "$warp_port" "$redsocks_port" 0 root /usr/sbin/redsocks
+
+  apply_swap_choice
+
+  log "正在安装依赖"
+  install_dependencies "$selected_mode"
+
+  if [ "$selected_mode" = "socks" ]; then
+    disable_new_packaged_redsocks_service
+    preflight_nft_nat
+    port_in_use "$warp_port" && die "安装依赖期间端口 $warp_port 被占用，请直接重跑安装器选择其他端口"
+    port_in_use "$redsocks_port" && die "安装依赖期间内部端口 $redsocks_port 被占用，请直接重跑安装器"
     ensure_redsocks_user
     redsocks_uid="$(id -u "$REDSOCKS_USER")"
     redsocks_group="$(id -gn "$REDSOCKS_USER")"
     redsocks_bin="$(redsocks_path)"
+    mark_managed_redsocks_if_current
   else
-    warp_port=0
-    redsocks_port=0
     redsocks_uid=0
     redsocks_group=root
     redsocks_bin=/usr/sbin/redsocks
   fi
 
-  log "正在安装项目文件"
-  [ "$selected_mode" = "socks" ] && disable_packaged_redsocks_service
-  install_project_files
   write_config "$selected_mode" "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
 
   if [ "$selected_mode" = "socks" ]; then
@@ -969,12 +859,17 @@ main() {
   if [ "$selected_mode" = "socks" ]; then
     printf 'WARP SOCKS 端口：%s\n' "$warp_port"
   fi
-  printf '管理命令：warp-vps {status|test|restart|update|logs|uninstall}\n'
+  printf '管理命令：warp-vps {status|test|restart|unlock-check|update|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ]; then
     printf '已默认阻断 Google 目标 IPv6，避免 IPv6 泄漏。\n'
   else
     printf 'WireGuard 模式会把命中 Google CIDR 的 TCP/UDP 流量路由到 WARP。\n'
   fi
+
+  printf '\n安装后 IPv4 出口解锁检测：\n'
+  "$BIN_PATH" unlock-check || true
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
