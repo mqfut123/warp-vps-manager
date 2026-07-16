@@ -23,6 +23,9 @@ REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 UNLOCK_CONNECT_TIMEOUT=5
 UNLOCK_MAX_TIME=12
+WARP_REGISTRATION_STATE="unknown"
+WARP_REGISTRATION_DETAIL=""
+WARP_RUNTIME_DETAILS=""
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -71,6 +74,9 @@ require_root() {
 load_config() {
   [ -r "$CONFIG_FILE" ] || die "找不到配置文件：$CONFIG_FILE"
   local line key value
+  unset WARP_MODE WARP_SOCKS_PORT REDSOCKS_PORT REDSOCKS_USER REDSOCKS_UID \
+    REDSOCKS_GROUP REDSOCKS_BIN WG_IFACE WGCF_BIN WG_CONFIG \
+    MANAGED_WARP_SVC MANAGED_REDSOCKS_BIN
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       ''|\#*) continue ;;
@@ -119,8 +125,7 @@ load_config() {
   fi
   if [ -z "${MANAGED_REDSOCKS_BIN:-}" ]; then
     MANAGED_REDSOCKS_BIN=0
-    if [ "${REDSOCKS_BIN:-}" = "$REDSOCKS_FALLBACK_BIN" ] \
-      && grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null; then
+    if managed_redsocks_fallback_exists; then
       MANAGED_REDSOCKS_BIN=1
     fi
   fi
@@ -370,19 +375,163 @@ install_wgcf_binary() {
   log "已下载 wgcf：${DEFAULT_WGCF_VERSION} ${asset_name}"
 }
 
+wg_config_valid() {
+  local file="$1"
+  [ -s "$file" ] || return 1
+  wg-quick strip "$file" >/dev/null 2>&1 || return 1
+  python3 - "$file" >/dev/null 2>&1 <<'PY'
+import base64
+import binascii
+import ipaddress
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+interface = None
+peers = []
+current = None
+current_kind = None
+allowed_keys = {
+    "interface": {"privatekey", "address", "mtu", "table"},
+    "peer": {"publickey", "allowedips", "endpoint"},
+}
+
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        section = line[1:-1].strip().lower()
+        if section == "interface":
+            if interface is not None:
+                raise SystemExit("duplicate interface")
+            interface = {}
+            current = interface
+            current_kind = "interface"
+        elif section == "peer":
+            current = {}
+            peers.append(current)
+            current_kind = "peer"
+        else:
+            raise SystemExit("unknown section")
+        continue
+    if current is None or "=" not in line:
+        raise SystemExit("invalid line")
+    key, value = line.split("=", 1)
+    key = key.strip().lower()
+    if key not in allowed_keys[current_kind]:
+        raise SystemExit("unknown key")
+    current.setdefault(key, []).append(value.strip())
+
+def entries(section, key):
+    values = []
+    for raw_value in section.get(key, []):
+        values.extend(item.strip() for item in raw_value.split(",") if item.strip())
+    return values
+
+def valid_key(value):
+    try:
+        return len(base64.b64decode(value, validate=True)) == 32
+    except (binascii.Error, ValueError):
+        return False
+
+def valid_endpoint(value):
+    if not value or any(ch.isspace() for ch in value):
+        return False
+    if value.startswith("["):
+        close = value.find("]")
+        if close <= 1 or value[close + 1:close + 2] != ":":
+            return False
+        host = value[1:close]
+        port = value[close + 2:]
+        try:
+            if ipaddress.ip_address(host).version != 6:
+                return False
+        except ValueError:
+            return False
+    else:
+        if value.count(":") != 1:
+            return False
+        host, port = value.rsplit(":", 1)
+        if not host:
+            return False
+    return port.isdigit() and 1 <= int(port) <= 65535
+
+if interface is None:
+    raise SystemExit("missing interface")
+private_keys = entries(interface, "privatekey")
+if len(private_keys) != 1 or not valid_key(private_keys[0]):
+    raise SystemExit("invalid private key")
+addresses = entries(interface, "address")
+if not addresses:
+    raise SystemExit("missing address")
+for address in addresses:
+    ipaddress.ip_interface(address)
+mtus = entries(interface, "mtu")
+if len(mtus) > 1 or (mtus and (not mtus[0].isdigit() or not 576 <= int(mtus[0]) <= 65535)):
+    raise SystemExit("invalid mtu")
+tables = entries(interface, "table")
+if len(tables) != 1 or tables[0] != "off":
+    raise SystemExit("table must be off")
+if not peers:
+    raise SystemExit("missing peer")
+
+for peer in peers:
+    public_keys = entries(peer, "publickey")
+    if len(public_keys) != 1 or not valid_key(public_keys[0]):
+        raise SystemExit("invalid peer key")
+    endpoints = entries(peer, "endpoint")
+    if len(endpoints) != 1 or not valid_endpoint(endpoints[0]):
+        raise SystemExit("invalid endpoint")
+    allowed = entries(peer, "allowedips")
+    networks = {ipaddress.ip_network(value, strict=False) for value in allowed}
+    if ipaddress.ip_network("0.0.0.0/0") not in networks:
+        raise SystemExit("missing IPv4 default route")
+    if ipaddress.ip_network("::/0") not in networks:
+        raise SystemExit("missing IPv6 default route")
+PY
+}
+
 generate_wg_config() {
-  [ -r "$WG_CONFIG" ] && return 0
-  install -d -m 0700 /etc/wireguard "${STATE_DIR}/wgcf"
+  if [ -r "$WG_CONFIG" ] && wg_config_valid "$WG_CONFIG"; then
+    return 0
+  fi
+
+  local stage fresh profile_dir account_source config_stage config_tmp account_tmp backup_dir
+  stage="${STATE_DIR}/wgcf-stage-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  fresh="${stage}/fresh"
+  account_source="${STATE_DIR}/wgcf/wgcf-account.toml"
+  config_stage="${stage}/${WG_IFACE}.conf"
+  config_tmp="${WG_CONFIG}.new.$$"
+  account_tmp="${account_source}.new.$$"
+  backup_dir="${STATE_DIR}/wgcf/backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+  install -d -m 0700 /etc/wireguard "${STATE_DIR}/wgcf" "$stage"
   install_wgcf_binary
-  (
-    cd "${STATE_DIR}/wgcf"
-    if [ ! -s wgcf-account.toml ]; then
-      printf 'yes\n' | "$WGCF_BIN" register >/dev/null
+  profile_dir=""
+  if [ -s "$account_source" ]; then
+    install -m 0600 "$account_source" "${stage}/wgcf-account.toml"
+    if (
+      cd "$stage"
+      "$WGCF_BIN" generate >/dev/null
+    ); then
+      profile_dir="$stage"
     fi
-    "$WGCF_BIN" generate >/dev/null
-  )
-  [ -r "${STATE_DIR}/wgcf/wgcf-profile.conf" ] || die "wgcf 没有生成 WireGuard 配置"
-  python3 - "${STATE_DIR}/wgcf/wgcf-profile.conf" "$WG_CONFIG" <<'PY'
+  fi
+
+  if [ -z "$profile_dir" ]; then
+    install -d -m 0700 "$fresh"
+    (
+      cd "$fresh"
+      "$WGCF_BIN" register --accept-tos >/dev/null
+      "$WGCF_BIN" generate >/dev/null
+    ) || die "wgcf 注册或生成 WireGuard 配置失败"
+    profile_dir="$fresh"
+  fi
+
+  [ -s "${profile_dir}/wgcf-account.toml" ] || die "wgcf 没有生成账户文件"
+  [ -s "${profile_dir}/wgcf-profile.conf" ] || die "wgcf 没有生成 WireGuard 配置"
+  python3 - "${profile_dir}/wgcf-profile.conf" "$config_stage" <<'PY'
 import pathlib
 import sys
 
@@ -405,7 +554,25 @@ if not inserted:
     raise SystemExit("WireGuard 配置缺少 [Interface]")
 dst.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 PY
-  chmod 0600 "$WG_CONFIG"
+  chmod 0600 "$config_stage"
+  wg_config_valid "$config_stage" || die "wgcf 生成的 WireGuard 配置无法被 wg-quick 解析"
+
+  if [ -e "$WG_CONFIG" ] || { [ -s "$account_source" ] && [ "$profile_dir" = "$fresh" ]; }; then
+    install -d -m 0700 "$backup_dir"
+    if [ -e "$WG_CONFIG" ]; then
+      install -m 0600 "$WG_CONFIG" "${backup_dir}/$(basename "$WG_CONFIG").invalid" \
+        || die "无法备份旧 WireGuard 配置"
+    fi
+    if [ -s "$account_source" ] && [ "$profile_dir" = "$fresh" ]; then
+      install -m 0600 "$account_source" "${backup_dir}/wgcf-account.toml.invalid" \
+        || die "无法备份旧 wgcf 账户文件"
+    fi
+  fi
+
+  install -m 0600 "$config_stage" "$config_tmp"
+  mv "$config_tmp" "$WG_CONFIG"
+  install -m 0600 "${profile_dir}/wgcf-account.toml" "$account_tmp"
+  mv "$account_tmp" "$account_source"
 }
 
 route_file_lines() {
@@ -483,41 +650,54 @@ stop_rules() {
 }
 
 load_uninstall_config() {
-  [ -r "$CONFIG_FILE" ] || return 0
-  local line key value
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      WARP_MODE=*|WG_IFACE=*|MANAGED_WARP_SVC=*|REDSOCKS_BIN=*|MANAGED_REDSOCKS_BIN=*) ;;
-      *) continue ;;
-    esac
-    key="${line%%=*}"
-    value="${line#*=}"
-    case "$key" in
-      WARP_MODE)
-        case "$value" in socks|wireguard) WARP_MODE="$value" ;; esac
-        ;;
-      WG_IFACE)
-        if valid_config_iface "$value"; then
-          WG_IFACE="$value"
-        fi
-        ;;
-      MANAGED_WARP_SVC)
-        case "$value" in 0|1) MANAGED_WARP_SVC="$value" ;; esac
-        ;;
-      REDSOCKS_BIN)
-        if valid_config_path "$value"; then
-          REDSOCKS_BIN="$value"
-        fi
-        ;;
-      MANAGED_REDSOCKS_BIN)
-        case "$value" in 0|1) MANAGED_REDSOCKS_BIN="$value" ;; esac
-        ;;
-    esac
-  done < "$CONFIG_FILE"
+  local line key value mode_present
+  mode_present=0
+  unset WARP_MODE WG_IFACE WG_CONFIG MANAGED_WARP_SVC REDSOCKS_BIN MANAGED_REDSOCKS_BIN
+  if [ -r "$CONFIG_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        WARP_MODE=*|WG_IFACE=*|WG_CONFIG=*|MANAGED_WARP_SVC=*|REDSOCKS_BIN=*|MANAGED_REDSOCKS_BIN=*) ;;
+        *) continue ;;
+      esac
+      key="${line%%=*}"
+      value="${line#*=}"
+      case "$key" in
+        WARP_MODE)
+          case "$value" in
+            socks|wireguard)
+              WARP_MODE="$value"
+              mode_present=1
+              ;;
+          esac
+          ;;
+        WG_IFACE)
+          if valid_config_iface "$value"; then
+            WG_IFACE="$value"
+          fi
+          ;;
+        WG_CONFIG)
+          if valid_config_path "$value"; then
+            WG_CONFIG="$value"
+          fi
+          ;;
+        MANAGED_WARP_SVC)
+          case "$value" in 0|1) MANAGED_WARP_SVC="$value" ;; esac
+          ;;
+        REDSOCKS_BIN)
+          if valid_config_path "$value"; then
+            REDSOCKS_BIN="$value"
+          fi
+          ;;
+        MANAGED_REDSOCKS_BIN)
+          case "$value" in 0|1) MANAGED_REDSOCKS_BIN="$value" ;; esac
+          ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
   WG_IFACE="${WG_IFACE:-$DEFAULT_WG_IFACE}"
-  WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
+  WG_CONFIG="${WG_CONFIG:-/etc/wireguard/${WG_IFACE}.conf}"
   if [ -z "${MANAGED_WARP_SVC:-}" ]; then
-    if [ "${WARP_MODE:-socks}" = "socks" ]; then
+    if [ "$mode_present" -eq 1 ] && [ "$WARP_MODE" = "socks" ]; then
       MANAGED_WARP_SVC=1
     else
       MANAGED_WARP_SVC=0
@@ -525,15 +705,16 @@ load_uninstall_config() {
   fi
   if [ -z "${MANAGED_REDSOCKS_BIN:-}" ]; then
     MANAGED_REDSOCKS_BIN=0
-    if [ "${REDSOCKS_BIN:-}" = "$REDSOCKS_FALLBACK_BIN" ] \
-      && grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null; then
+    if managed_redsocks_fallback_exists; then
       MANAGED_REDSOCKS_BIN=1
     fi
   fi
 }
 
 stop_rules_for_uninstall() {
-  stop_wg_routes
+  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
+    stop_wg_routes
+  fi
   if table_exists; then
     nft delete table inet warp_vps
   fi
@@ -702,15 +883,161 @@ unit_ready() {
   service_active "$1" && service_enabled "$1"
 }
 
+required_runtime_units_ready() {
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    unit_ready "wg-quick@${WG_IFACE}.service" \
+      && unit_ready warp-vps.service \
+      && unit_ready warp-vps-health.timer
+    return
+  fi
+  unit_ready warp-svc.service \
+    && unit_ready warp-vps-redsocks.service \
+    && unit_ready warp-vps.service \
+    && unit_ready warp-vps-health.timer
+}
+
 warp_cli() {
   timeout 60 warp-cli "$@"
 }
 
-ensure_warp_connected() {
-  warp_cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 \
-    || warp_cli tunnel protocol set MASQUE >/dev/null 2>&1 \
+warp_output_registration_missing() {
+  grep -Eiq 'registration.*(missing|required|not found|does not exist)|not registered|no .*registration' <<< "$1"
+}
+
+inspect_warp_registration() {
+  local attempt show_output status_output combined rc
+  WARP_REGISTRATION_STATE="unknown"
+  WARP_REGISTRATION_DETAIL=""
+  for attempt in 1 2 3 4 5 6; do
+    rc=0
+    show_output="$(timeout 10 warp-cli --accept-tos registration show 2>&1)" || rc=$?
+    if warp_output_registration_missing "$show_output"; then
+      WARP_REGISTRATION_STATE="missing"
+      WARP_REGISTRATION_DETAIL="$show_output"
+      return 0
+    fi
+    if [ "$rc" -eq 0 ]; then
+      WARP_REGISTRATION_STATE="present"
+      return 0
+    fi
+    status_output="$(timeout 10 warp-cli --accept-tos status 2>&1 || true)"
+    combined="${show_output}"$'\n'"${status_output}"
+    if warp_output_registration_missing "$combined"; then
+      WARP_REGISTRATION_STATE="missing"
+      WARP_REGISTRATION_DETAIL="$combined"
+      return 0
+    fi
+    WARP_REGISTRATION_DETAIL="$combined"
+    sleep 2
+  done
+  return 0
+}
+
+remember_warp_output() {
+  local label="$1"
+  local output="$2"
+  [ -n "$output" ] || return 0
+  WARP_RUNTIME_DETAILS="${WARP_RUNTIME_DETAILS}${label}:"$'\n'"${output}"$'\n'
+}
+
+create_warp_registration() {
+  local output
+  if output="$(warp_cli --accept-tos registration new 2>&1)"; then
+    inspect_warp_registration
+    return 0
+  fi
+  remember_warp_output "registration new" "$output"
+  inspect_warp_registration
+  [ "$WARP_REGISTRATION_STATE" = "present" ] && return 0
+  [ "$WARP_REGISTRATION_STATE" = "missing" ] || return 1
+  if output="$(warp_cli --accept-tos register 2>&1)"; then
+    inspect_warp_registration
+    return 0
+  fi
+  remember_warp_output "register" "$output"
+  inspect_warp_registration
+  [ "$WARP_REGISTRATION_STATE" = "present" ]
+}
+
+try_warp_command() {
+  local label="$1"
+  shift
+  local output
+  if output="$(warp_cli "$@" 2>&1)"; then
+    return 0
+  fi
+  remember_warp_output "$label" "$output"
+  return 1
+}
+
+wait_for_warp_proxy_ready() {
+  local timeout="${1:-90}"
+  local end=$((SECONDS + timeout))
+  while [ "$SECONDS" -le "$end" ]; do
+    if port_listening "$WARP_SOCKS_PORT" && socks_ok; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+print_warp_diagnostics() {
+  local status_output
+  warn "Cloudflare WARP 本地代理没有就绪"
+  warn "注册状态：${WARP_REGISTRATION_STATE}"
+  if [ -n "$WARP_RUNTIME_DETAILS" ]; then
+    printf '[warp-vps] warp-cli 命令输出：\n%s' "$WARP_RUNTIME_DETAILS" >&2
+  fi
+  status_output="$(timeout 15 warp-cli --accept-tos status 2>&1 || true)"
+  if [ -n "$status_output" ]; then
+    printf '[warp-vps] warp-cli status：\n%s\n' "$status_output" >&2
+  elif [ -n "$WARP_REGISTRATION_DETAIL" ]; then
+    printf '[warp-vps] 注册检查输出：\n%s\n' "$WARP_REGISTRATION_DETAIL" >&2
+  fi
+}
+
+configure_warp_runtime() {
+  command -v warp-cli >/dev/null 2>&1 || {
+    warn "找不到 warp-cli"
+    return 1
+  }
+  systemctl enable --now warp-svc.service >/dev/null 2>&1 || {
+    warn "无法启动 warp-svc.service"
+    return 1
+  }
+
+  WARP_RUNTIME_DETAILS=""
+  inspect_warp_registration
+  if [ "$WARP_REGISTRATION_STATE" = "missing" ]; then
+    log "Cloudflare WARP 尚未注册，正在创建注册"
+    create_warp_registration || true
+  fi
+
+  try_warp_command "mode proxy" --accept-tos mode proxy \
+    || try_warp_command "mode proxy" mode proxy \
     || true
-  warp_cli --accept-tos connect >/dev/null 2>&1 || warp_cli connect >/dev/null 2>&1 || true
+  try_warp_command "tunnel protocol set MASQUE" --accept-tos tunnel protocol set MASQUE \
+    || try_warp_command "tunnel protocol set MASQUE" tunnel protocol set MASQUE \
+    || true
+  try_warp_command "proxy port ${WARP_SOCKS_PORT}" --accept-tos proxy port "$WARP_SOCKS_PORT" \
+    || try_warp_command "proxy port ${WARP_SOCKS_PORT}" proxy port "$WARP_SOCKS_PORT" \
+    || true
+
+  local attempt
+  for attempt in 1 2 3; do
+    try_warp_command "connect" --accept-tos connect \
+      || try_warp_command "connect" connect \
+      || true
+    port_listening "$WARP_SOCKS_PORT" && break
+    sleep 2
+  done
+
+  if wait_for_warp_proxy_ready 90; then
+    return 0
+  fi
+  print_warp_diagnostics
+  return 1
 }
 
 test_quiet() {
@@ -1160,25 +1487,36 @@ cmd_unlock_check() {
   run_unlock_checks
 }
 
+cmd_configure_warp() {
+  require_root
+  load_config
+  [ "$WARP_MODE" = "socks" ] || die "当前不是 Socks5 模式"
+  configure_warp_runtime || die "Cloudflare WARP SOCKS 配置失败；上方已输出 warp-cli 诊断"
+}
+
 cmd_restart() {
   require_root
   load_config
   section "正在重启"
   if [ "$WARP_MODE" = "wireguard" ]; then
     info_line "正在重启 WireGuard WARP 网卡和分流路由，请稍等"
+    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null \
+      || die "无法启用 WireGuard 项目服务"
     restart_wireguard_runtime || die "重启后 WireGuard 出口不可用"
-    systemctl restart warp-vps.service
+    systemctl restart warp-vps.service || die "无法重启分流规则服务"
+    systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
     cmd_test
     return
   fi
 
   info_line "正在重启 WARP 和本地分流服务，请稍等"
-  systemctl restart warp-svc >/dev/null 2>&1 || true
-  ensure_warp_connected
-  wait_for_socks_listen 20 || die "重启后 WARP SOCKS 端口没有监听"
-  systemctl restart warp-vps-redsocks.service
-  apply_rules
-  systemctl restart warp-vps.service
+  systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null \
+    || die "无法启用 Socks5 项目服务"
+  configure_warp_runtime || die "重启后 Cloudflare WARP SOCKS 不可用"
+  systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
+  apply_rules || die "无法重新加载分流规则"
+  systemctl restart warp-vps.service || die "无法重启分流规则服务"
+  systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
   cmd_test
 }
 
@@ -1254,32 +1592,56 @@ validate_update_stage() {
 backup_current_installation() {
   local backup="$1"
   install -d -m 0755 "${backup}/bin" "${backup}/rules"
-  [ -f "${APP_DIR}/install.sh" ] && install -m 0755 "${APP_DIR}/install.sh" "${backup}/install.sh"
-  [ -f "${APP_DIR}/bin/warp-vps" ] && install -m 0755 "${APP_DIR}/bin/warp-vps" "${backup}/bin/warp-vps"
-  [ -f "${RULES_DIR}/google_ipv4.txt" ] && install -m 0644 "${RULES_DIR}/google_ipv4.txt" "${backup}/rules/google_ipv4.txt"
-  [ -f "${RULES_DIR}/google_ipv6.txt" ] && install -m 0644 "${RULES_DIR}/google_ipv6.txt" "${backup}/rules/google_ipv6.txt"
-  [ -f "${RULES_DIR}/rules.meta.json" ] && install -m 0644 "${RULES_DIR}/rules.meta.json" "${backup}/rules/rules.meta.json"
-  [ -f "$BIN_PATH" ] && install -m 0755 "$BIN_PATH" "${backup}/warp-vps"
+  if [ -f "${APP_DIR}/install.sh" ]; then
+    install -m 0755 "${APP_DIR}/install.sh" "${backup}/install.sh" || return 1
+  fi
+  if [ -f "${APP_DIR}/bin/warp-vps" ]; then
+    install -m 0755 "${APP_DIR}/bin/warp-vps" "${backup}/bin/warp-vps" || return 1
+  fi
+  if [ -f "${RULES_DIR}/google_ipv4.txt" ]; then
+    install -m 0644 "${RULES_DIR}/google_ipv4.txt" "${backup}/rules/google_ipv4.txt" || return 1
+  fi
+  if [ -f "${RULES_DIR}/google_ipv6.txt" ]; then
+    install -m 0644 "${RULES_DIR}/google_ipv6.txt" "${backup}/rules/google_ipv6.txt" || return 1
+  fi
+  if [ -f "${RULES_DIR}/rules.meta.json" ]; then
+    install -m 0644 "${RULES_DIR}/rules.meta.json" "${backup}/rules/rules.meta.json" || return 1
+  fi
+  if [ -f "$BIN_PATH" ]; then
+    install -m 0755 "$BIN_PATH" "${backup}/warp-vps" || return 1
+  fi
 }
 
 activate_update_stage() {
   local stage="$1"
-  install -m 0755 "${stage}/install.sh" "${APP_DIR}/install.sh"
-  install -m 0755 "${stage}/bin/warp-vps" "${APP_DIR}/bin/warp-vps"
-  install -m 0644 "${stage}/rules/google_ipv4.txt" "${RULES_DIR}/google_ipv4.txt"
-  install -m 0644 "${stage}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt"
-  install -m 0644 "${stage}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json"
-  install -m 0755 "${APP_DIR}/bin/warp-vps" "$BIN_PATH"
+  install -m 0755 "${stage}/install.sh" "${APP_DIR}/install.sh" || return 1
+  install -m 0755 "${stage}/bin/warp-vps" "${APP_DIR}/bin/warp-vps" || return 1
+  install -m 0644 "${stage}/rules/google_ipv4.txt" "${RULES_DIR}/google_ipv4.txt" || return 1
+  install -m 0644 "${stage}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt" || return 1
+  install -m 0644 "${stage}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json" || return 1
+  install -m 0755 "${APP_DIR}/bin/warp-vps" "$BIN_PATH" || return 1
 }
 
 restore_update_backup() {
   local backup="$1"
-  [ -f "${backup}/install.sh" ] && install -m 0755 "${backup}/install.sh" "${APP_DIR}/install.sh"
-  [ -f "${backup}/bin/warp-vps" ] && install -m 0755 "${backup}/bin/warp-vps" "${APP_DIR}/bin/warp-vps"
-  [ -f "${backup}/rules/google_ipv4.txt" ] && install -m 0644 "${backup}/rules/google_ipv4.txt" "${RULES_DIR}/google_ipv4.txt"
-  [ -f "${backup}/rules/google_ipv6.txt" ] && install -m 0644 "${backup}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt"
-  [ -f "${backup}/rules/rules.meta.json" ] && install -m 0644 "${backup}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json"
-  [ -f "${backup}/warp-vps" ] && install -m 0755 "${backup}/warp-vps" "$BIN_PATH"
+  if [ -f "${backup}/install.sh" ]; then
+    install -m 0755 "${backup}/install.sh" "${APP_DIR}/install.sh" || return 1
+  fi
+  if [ -f "${backup}/bin/warp-vps" ]; then
+    install -m 0755 "${backup}/bin/warp-vps" "${APP_DIR}/bin/warp-vps" || return 1
+  fi
+  if [ -f "${backup}/rules/google_ipv4.txt" ]; then
+    install -m 0644 "${backup}/rules/google_ipv4.txt" "${RULES_DIR}/google_ipv4.txt" || return 1
+  fi
+  if [ -f "${backup}/rules/google_ipv6.txt" ]; then
+    install -m 0644 "${backup}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt" || return 1
+  fi
+  if [ -f "${backup}/rules/rules.meta.json" ]; then
+    install -m 0644 "${backup}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json" || return 1
+  fi
+  if [ -f "${backup}/warp-vps" ]; then
+    install -m 0755 "${backup}/warp-vps" "$BIN_PATH" || return 1
+  fi
 }
 
 reload_runtime_after_update() {
@@ -1288,12 +1650,16 @@ reload_runtime_after_update() {
   if [ "$WARP_MODE" = "wireguard" ]; then
     systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null || return 1
     restart_wireguard_runtime || return 1
+    systemctl restart warp-vps.service || return 1
+    systemctl start warp-vps-health.timer || return 1
   else
     systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null || return 1
-    "$BIN_PATH" apply || return 1
+    configure_warp_runtime || return 1
     systemctl restart warp-vps-redsocks.service || return 1
+    "$BIN_PATH" apply || return 1
+    systemctl restart warp-vps.service || return 1
+    systemctl start warp-vps-health.timer || return 1
   fi
-  systemctl restart warp-vps.service || return 1
   "$BIN_PATH" test || return 1
 }
 
@@ -1312,8 +1678,12 @@ cmd_update() {
   download_update_asset "rules/google_ipv6.txt" "${stage}/rules/google_ipv6.txt"
   download_update_asset "rules/rules.meta.json" "${stage}/rules/rules.meta.json"
   validate_update_stage "$stage"
-  backup_current_installation "$backup"
-  activate_update_stage "$stage"
+  backup_current_installation "$backup" || die "无法备份当前安装，更新已中止"
+  if ! activate_update_stage "$stage"; then
+    warn_line "更新文件激活失败，正在恢复旧文件"
+    restore_update_backup "$backup" || die "更新文件激活失败，且无法恢复旧文件"
+    die "更新失败，已恢复旧文件"
+  fi
   ok_line "更新完成，正在运行自检"
   if reload_runtime_after_update; then
     ok_line "更新后的链路自检通过"
@@ -1321,7 +1691,7 @@ cmd_update() {
   fi
 
   warn_line "更新后自检失败，正在恢复旧版本"
-  restore_update_backup "$backup"
+  restore_update_backup "$backup" || die "更新后自检失败，且无法恢复旧文件"
   if reload_runtime_after_update; then
     die "更新失败，已恢复旧版本"
   fi
@@ -1330,27 +1700,33 @@ cmd_update() {
 
 cmd_heal() {
   require_root
-  if test_quiet; then
+  load_config
+  if required_runtime_units_ready && test_quiet; then
     log "健康检查正常"
     return 0
   fi
   warn "健康检查失败，正在尝试自动修复"
-  load_config
   if [ "$WARP_MODE" = "wireguard" ]; then
+    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null \
+      || die "无法启用 WireGuard 项目服务"
     restart_wireguard_runtime || true
-    if test_quiet; then
+    systemctl restart warp-vps.service >/dev/null 2>&1 || true
+    systemctl start warp-vps-health.timer >/dev/null 2>&1 || true
+    if required_runtime_units_ready && test_quiet; then
       log "自动修复成功"
     else
       die "自动修复失败，请运行 warp-vps logs 查看日志"
     fi
     return 0
   fi
-  systemctl restart warp-svc >/dev/null 2>&1 || true
-  ensure_warp_connected
-  wait_for_socks_listen 20 || die "自动修复后 WARP SOCKS 端口仍未监听"
-  systemctl restart warp-vps-redsocks.service || true
-  apply_rules
-  if test_quiet; then
+  systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null \
+    || die "无法启用 Socks5 项目服务"
+  configure_warp_runtime || die "自动修复后 Cloudflare WARP SOCKS 仍不可用"
+  systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
+  apply_rules || die "无法重新加载分流规则"
+  systemctl restart warp-vps.service || die "无法重启分流规则服务"
+  systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
+  if required_runtime_units_ready && test_quiet; then
     log "自动修复成功"
   else
     die "自动修复失败，请运行 warp-vps logs 查看日志"
@@ -1366,7 +1742,8 @@ cmd_wait_wireguard() {
 
 cmd_logs() {
   require_root
-  journalctl -u warp-svc -u "wg-quick@${DEFAULT_WG_IFACE}.service" -u warp-vps-redsocks.service -u warp-vps.service -u warp-vps-health.service --no-pager -n 200
+  load_uninstall_config
+  journalctl -u warp-svc -u "wg-quick@${WG_IFACE}.service" -u warp-vps-redsocks.service -u warp-vps.service -u warp-vps-health.service --no-pager -n 200
 }
 
 safe_move_if_exists() {
@@ -1419,24 +1796,36 @@ ensure_wireguard_down_for_uninstall() {
       || true
   fi
   if wg_interface_exists; then
+    ip link delete dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" >/dev/null 2>&1 || true
+  fi
+  if wg_interface_exists; then
     die "WireGuard 网卡仍在运行，卸载已中止：${WG_IFACE:-$DEFAULT_WG_IFACE}"
   fi
 }
 
 managed_redsocks_fallback_exists() {
-  [ "${MANAGED_REDSOCKS_BIN:-0}" = "1" ] || return 1
-  [ "${REDSOCKS_BIN:-}" = "$REDSOCKS_FALLBACK_BIN" ] || return 1
-  [ -e "$REDSOCKS_FALLBACK_BIN" ]
+  local marker_value
+  [ -x "$REDSOCKS_FALLBACK_BIN" ] || return 1
+  [ -r "${STATE_DIR}/managed-redsocks-fallback" ] || return 1
+  marker_value="$(head -n 1 "${STATE_DIR}/managed-redsocks-fallback" 2>/dev/null || true)"
+  [ "$marker_value" = "$REDSOCKS_MANAGED_VERSION" ] || return 1
+  grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null
 }
 
 cmd_uninstall() {
   require_root
-  local backup_dir
+  local backup_dir move_managed_redsocks
   backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)"
   install -d -m 0755 "$backup_dir"
   load_uninstall_config
-  systemctl stop warp-vps-health.timer warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
-  systemctl disable warp-vps-health.timer warp-vps.service warp-vps-redsocks.service "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
+  move_managed_redsocks=0
+  managed_redsocks_fallback_exists && move_managed_redsocks=1
+  systemctl stop warp-vps-health.timer warp-vps-health.service warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
+  systemctl disable warp-vps-health.timer warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
+  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
+    systemctl stop "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
+    systemctl disable "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
+  fi
   ensure_wireguard_down_for_uninstall
   stop_rules_for_uninstall
   disable_managed_warp_service
@@ -1447,12 +1836,14 @@ cmd_uninstall() {
   print_move_target_if_exists /etc/systemd/system/warp-vps.service "$backup_dir" "systemd-warp-vps.service"
   print_move_target_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir" "systemd-warp-vps-health.service"
   print_move_target_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir" "systemd-warp-vps-health.timer"
-  print_move_target_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
+  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
+    print_move_target_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
+  fi
   print_move_target_if_exists "$ETC_DIR" "$backup_dir" "etc-warp-vps-manager"
   print_move_target_if_exists "$APP_DIR" "$backup_dir" "opt-warp-vps-manager"
   print_move_target_if_exists "$STATE_DIR" "$backup_dir" "var-lib-warp-vps-manager"
   print_move_target_if_exists "$BIN_PATH" "$backup_dir" "usr-local-bin-warp-vps"
-  if managed_redsocks_fallback_exists; then
+  if [ "$move_managed_redsocks" -eq 1 ]; then
     print_move_target_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
   fi
   print_move_target_if_exists "$MANAGED_SWAP_FILE" "$backup_dir" "swapfile-warp-vps-manager"
@@ -1462,12 +1853,14 @@ cmd_uninstall() {
   safe_move_if_exists /etc/systemd/system/warp-vps.service "$backup_dir" "systemd-warp-vps.service"
   safe_move_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir" "systemd-warp-vps-health.service"
   safe_move_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir" "systemd-warp-vps-health.timer"
-  safe_move_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
+  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
+    safe_move_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
+  fi
   safe_move_if_exists "$ETC_DIR" "$backup_dir" "etc-warp-vps-manager"
   safe_move_if_exists "$APP_DIR" "$backup_dir" "opt-warp-vps-manager"
   safe_move_if_exists "$STATE_DIR" "$backup_dir" "var-lib-warp-vps-manager"
   safe_move_if_exists "$BIN_PATH" "$backup_dir" "usr-local-bin-warp-vps"
-  if managed_redsocks_fallback_exists; then
+  if [ "$move_managed_redsocks" -eq 1 ]; then
     safe_move_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
   fi
   systemctl daemon-reload
@@ -1492,6 +1885,7 @@ usage() {
   heal            健康检查和自动修复
   apply           重新生成并加载分流规则
   stop-rules      移除本项目 nftables 规则
+  configure-warp  配置并连接 Cloudflare WARP 本地代理
   setup-wireguard 准备 WireGuard WARP 配置
   preflight-wireguard 预检 WireGuard 网卡和路由
   wait-wireguard  等待 WireGuard 出口就绪
@@ -1511,6 +1905,7 @@ main() {
     heal) cmd_heal ;;
     apply) require_root; apply_rules ;;
     stop-rules) require_root; stop_rules ;;
+    configure-warp) cmd_configure_warp ;;
     setup-wireguard) cmd_setup_wireguard ;;
     preflight-wireguard) cmd_preflight_wireguard ;;
     wait-wireguard) cmd_wait_wireguard ;;
