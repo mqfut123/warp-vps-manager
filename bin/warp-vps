@@ -1111,15 +1111,25 @@ curl_gemini_location() {
 
 extract_youtube_region() {
   local body="$1"
-  local region
-  region="$(sed -n 's/.*"INNERTUBE_CONTEXT_GL"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
-  region="${region%%$'\n'*}"
-  if [ -z "$region" ]; then
-    region="$(sed -n 's/.*"countryCode"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body")"
-    region="${region%%$'\n'*}"
-  fi
-  printf '%s' "$region" | tr '[:lower:]' '[:upper:]'
-  printf '\n'
+  python3 -c '
+import re
+import sys
+
+body = sys.stdin.read()
+for key in ("INNERTUBE_CONTEXT_GL", "contentRegion", "countryCode"):
+    pattern = rf"\"{key}\"\s*:\s*\"([A-Za-z]{{2}})\""
+    values = []
+    for value in re.findall(pattern, body):
+        value = value.upper()
+        if value not in values:
+            values.append(value)
+    if len(values) == 1:
+        print(values[0])
+        raise SystemExit(0)
+    if len(values) > 1:
+        raise SystemExit(2)
+raise SystemExit(1)
+' <<< "$body"
 }
 
 parse_gemini_location() {
@@ -1182,8 +1192,16 @@ evaluate_gemini_unlock() {
   local body="$1"
   local location_response="$2"
   local location
+  local restricted=0
 
   if grep -Eiq "gemini (is not|isn.t)( currently)? available in your (country|region)|not( currently)? available in your (country|region)|unavailable in your (country|region)" <<< "$body"; then
+    restricted=1
+  fi
+  if [ "$restricted" -eq 1 ] && gemini_page_normal "$body"; then
+    printf 'unknown|页面特征冲突\n'
+    return 0
+  fi
+  if [ "$restricted" -eq 1 ]; then
     printf 'no|当前出口地区受限\n'
     return 0
   fi
@@ -1214,21 +1232,32 @@ probe_gemini_unlock() {
   evaluate_gemini_unlock "$body" "$location_response"
 }
 
-probe_youtube_premium_unlock() {
-  local body region
-  body="$(curl_unlock_page "https://www.youtube.com/premium")"
+evaluate_youtube_premium_unlock() {
+  local body="$1"
+  local region=""
+  local region_status=0
+  local unavailable=0
+  local available=0
+
   if [ -z "$body" ]; then
     printf 'unknown|网络连接失败\n'
     return 0
   fi
 
-  region="$(extract_youtube_region "$body")"
-  if grep -q 'www.google.cn' <<< "$body"; then
-    printf 'no|地区：CN\n'
-    return 0
+  if region="$(extract_youtube_region "$body" 2>/dev/null)"; then
+    :
+  else
+    region_status=$?
   fi
 
-  if grep -Eiq 'Premium is not available in your country|Premium is not available' <<< "$body"; then
+  if grep -Fqi 'Premium is not available in your country' <<< "$body"; then
+    unavailable=1
+  fi
+  if grep -Eiq 'ad-free|purchaseButtonOverride|Start trial' <<< "$body"; then
+    available=1
+  fi
+
+  if [ "$unavailable" -eq 1 ]; then
     if [ -n "$region" ]; then
       printf 'no|地区：%s\n' "$region"
     else
@@ -1237,7 +1266,17 @@ probe_youtube_premium_unlock() {
     return 0
   fi
 
-  if [ -n "$region" ] && grep -Eiq 'ad-free|YouTube and YouTube Music ad-free' <<< "$body"; then
+  if [ "$region_status" -eq 2 ]; then
+    printf 'unknown|地区信息冲突\n'
+    return 0
+  fi
+
+  if [ "$region" = "CN" ]; then
+    printf 'no|地区：CN\n'
+    return 0
+  fi
+
+  if [ -n "$region" ] && [ "$available" -eq 1 ]; then
     printf 'yes|地区：%s\n' "$region"
     return 0
   fi
@@ -1247,6 +1286,12 @@ probe_youtube_premium_unlock() {
   else
     printf 'unknown|页面特征不明确\n'
   fi
+}
+
+probe_youtube_premium_unlock() {
+  local body
+  body="$(curl_unlock_page "https://www.youtube.com/premium")"
+  evaluate_youtube_premium_unlock "$body"
 }
 
 print_unlock_result() {

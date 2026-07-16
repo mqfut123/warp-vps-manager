@@ -900,7 +900,63 @@ test_gemini_fixtures() {
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/old-false-marker.html" \
     "${FIXTURE_DIR}/gemini/available-k4wwud.txt" \
-    'unknown|页面特征不明确'
+    'unknown|页面特征不明确' || return 1
+  evaluate_gemini_fixture \
+    "${FIXTURE_DIR}/gemini/conflicting.html" \
+    "${FIXTURE_DIR}/gemini/available-k4wwud.txt" \
+    'unknown|页面特征冲突'
+}
+
+evaluate_youtube_fixture() {
+  local fixture="$1"
+  local expected="$2"
+  local actual
+
+  actual="$(evaluate_youtube_premium_unlock "$(cat "$fixture")")"
+  assert_eq "$expected" "$actual" "YouTube fixture $(basename "$fixture")"
+}
+
+test_youtube_fixtures() {
+  source_without_main "$MANAGER_SCRIPT"
+  declare -F evaluate_youtube_premium_unlock >/dev/null || {
+    fail 'evaluate_youtube_premium_unlock is missing'
+    return 1
+  }
+
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us-google-cn.html" \
+    'yes|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us-unrelated-country.html" \
+    'yes|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us.html" \
+    'yes|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us-generic-adfree.html" \
+    'yes|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/conflicting-region.html" \
+    'unknown|地区信息冲突' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/conflicting-signals.html" \
+    'no|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/region-cn.html" \
+    'no|地区：CN' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/unavailable-us.html" \
+    'no|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/region-only.html" \
+    'unknown|页面特征不明确' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/offer-without-region.html" \
+    'unknown|未取到地区' || return 1
+  assert_eq \
+    'unknown|网络连接失败' \
+    "$(evaluate_youtube_premium_unlock '')" \
+    'empty YouTube response should remain unknown'
 }
 
 test_status_and_test_do_not_run_unlock_checks() {
@@ -1149,6 +1205,7 @@ run_test 'WARP readiness wins over intermediate command exit codes' test_warp_co
 run_test 'failed Swap creation returns to selection' test_swap_failure_returns_to_selection
 run_test 'custom Swap uses decimal input and releases failed allocation' test_custom_swap_is_decimal_and_rollback_releases_space
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
+run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'status and test do not run unlock probes' test_status_and_test_do_not_run_unlock_checks
 run_test 'restart update and heal restore required units' test_restart_and_update_restore_required_units
 run_test 'uninstall is mode scoped and keeps custom WireGuard paths' test_uninstall_is_mode_scoped_and_keeps_custom_wg_path
