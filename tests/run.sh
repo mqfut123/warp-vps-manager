@@ -157,6 +157,7 @@ test_stdin_execution_without_bash_source() {
   body="$(function_body "$INSTALL_SCRIPT" fetch_asset)"
   output="$(printf '%s\n' \
     'set -u' \
+    'SCRIPT_SOURCE=' \
     'REPO_RAW_BASE=https://example.invalid/project/main' \
     'raw_asset_url() { printf "%s/%s\\n" "${REPO_RAW_BASE%/}" "$1"; }' \
     'curl() { printf "download:%s\\n" "$*"; }' \

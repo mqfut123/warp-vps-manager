@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 APP_NAME="warp-vps-manager"
 APP_DIR="/opt/${APP_NAME}"
 ETC_DIR="/etc/${APP_NAME}"
@@ -631,7 +632,7 @@ fetch_asset() {
   local dest="$2"
   local mode="$3"
   local source_path script_dir
-  source_path="${BASH_SOURCE[0]:-}"
+  source_path="$SCRIPT_SOURCE"
   script_dir=""
   if [ -n "$source_path" ]; then
     script_dir="$(cd -- "$(dirname -- "$source_path")" && pwd -P 2>/dev/null)" || script_dir=""
