@@ -70,7 +70,7 @@ source_without_main() {
   # Removing it lets the tests exercise pure functions without touching the host.
   # shellcheck disable=SC1090
   eval "$(sed \
-    -e '/^if \[ "${BASH_SOURCE\[0\]}" = "\$0" \]; then$/,/^fi$/d' \
+    -e '/^if \[ "${BASH_SOURCE\[0\]:-\$0}" = "\$0" \]; then$/,/^fi$/d' \
     -e '/^main "\$@"$/d' \
     "$file")"
 }
@@ -144,6 +144,28 @@ test_warp_port_reprompts() {
   fi
   output="${output##*$'\n'}"
   assert_eq '23456' "$output" 'empty retry should select a free port'
+}
+
+test_stdin_execution_without_bash_source() {
+  local file guard output body
+  for file in "$INSTALL_SCRIPT" "$MANAGER_SCRIPT"; do
+    guard="$(tail -n 3 "$file")"
+    output="$(printf 'set -u\nmain() { printf called; }\n%s\n' "$guard" | bash)"
+    assert_eq 'called' "$output" "stdin execution should call main without BASH_SOURCE: $file" || return 1
+  done
+
+  body="$(function_body "$INSTALL_SCRIPT" fetch_asset)"
+  output="$(printf '%s\n' \
+    'set -u' \
+    'REPO_RAW_BASE=https://example.invalid/project/main' \
+    'raw_asset_url() { printf "%s/%s\\n" "${REPO_RAW_BASE%/}" "$1"; }' \
+    'curl() { printf "download:%s\\n" "$*"; }' \
+    'chmod() { :; }' \
+    "$body" \
+    'fetch_asset bin/warp-vps /tmp/unused 0755' \
+    | bash)"
+  assert_contains "$output" 'https://example.invalid/project/main/bin/warp-vps' \
+    'stdin execution should download assets when no script path exists'
 }
 
 test_inputs_precede_side_effects() {
@@ -646,6 +668,7 @@ test_no_sha_gate() {
 
 run_test 'install mode retries after invalid input' test_install_mode_reprompts
 run_test 'SOCKS port retries after a stray backslash' test_warp_port_reprompts
+run_test 'stdin execution works without BASH_SOURCE' test_stdin_execution_without_bash_source
 run_test 'all interactive input precedes installation side effects' test_inputs_precede_side_effects
 run_test 'installed services are reusable instead of blanket blockers' test_existing_services_are_reusable
 run_test 'installer records and respects service ownership' test_installer_captures_service_ownership

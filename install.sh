@@ -630,12 +630,14 @@ fetch_asset() {
   local rel="$1"
   local dest="$2"
   local mode="$3"
-  local script_dir
-  if ! script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null)"; then
-    script_dir="$PWD"
+  local source_path script_dir
+  source_path="${BASH_SOURCE[0]:-}"
+  script_dir=""
+  if [ -n "$source_path" ]; then
+    script_dir="$(cd -- "$(dirname -- "$source_path")" && pwd -P 2>/dev/null)" || script_dir=""
   fi
 
-  if [ -f "${script_dir}/${rel}" ]; then
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/${rel}" ]; then
     install -m "$mode" "${script_dir}/${rel}" "$dest"
     return
   fi
@@ -870,6 +872,6 @@ main() {
   "$BIN_PATH" unlock-check || true
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
   main "$@"
 fi
