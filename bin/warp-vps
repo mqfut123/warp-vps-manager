@@ -26,6 +26,10 @@ UNLOCK_MAX_TIME=12
 WARP_REGISTRATION_STATE="unknown"
 WARP_REGISTRATION_DETAIL=""
 WARP_RUNTIME_DETAILS=""
+UNINSTALL_REMOVE_DEPENDENCIES=0
+UNINSTALL_WG_CONFIG_EXPLICIT=0
+UNINSTALL_WIREGUARD_PRESENT=0
+UNINSTALL_RUNTIME_IDENTIFIED=0
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -46,6 +50,17 @@ fi
 log() { printf '[warp-vps] %s\n' "$*"; }
 warn() { printf '[warp-vps] 警告：%s\n' "$*" >&2; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
+
+read_input() {
+  local var_name="$1"
+  if [ -r /dev/tty ]; then
+    # shellcheck disable=SC2229
+    IFS= read -r "$var_name" </dev/tty
+  else
+    # shellcheck disable=SC2229
+    IFS= read -r "$var_name"
+  fi
+}
 
 section() {
   printf '\n%b%s%b\n' "$C_BOLD" "$1" "$C_RESET"
@@ -650,8 +665,12 @@ stop_rules() {
 }
 
 load_uninstall_config() {
-  local line key value mode_present
+  local line key value mode_present iface_invalid
   mode_present=0
+  iface_invalid=0
+  UNINSTALL_WG_CONFIG_EXPLICIT=0
+  UNINSTALL_WIREGUARD_PRESENT=0
+  UNINSTALL_RUNTIME_IDENTIFIED=0
   unset WARP_MODE WG_IFACE WG_CONFIG MANAGED_WARP_SVC REDSOCKS_BIN MANAGED_REDSOCKS_BIN
   if [ -r "$CONFIG_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -673,11 +692,14 @@ load_uninstall_config() {
         WG_IFACE)
           if valid_config_iface "$value"; then
             WG_IFACE="$value"
+          else
+            iface_invalid=1
           fi
           ;;
         WG_CONFIG)
           if valid_config_path "$value"; then
             WG_CONFIG="$value"
+            UNINSTALL_WG_CONFIG_EXPLICIT=1
           fi
           ;;
         MANAGED_WARP_SVC)
@@ -696,6 +718,14 @@ load_uninstall_config() {
   fi
   WG_IFACE="${WG_IFACE:-$DEFAULT_WG_IFACE}"
   WG_CONFIG="${WG_CONFIG:-/etc/wireguard/${WG_IFACE}.conf}"
+  if [ "${WARP_MODE:-}" = "wireguard" ]; then
+    UNINSTALL_WIREGUARD_PRESENT=1
+  fi
+  if [ "$mode_present" -eq 1 ]; then
+    if [ "$WARP_MODE" = "socks" ] || [ "$iface_invalid" -eq 0 ]; then
+      UNINSTALL_RUNTIME_IDENTIFIED=1
+    fi
+  fi
   if [ -z "${MANAGED_WARP_SVC:-}" ]; then
     if [ "$mode_present" -eq 1 ] && [ "$WARP_MODE" = "socks" ]; then
       MANAGED_WARP_SVC=1
@@ -711,12 +741,86 @@ load_uninstall_config() {
   fi
 }
 
+recover_uninstall_runtime_from_unit() {
+  local unit_file candidate line
+  unit_file="/etc/systemd/system/warp-vps.service"
+  if [ -r "$unit_file" ] && grep -q 'wg-quick@' "$unit_file"; then
+    candidate=""
+    while IFS= read -r line; do
+      case "$line" in
+        *wg-quick@*.service*)
+          candidate="${line#*wg-quick@}"
+          candidate="${candidate%%.service*}"
+          valid_config_iface "$candidate" && break
+          candidate=""
+          ;;
+      esac
+    done < "$unit_file"
+    if valid_config_iface "$candidate"; then
+      WG_IFACE="$candidate"
+      if [ "$UNINSTALL_WG_CONFIG_EXPLICIT" -eq 0 ]; then
+        WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
+      fi
+      UNINSTALL_WIREGUARD_PRESENT=1
+      UNINSTALL_RUNTIME_IDENTIFIED=1
+      WARP_MODE="${WARP_MODE:-wireguard}"
+    fi
+  elif [ -r "$unit_file" ] && grep -q 'warp-vps-redsocks\.service' "$unit_file"; then
+    UNINSTALL_RUNTIME_IDENTIFIED=1
+    WARP_MODE="${WARP_MODE:-socks}"
+  fi
+  WARP_MODE="${WARP_MODE:-socks}"
+  if [ -e "$WG_CONFIG" ]; then
+    UNINSTALL_WIREGUARD_PRESENT=1
+  fi
+}
+
+uninstall_nft_table_exists() {
+  local tables rc
+  tables="$(nft list tables 2>/dev/null)" \
+    || die "无法读取 nftables 当前状态，不能确认分流规则已经失效"
+  rc=0
+  grep -Fxq 'table inet warp_vps' <<< "$tables" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) die "无法解析 nftables 当前状态，不能确认分流规则已经失效" ;;
+  esac
+}
+
+uninstall_wg_interface_exists() {
+  local links rc
+  links="$(ip -o link show 2>/dev/null)" \
+    || die "无法读取网卡当前状态，不能确认 WireGuard 分流已经失效"
+  rc=0
+  awk -F ': ' -v iface="$WG_IFACE" '
+    {
+      name=$2
+      sub(/@.*/, "", name)
+      if (name == iface) found=1
+    }
+    END { exit !found }
+  ' <<< "$links" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) die "无法解析网卡当前状态，不能确认 WireGuard 分流已经失效" ;;
+  esac
+}
+
 stop_rules_for_uninstall() {
-  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
+  if command -v ip >/dev/null 2>&1; then
     stop_wg_routes
   fi
-  if table_exists; then
-    nft delete table inet warp_vps
+  if command -v nft >/dev/null 2>&1; then
+    if uninstall_nft_table_exists; then
+      nft delete table inet warp_vps || die "无法删除本项目 nftables 分流规则"
+    fi
+    if uninstall_nft_table_exists; then
+      die "本项目 nftables 分流规则仍在生效，卸载已中止"
+    fi
+  elif [ "${WARP_MODE:-socks}" = "socks" ]; then
+    die "找不到 nft 命令，无法确认 Socks5 分流规则已经失效"
   fi
 }
 
@@ -1796,8 +1900,12 @@ safe_move_if_exists() {
   local backup_dir="$2"
   local label="$3"
   local dest="${backup_dir}/${label}"
-  [ -e "$path" ] || return 0
-  [ ! -e "$dest" ] || die "备份目标已存在：$dest"
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    die "备份目标已存在：$dest"
+  fi
   mv "$path" "$dest"
 }
 
@@ -1805,7 +1913,9 @@ print_move_target_if_exists() {
   local path="$1"
   local backup_dir="$2"
   local label="$3"
-  [ -e "$path" ] || return 0
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
   info_line "$path -> ${backup_dir}/${label}"
 }
 
@@ -1827,23 +1937,23 @@ uninstall_managed_swap() {
 disable_managed_warp_service() {
   [ "${MANAGED_WARP_SVC:-0}" = "1" ] || return 0
   info_line "正在停止 Cloudflare WARP 官方客户端服务"
-  systemctl stop warp-svc >/dev/null 2>&1 || true
-  systemctl disable warp-svc >/dev/null 2>&1 || true
+  systemctl stop warp-svc.service >/dev/null 2>&1 || true
+  systemctl disable warp-svc.service >/dev/null 2>&1 || true
 }
 
 ensure_wireguard_down_for_uninstall() {
-  [ "${WARP_MODE:-socks}" = "wireguard" ] || return 0
-  wg_interface_exists || return 0
+  uninstall_wg_interface_exists || return 0
+  UNINSTALL_WIREGUARD_PRESENT=1
   info_line "正在关闭 WireGuard 网卡：${WG_IFACE:-$DEFAULT_WG_IFACE}"
   if command -v wg-quick >/dev/null 2>&1 && [ -r "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" ]; then
     wg-quick down "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" >/dev/null 2>&1 \
       || wg-quick down "${WG_IFACE:-$DEFAULT_WG_IFACE}" >/dev/null 2>&1 \
       || true
   fi
-  if wg_interface_exists; then
+  if uninstall_wg_interface_exists; then
     ip link delete dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" >/dev/null 2>&1 || true
   fi
-  if wg_interface_exists; then
+  if uninstall_wg_interface_exists; then
     die "WireGuard 网卡仍在运行，卸载已中止：${WG_IFACE:-$DEFAULT_WG_IFACE}"
   fi
 }
@@ -1857,23 +1967,285 @@ managed_redsocks_fallback_exists() {
   grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null
 }
 
+prompt_uninstall_scope() {
+  local choice
+  while true; do
+    printf '\n卸载时是否一并卸载相关运行依赖？\n' >&2
+    printf '  1. 保留依赖，只卸载 WARP VPS Manager（默认）\n' >&2
+    printf '  2. 一并卸载 Cloudflare WARP、redsocks 和 wireguard-tools\n' >&2
+    printf '请输入选项 [1]：' >&2
+    read_input choice \
+      || die "无法读取输入；非交互式卸载请使用 warp-vps uninstall --yes 或 warp-vps uninstall all"
+    case "$choice" in
+      ''|1)
+        UNINSTALL_REMOVE_DEPENDENCIES=0
+        return 0
+        ;;
+      2)
+        UNINSTALL_REMOVE_DEPENDENCIES=1
+        return 0
+        ;;
+      *) printf '输入无效，请输入 1 或 2。\n' >&2 ;;
+    esac
+  done
+}
+
+resolve_uninstall_scope() {
+  if [ "$#" -gt 1 ]; then
+    printf '[warp-vps] 错误：uninstall 只接受一个选项：--yes 或 all\n' >&2
+    return 2
+  fi
+  case "${1:-}" in
+    '') prompt_uninstall_scope ;;
+    --yes) UNINSTALL_REMOVE_DEPENDENCIES=0 ;;
+    all) UNINSTALL_REMOVE_DEPENDENCIES=1 ;;
+    *)
+      printf '[warp-vps] 错误：未知卸载选项：%s（可用：--yes、all）\n' "$1" >&2
+      return 2
+      ;;
+  esac
+}
+
+uninstall_unit_is_active() {
+  local unit="$1"
+  local load_state active_state
+  load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" \
+    || die "无法查询 systemd 服务加载状态：$unit"
+  [ "$load_state" != "not-found" ] || return 1
+  [ -n "$load_state" ] || die "systemd 没有返回服务加载状态：$unit"
+  active_state="$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null)" \
+    || die "无法查询 systemd 服务运行状态：$unit"
+  case "$active_state" in
+    inactive|failed) return 1 ;;
+    active|activating|deactivating|reloading) return 0 ;;
+    *) die "无法识别 systemd 服务运行状态：$unit=$active_state" ;;
+  esac
+}
+
+uninstall_unit_is_enabled() {
+  local unit="$1"
+  local load_state unit_state rc
+  load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" \
+    || die "无法查询 systemd 服务加载状态：$unit"
+  [ "$load_state" != "not-found" ] || return 1
+  [ -n "$load_state" ] || die "systemd 没有返回服务加载状态：$unit"
+  rc=0
+  unit_state="$(systemctl is-enabled "$unit" 2>/dev/null)" || rc=$?
+  case "$unit_state" in
+    disabled|masked|masked-runtime|not-found) return 1 ;;
+    enabled|enabled-runtime|linked|linked-runtime|alias|static|indirect|generated|transient) return 0 ;;
+    *) die "无法确认 systemd 服务是否已禁用：${unit}（状态：${unit_state:-无}，退出码：${rc}）" ;;
+  esac
+}
+
+verify_project_units_for_uninstall() {
+  local unit
+  local wg_unit="wg-quick@${WG_IFACE}.service"
+  local -a stop_units=(
+    warp-vps-health.timer
+    warp-vps-health.service
+    warp-vps.service
+    warp-vps-redsocks.service
+    "$wg_unit"
+  )
+  local -a enabled_units=(
+    warp-vps-health.timer
+    warp-vps.service
+    warp-vps-redsocks.service
+    "$wg_unit"
+  )
+  for unit in "${stop_units[@]}"; do
+    if uninstall_unit_is_active "$unit"; then
+      die "系统服务仍在运行，无法保证分流停止：$unit"
+    fi
+  done
+  for unit in "${enabled_units[@]}"; do
+    if uninstall_unit_is_enabled "$unit"; then
+      die "系统服务仍会开机启动，卸载已中止：$unit"
+    fi
+  done
+}
+
+stop_project_units_for_uninstall() {
+  local wg_unit="wg-quick@${WG_IFACE}.service"
+  local -a stop_units=(
+    warp-vps-health.timer
+    warp-vps-health.service
+    warp-vps.service
+    warp-vps-redsocks.service
+    "$wg_unit"
+  )
+  local -a enabled_units=(
+    warp-vps-health.timer
+    warp-vps.service
+    warp-vps-redsocks.service
+    "$wg_unit"
+  )
+
+  systemctl stop "${stop_units[@]}" >/dev/null 2>&1 || true
+  systemctl disable "${enabled_units[@]}" >/dev/null 2>&1 || true
+  verify_project_units_for_uninstall
+}
+
+deactivate_runtime_for_uninstall() {
+  local ip_available
+  command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl，无法停止项目服务"
+  stop_project_units_for_uninstall || die "无法停止并禁用项目服务"
+
+  ip_available=0
+  if command -v ip >/dev/null 2>&1; then
+    ip_available=1
+    if uninstall_wg_interface_exists; then
+      UNINSTALL_WIREGUARD_PRESENT=1
+      if [ "$UNINSTALL_RUNTIME_IDENTIFIED" -eq 0 ]; then
+        UNINSTALL_RUNTIME_IDENTIFIED=1
+        WARP_MODE=wireguard
+      fi
+    fi
+  fi
+  if command -v nft >/dev/null 2>&1 && uninstall_nft_table_exists; then
+    if [ "$UNINSTALL_RUNTIME_IDENTIFIED" -eq 0 ]; then
+      UNINSTALL_RUNTIME_IDENTIFIED=1
+      WARP_MODE=socks
+    fi
+  fi
+  stop_rules_for_uninstall || die "无法停止本项目分流规则"
+  if [ "$ip_available" -eq 1 ]; then
+    ensure_wireguard_down_for_uninstall || die "无法关闭本项目 WireGuard 网卡"
+  elif [ "$WARP_MODE" = "wireguard" ] || [ "$UNINSTALL_RUNTIME_IDENTIFIED" -eq 0 ]; then
+    die "找不到 ip 命令；已停止可识别的服务和 nftables 规则，但无法确认 WireGuard 分流已经失效"
+  fi
+  disable_managed_warp_service || die "无法停止项目安装的 Cloudflare WARP 服务"
+
+  if command -v nft >/dev/null 2>&1 && uninstall_nft_table_exists; then
+    die "本项目 nftables 分流规则仍在生效，卸载已中止"
+  fi
+  if [ "$ip_available" -eq 1 ] && uninstall_wg_interface_exists; then
+    die "本项目 WireGuard 网卡仍在运行，卸载已中止：$WG_IFACE"
+  fi
+  verify_project_units_for_uninstall
+  if [ "${MANAGED_WARP_SVC:-0}" = "1" ] && uninstall_unit_is_active warp-svc.service; then
+    die "Cloudflare WARP 官方客户端服务仍在运行，卸载已中止"
+  fi
+  if [ "$UNINSTALL_RUNTIME_IDENTIFIED" -eq 0 ]; then
+    die "找不到有效的项目配置或分流服务定义，无法排除未知的自定义 WireGuard 网卡；已停止可识别的规则，卸载未继续"
+  fi
+  ok_line "分流服务、nftables 规则和项目 WireGuard 网卡均已停止"
+}
+
+uninstall_apt_dependencies() {
+  local package inventory status
+  local -a packages=()
+  # shellcheck disable=SC2016
+  inventory="$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n')" \
+    || die "无法读取 dpkg 软件包状态，依赖卸载已中止"
+  for package in cloudflare-warp redsocks wireguard-tools; do
+    status="$(awk -F '\t' -v package="$package" '
+      $1 == package || index($1, package ":") == 1 { print $2; exit }
+    ' <<< "$inventory")" \
+      || die "无法解析 dpkg 软件包状态，依赖卸载已中止"
+    case "$status" in ''|not-installed) ;; *) packages+=("$package") ;; esac
+  done
+  [ "${#packages[@]}" -gt 0 ] || return 0
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -o DPkg::Lock::Timeout=1200 \
+    -o APT::Get::AutomaticRemove=false \
+    purge -y "${packages[@]}" \
+    || die "APT 卸载专用运行依赖失败；项目文件尚未移动，可以修复后重试"
+  # shellcheck disable=SC2016
+  inventory="$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n')" \
+    || die "APT 已执行，但无法复核 dpkg 软件包状态"
+  for package in "${packages[@]}"; do
+    status="$(awk -F '\t' -v package="$package" '
+      $1 == package || index($1, package ":") == 1 { print $2; exit }
+    ' <<< "$inventory")" \
+      || die "APT 已执行，但无法解析 dpkg 软件包状态"
+    case "$status" in
+      ''|not-installed) ;;
+      *) die "APT 未彻底卸载软件包：${package}（状态：${status}）" ;;
+    esac
+  done
+}
+
+uninstall_rpm_dependencies() {
+  local package manager inventory rc
+  local -a packages=()
+  inventory="$(rpm -qa --qf '%{NAME}\n')" \
+    || die "无法读取 RPM 软件包状态，依赖卸载已中止"
+  for package in cloudflare-warp redsocks wireguard-tools; do
+    rc=0
+    grep -Fxq "$package" <<< "$inventory" || rc=$?
+    case "$rc" in
+      0) packages+=("$package") ;;
+      1) ;;
+      *) die "无法解析 RPM 软件包状态，依赖卸载已中止" ;;
+    esac
+  done
+  [ "${#packages[@]}" -gt 0 ] || return 0
+  if command -v dnf >/dev/null 2>&1; then
+    manager=dnf
+  elif command -v yum >/dev/null 2>&1; then
+    manager=yum
+  else
+    die "找不到 dnf 或 yum，无法卸载 RPM 专用运行依赖"
+  fi
+  if [ "$manager" = "dnf" ]; then
+    dnf -y --setopt=clean_requirements_on_remove=False remove "${packages[@]}" \
+      || die "DNF 卸载专用运行依赖失败；项目文件尚未移动，可以修复后重试"
+  else
+    yum --setopt=clean_requirements_on_remove=0 remove -y "${packages[@]}" \
+      || die "YUM 卸载专用运行依赖失败；项目文件尚未移动，可以修复后重试"
+  fi
+  inventory="$(rpm -qa --qf '%{NAME}\n')" \
+    || die "RPM 卸载已执行，但无法复核软件包状态"
+  for package in "${packages[@]}"; do
+    rc=0
+    grep -Fxq "$package" <<< "$inventory" || rc=$?
+    case "$rc" in
+      0) die "RPM 未彻底卸载软件包：$package" ;;
+      1) ;;
+      *) die "RPM 已执行，但无法解析软件包状态" ;;
+    esac
+  done
+}
+
+uninstall_project_dependencies() {
+  local unit
+  info_line "正在卸载相关运行依赖；不会主动执行 autoremove，共享基础包不在直接卸载清单"
+  systemctl disable --now warp-svc.service redsocks.service >/dev/null 2>&1 || true
+  for unit in warp-svc.service redsocks.service; do
+    if uninstall_unit_is_active "$unit"; then
+      die "依赖服务仍在运行，不能安全卸载：$unit"
+    fi
+  done
+
+  if command -v apt-get >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1; then
+    uninstall_apt_dependencies
+  elif command -v rpm >/dev/null 2>&1; then
+    uninstall_rpm_dependencies
+  else
+    die "找不到受支持的包管理器，无法卸载专用运行依赖"
+  fi
+}
+
 cmd_uninstall() {
   require_root
+  resolve_uninstall_scope "$@" || return $?
+
   local backup_dir move_managed_redsocks
-  backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)"
-  install -d -m 0755 "$backup_dir"
   load_uninstall_config
+  recover_uninstall_runtime_from_unit
   move_managed_redsocks=0
-  managed_redsocks_fallback_exists && move_managed_redsocks=1
-  systemctl stop warp-vps-health.timer warp-vps-health.service warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
-  systemctl disable warp-vps-health.timer warp-vps.service warp-vps-redsocks.service >/dev/null 2>&1 || true
-  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
-    systemctl stop "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
-    systemctl disable "wg-quick@${WG_IFACE:-$DEFAULT_WG_IFACE}.service" >/dev/null 2>&1 || true
+  if [ "$UNINSTALL_REMOVE_DEPENDENCIES" -eq 1 ] && managed_redsocks_fallback_exists; then
+    move_managed_redsocks=1
   fi
-  ensure_wireguard_down_for_uninstall
-  stop_rules_for_uninstall
-  disable_managed_warp_service
+  deactivate_runtime_for_uninstall || die "无法确认分流规则已经失效，卸载已中止"
+
+  backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  if [ -e "$backup_dir" ] || [ -L "$backup_dir" ]; then
+    die "卸载备份目录已存在，拒绝复用：$backup_dir"
+  fi
+  install -d -m 0755 "$backup_dir" || die "无法创建卸载备份目录：$backup_dir"
 
   section "卸载移动清单"
   info_line "以下项目文件会移动到备份目录，不会永久删除"
@@ -1881,7 +2253,11 @@ cmd_uninstall() {
   print_move_target_if_exists /etc/systemd/system/warp-vps.service "$backup_dir" "systemd-warp-vps.service"
   print_move_target_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir" "systemd-warp-vps-health.service"
   print_move_target_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir" "systemd-warp-vps-health.timer"
-  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
+  print_move_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service "$backup_dir" "systemd-wants-warp-vps-redsocks.service"
+  print_move_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service "$backup_dir" "systemd-wants-warp-vps.service"
+  print_move_target_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer "$backup_dir" "systemd-wants-warp-vps-health.timer"
+  print_move_target_if_exists "/etc/systemd/system/multi-user.target.wants/wg-quick@${WG_IFACE}.service" "$backup_dir" "systemd-wants-wg-quick@${WG_IFACE}.service"
+  if [ "$UNINSTALL_WIREGUARD_PRESENT" -eq 1 ]; then
     print_move_target_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
   fi
   print_move_target_if_exists "$ETC_DIR" "$backup_dir" "etc-warp-vps-manager"
@@ -1893,24 +2269,37 @@ cmd_uninstall() {
   fi
   print_move_target_if_exists "$MANAGED_SWAP_FILE" "$backup_dir" "swapfile-warp-vps-manager"
 
+  if [ "$UNINSTALL_REMOVE_DEPENDENCIES" -eq 1 ]; then
+    uninstall_project_dependencies \
+      || die "专用运行依赖卸载失败；分流已停止，项目文件尚未移动，可以修复后重试"
+    if [ "$move_managed_redsocks" -eq 1 ]; then
+      safe_move_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
+    fi
+  fi
+
   uninstall_managed_swap "$backup_dir"
   safe_move_if_exists /etc/systemd/system/warp-vps-redsocks.service "$backup_dir" "systemd-warp-vps-redsocks.service"
   safe_move_if_exists /etc/systemd/system/warp-vps.service "$backup_dir" "systemd-warp-vps.service"
   safe_move_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir" "systemd-warp-vps-health.service"
   safe_move_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir" "systemd-warp-vps-health.timer"
-  if [ "${WARP_MODE:-socks}" = "wireguard" ]; then
+  safe_move_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service "$backup_dir" "systemd-wants-warp-vps-redsocks.service"
+  safe_move_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service "$backup_dir" "systemd-wants-warp-vps.service"
+  safe_move_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer "$backup_dir" "systemd-wants-warp-vps-health.timer"
+  safe_move_if_exists "/etc/systemd/system/multi-user.target.wants/wg-quick@${WG_IFACE}.service" "$backup_dir" "systemd-wants-wg-quick@${WG_IFACE}.service"
+  if [ "$UNINSTALL_WIREGUARD_PRESENT" -eq 1 ]; then
     safe_move_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
   fi
   safe_move_if_exists "$ETC_DIR" "$backup_dir" "etc-warp-vps-manager"
   safe_move_if_exists "$APP_DIR" "$backup_dir" "opt-warp-vps-manager"
   safe_move_if_exists "$STATE_DIR" "$backup_dir" "var-lib-warp-vps-manager"
   safe_move_if_exists "$BIN_PATH" "$backup_dir" "usr-local-bin-warp-vps"
-  if [ "$move_managed_redsocks" -eq 1 ]; then
-    safe_move_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
-  fi
-  systemctl daemon-reload
+  systemctl daemon-reload || die "systemd 重新加载失败；分流已停止，但请检查备份目录"
   printf 'WARP VPS Manager 已卸载，文件已移动到备份目录：%s\n' "$backup_dir"
-  printf '系统依赖包已保留，不会被删除。\n'
+  if [ "$UNINSTALL_REMOVE_DEPENDENCIES" -eq 1 ]; then
+    printf 'Cloudflare WARP、redsocks 和 wireguard-tools 等专用运行依赖已卸载。\n'
+  else
+    printf '系统依赖包已保留。\n'
+  fi
 }
 
 usage() {
@@ -1924,7 +2313,9 @@ usage() {
   unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
   update          更新脚本和固定规则快照
   logs            查看最近日志
-  uninstall       卸载并移动文件到备份目录
+  uninstall       交互卸载，并询问是否一并卸载相关运行依赖
+  uninstall --yes 非交互卸载项目，保留依赖
+  uninstall all   非交互卸载项目及 Cloudflare WARP、redsocks、wireguard-tools
 
 内部命令：
   heal            健康检查和自动修复
@@ -1955,7 +2346,7 @@ main() {
     preflight-wireguard) cmd_preflight_wireguard ;;
     wait-wireguard) cmd_wait_wireguard ;;
     install-systemd) install_systemd ;;
-    uninstall) cmd_uninstall ;;
+    uninstall) cmd_uninstall "${@:2}" ;;
     -h|--help|help|'') usage ;;
     *) usage; exit 2 ;;
   esac

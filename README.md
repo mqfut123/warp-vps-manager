@@ -47,7 +47,9 @@ Socks5 对现有网络改动较少。WireGuard 会增加网卡和路由，如果
 | `warp-vps restart` | 重启 WARP 分流链路 |
 | `warp-vps update` | 更新脚本和 Google IP 规则 |
 | `warp-vps logs` | 查看最近的服务日志 |
-| `warp-vps uninstall` | 停止分流并把项目文件移到备份目录 |
+| `warp-vps uninstall` | 交互卸载，并询问是否一并卸载相关运行依赖 |
+| `warp-vps uninstall --yes` | 非交互卸载项目，保留依赖 |
+| `warp-vps uninstall all` | 非交互卸载项目及 WARP、redsocks、wireguard-tools |
 
 安装完成后如果访问异常，先运行：
 
@@ -56,12 +58,20 @@ warp-vps status
 warp-vps logs
 ```
 
+## 卸载
+
+直接运行 `warp-vps uninstall`，会询问是否一并卸载相关运行依赖；直接回车默认保留依赖。
+
+脚本或批量操作可使用 `warp-vps uninstall --yes`，无需交互并保留依赖。需要连依赖一起卸载时使用 `warp-vps uninstall all`，同样无需交互。
+
+三种卸载方式都会先停止自动修复，并确认分流规则已经失效；如果无法确认，卸载会立即中止，不会继续移动文件或显示成功。`all` 会强制移除 `cloudflare-warp`、`redsocks` 和 `wireguard-tools`，包括卸载前已经存在的这些软件包；它不会主动执行 `autoremove`，curl、Python、iproute 等共享基础包不在直接卸载清单中，但包管理器仍可能按依赖关系处理关联软件包。
+
 ## 使用前需要知道
 
 - 这是 IP 分流，不是域名识别。Google 调整 IP 后，请运行 `warp-vps update` 获取新规则。
 - Socks5 模式不能转发 UDP。无法回落到 TCP 的客户端可能连接失败。
-- 如果系统已经安装 Cloudflare WARP 客户端，Socks5 模式会复用它并切换到本地代理模式。卸载本项目不会恢复客户端原来的模式。
-- 卸载不会删除系统依赖包。项目文件和脚本创建的 Swap 会移到 `/var/backups/warp-vps-manager/`。
+- 如果系统已经安装 Cloudflare WARP 客户端，Socks5 模式会复用它并切换到本地代理模式。保留依赖卸载不会恢复客户端原来的模式；`all` 会直接卸载该客户端。
+- 卸载时项目文件和脚本创建的 Swap 会移到 `/var/backups/warp-vps-manager/`，不会永久删除。
 
 ## IP 规则来源
 

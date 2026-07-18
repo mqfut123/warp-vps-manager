@@ -93,8 +93,11 @@ line_number() {
 
 run_test() {
   local name="$1"
+  local rc
   shift
-  if ( "$@" ); then
+  ( "$@" )
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
     printf 'ok - %s\n' "$name"
     passed=$((passed + 1))
   else
@@ -1005,7 +1008,7 @@ test_restart_and_update_restore_required_units() {
     'a partial update activation must restore the previous files'
 }
 
-test_uninstall_is_mode_scoped_and_keeps_custom_wg_path() {
+test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path() {
   source_without_main "$MANAGER_SCRIPT"
   CONFIG_FILE="${FIXTURE_DIR}/config/custom-wireguard.env"
   unset WARP_MODE WG_IFACE WG_CONFIG MANAGED_WARP_SVC MANAGED_REDSOCKS_BIN REDSOCKS_BIN || true
@@ -1018,40 +1021,508 @@ test_uninstall_is_mode_scoped_and_keeps_custom_wg_path() {
   local route_stops=0
   WARP_MODE=socks
   stop_wg_routes() { route_stops=$((route_stops + 1)); }
-  table_exists() { return 1; }
+  uninstall_nft_table_exists() { return 1; }
+  ip() { :; }
+  nft() { :; }
   stop_rules_for_uninstall
-  assert_eq '0' "$route_stops" \
-    'Socks uninstall must not delete WireGuard routes' || return 1
+  assert_eq '1' "$route_stops" \
+    'every uninstall must clear stale project WireGuard routes' || return 1
 
   local systemctl_calls=''
-  BACKUP_ROOT=/tmp/warp-vps-test-backups
-  install() { :; }
   systemctl() {
     systemctl_calls="${systemctl_calls}$*\n"
     return 0
+  }
+  uninstall_unit_is_active() { return 1; }
+  uninstall_unit_is_enabled() { return 1; }
+  WG_IFACE=warp-vps-wg
+  stop_project_units_for_uninstall
+  assert_contains "$systemctl_calls" 'stop warp-vps-health.timer warp-vps-health.service' \
+    'uninstall must stop an in-flight health service' || return 1
+  assert_contains "$systemctl_calls" 'wg-quick@warp-vps-wg.service' \
+    'uninstall must also stop its dedicated WireGuard unit'
+}
+
+test_uninstall_scope_is_explicit_and_vnc_safe() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local answer_index=0
+  local answers=('invalid' '')
+  read_input() {
+    printf -v "$1" '%s' "${answers[$answer_index]}"
+    answer_index=$((answer_index + 1))
+  }
+  resolve_uninstall_scope 2>/dev/null || return 1
+  assert_eq '0' "$UNINSTALL_REMOVE_DEPENDENCIES" \
+    'empty interactive choice should keep dependencies' || return 1
+  assert_eq '2' "$answer_index" 'invalid uninstall input should be asked again' || return 1
+
+  answer_index=0
+  answers=('2')
+  resolve_uninstall_scope 2>/dev/null || return 1
+  assert_eq '1' "$UNINSTALL_REMOVE_DEPENDENCIES" \
+    'interactive option 2 should remove dependencies' || return 1
+
+  local prompt_calls=0
+  read_input() {
+    prompt_calls=$((prompt_calls + 1))
+    return 1
+  }
+  resolve_uninstall_scope --yes || return 1
+  assert_eq '0' "$UNINSTALL_REMOVE_DEPENDENCIES" '--yes should keep dependencies' || return 1
+  resolve_uninstall_scope all || return 1
+  assert_eq '1' "$UNINSTALL_REMOVE_DEPENDENCIES" 'all should remove dependencies' || return 1
+  assert_eq '0' "$prompt_calls" 'non-interactive uninstall modes must not read input' || return 1
+
+  local rc=0
+  resolve_uninstall_scope unknown 2>/dev/null || rc=$?
+  assert_eq '2' "$rc" 'unknown uninstall options must fail with usage status' || return 1
+  rc=0
+  resolve_uninstall_scope --yes extra 2>/dev/null || rc=$?
+  assert_eq '2' "$rc" 'extra uninstall options must not be ignored'
+}
+
+test_uninstall_deactivation_reaches_inactive_state() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local nft_active=1
+  local iface_active=1
+  local routes_active=1
+  WARP_MODE=socks
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG="${FIXTURE_DIR}/config/custom-wireguard.env"
+  MANAGED_WARP_SVC=0
+  UNINSTALL_WIREGUARD_PRESENT=0
+  UNINSTALL_RUNTIME_IDENTIFIED=1
+
+  systemctl() { return 0; }
+  uninstall_unit_is_active() { return 1; }
+  uninstall_unit_is_enabled() { return 1; }
+  stop_wg_routes() { routes_active=0; }
+  uninstall_nft_table_exists() { [ "$nft_active" -eq 1 ]; }
+  nft() {
+    if [ "$*" = 'delete table inet warp_vps' ]; then
+      nft_active=0
+    fi
+  }
+  ip() {
+    case "$*" in
+      'link delete dev warp-vps-wg') iface_active=0 ;;
+      *) return 0 ;;
+    esac
+  }
+  uninstall_wg_interface_exists() { [ "$iface_active" -eq 1 ]; }
+  wg-quick() { return 1; }
+  ok_line() { :; }
+
+  deactivate_runtime_for_uninstall
+  assert_eq '0' "$nft_active" 'uninstall must leave the nftables table absent' || return 1
+  assert_eq '0' "$routes_active" 'uninstall must remove project WireGuard routes' || return 1
+  assert_eq '0' "$iface_active" 'uninstall must leave the project WireGuard interface absent' || return 1
+  assert_eq '1' "$UNINSTALL_WIREGUARD_PRESENT" \
+    'a discovered WireGuard runtime must remain marked for config backup'
+}
+
+test_uninstall_rejects_rules_that_remain_active() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  WARP_MODE=socks
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+  MANAGED_WARP_SVC=0
+  UNINSTALL_RUNTIME_IDENTIFIED=1
+  systemctl() { return 0; }
+  uninstall_unit_is_active() { return 1; }
+  uninstall_unit_is_enabled() { return 1; }
+  ip() { return 0; }
+  uninstall_wg_interface_exists() { return 1; }
+  stop_wg_routes() { :; }
+  uninstall_nft_table_exists() { return 0; }
+  nft() { return 0; }
+
+  local output rc=0
+  output="$(deactivate_runtime_for_uninstall 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'uninstall accepted an nftables table that remained active'
+    return 1
+  }
+  assert_contains "$output" '仍在生效' \
+    'persistent rule failure should explain why uninstall stopped'
+}
+
+test_uninstall_fails_closed_without_runtime_identity() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  WARP_MODE=socks
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+  MANAGED_WARP_SVC=0
+  UNINSTALL_RUNTIME_IDENTIFIED=0
+  systemctl() { return 0; }
+  uninstall_unit_is_active() { return 1; }
+  uninstall_unit_is_enabled() { return 1; }
+  ip() { return 0; }
+  uninstall_wg_interface_exists() { return 1; }
+  stop_wg_routes() { :; }
+  nft() { return 0; }
+  uninstall_nft_table_exists() { return 1; }
+
+  local output rc=0
+  output="$(deactivate_runtime_for_uninstall 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'uninstall reported success without config, unit, or live runtime identity'
+    return 1
+  }
+  assert_contains "$output" '无法排除未知的自定义 WireGuard 网卡' \
+    'missing runtime identity should fail closed instead of assuming the default interface'
+}
+
+test_socks_uninstall_stops_known_rules_before_missing_ip_failure() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local nft_active=1
+  local systemctl_calls=''
+  WARP_MODE=socks
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+  MANAGED_WARP_SVC=0
+  UNINSTALL_RUNTIME_IDENTIFIED=1
+  systemctl() {
+    systemctl_calls="${systemctl_calls}$*\n"
+    return 0
+  }
+  uninstall_unit_is_active() { return 1; }
+  uninstall_unit_is_enabled() { return 1; }
+  command() {
+    if [ "${1:-}" = '-v' ] && [ "${2:-}" = 'ip' ]; then
+      return 1
+    fi
+    builtin command "$@"
+  }
+  uninstall_nft_table_exists() { [ "$nft_active" -eq 1 ]; }
+  nft() {
+    if [ "$*" = 'delete table inet warp_vps' ]; then
+      nft_active=0
+    fi
+  }
+  ok_line() { :; }
+
+  deactivate_runtime_for_uninstall
+  assert_eq '0' "$nft_active" 'Socks nftables rules must be removed even when ip is missing' || return 1
+  assert_contains "$systemctl_calls" 'stop warp-vps-health.timer' \
+    'health automation must stop before optional WireGuard inspection'
+}
+
+test_uninstall_state_queries_fail_closed() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  systemctl() { return 1; }
+  local output rc=0
+  output="$(uninstall_unit_is_active warp-vps.service 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a failed systemd query was treated as an inactive service'
+    return 1
+  }
+  assert_contains "$output" '无法查询 systemd' \
+    'systemd query failures should stop uninstall' || return 1
+
+  nft() { return 1; }
+  rc=0
+  output="$(uninstall_nft_table_exists 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a failed nftables query was treated as an absent table'
+    return 1
+  }
+  assert_contains "$output" '无法读取 nftables' \
+    'nftables query failures should stop uninstall' || return 1
+
+  nft() { printf 'table inet warp_vps\n'; }
+  grep() { return 2; }
+  rc=0
+  output="$(uninstall_nft_table_exists 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'an nftables parser failure was treated as an absent table'
+    return 1
+  }
+  assert_contains "$output" '无法解析 nftables' \
+    'nftables parser failures should stop uninstall' || return 1
+  unset -f grep
+
+  ip() { return 1; }
+  WG_IFACE=warp-vps-wg
+  rc=0
+  output="$(uninstall_wg_interface_exists 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a failed link query was treated as an absent WireGuard interface'
+    return 1
+  }
+  assert_contains "$output" '无法读取网卡' \
+    'link query failures should stop uninstall' || return 1
+
+  ip() { printf '1: lo: <LOOPBACK>\n'; }
+  awk() { return 2; }
+  rc=0
+  output="$(uninstall_wg_interface_exists 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a link parser failure was treated as an absent WireGuard interface'
+    return 1
+  }
+  assert_contains "$output" '无法解析网卡' \
+    'link parser failures should stop uninstall'
+}
+
+test_uninstall_missing_unit_is_already_disabled() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local is_enabled_calls=0
+  systemctl() {
+    case "${1:-}" in
+      show) printf 'not-found\n' ;;
+      is-enabled)
+        is_enabled_calls=$((is_enabled_calls + 1))
+        return 1
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  local rc=0
+  uninstall_unit_is_enabled warp-vps.service || rc=$?
+  assert_eq '1' "$rc" 'a missing unit should be treated as already disabled' || return 1
+  assert_eq '0' "$is_enabled_calls" \
+    'a missing unit should not require an is-enabled query'
+}
+
+test_uninstall_orders_teardown_before_dependencies_and_files() {
+  local body resolve_line deactivate_line backup_line dependency_line move_line
+  body="$(function_body "$MANAGER_SCRIPT" cmd_uninstall)"
+  resolve_line="$(line_number "$body" 'resolve_uninstall_scope')"
+  deactivate_line="$(line_number "$body" 'deactivate_runtime_for_uninstall')"
+  backup_line="$(line_number "$body" 'install -d -m 0755 "$backup_dir"')"
+  dependency_line="$(line_number "$body" 'uninstall_project_dependencies')"
+  move_line="$(line_number "$body" 'safe_move_if_exists "$REDSOCKS_FALLBACK_BIN"')"
+  if [ -z "$resolve_line" ] || [ -z "$deactivate_line" ] || [ -z "$backup_line" ] \
+    || [ -z "$dependency_line" ] || [ -z "$move_line" ]; then
+    fail 'uninstall phase boundaries are incomplete'
+    return 1
+  fi
+  if [ "$resolve_line" -ge "$deactivate_line" ] || [ "$deactivate_line" -ge "$backup_line" ] \
+    || [ "$backup_line" -ge "$dependency_line" ] || [ "$dependency_line" -ge "$move_line" ]; then
+    fail 'uninstall must resolve input, deactivate rules, uninstall dependencies, then move files'
+    return 1
+  fi
+
+  local main_body
+  main_body="$(function_body "$MANAGER_SCRIPT" main)"
+  assert_contains "$main_body" 'cmd_uninstall "${@:2}"' \
+    'main must forward uninstall options instead of silently ignoring them'
+}
+
+test_all_dependency_packages_are_explicit_and_scoped() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local package_calls=''
+  local apt_purged=0
+  dpkg-query() {
+    if [ "$apt_purged" -eq 0 ]; then
+      printf 'cloudflare-warp\tinstalled\nredsocks\tconfig-files\nwireguard-tools\tunpacked\n'
+    fi
+  }
+  apt-get() {
+    package_calls="$*"
+    apt_purged=1
+    return 0
+  }
+  uninstall_apt_dependencies
+  assert_contains "$package_calls" 'DPkg::Lock::Timeout=1200' \
+    'APT all uninstall should wait for the dpkg lock' || return 1
+  assert_contains "$package_calls" 'APT::Get::AutomaticRemove=false' \
+    'APT all uninstall should disable automatic removals' || return 1
+  assert_contains "$package_calls" 'purge -y cloudflare-warp redsocks wireguard-tools' \
+    'APT all uninstall should purge the three dedicated runtime packages' || return 1
+  assert_not_contains "$package_calls" 'autoremove' 'APT all uninstall must not autoremove' || return 1
+  assert_not_contains "$package_calls" 'curl' 'APT all uninstall must keep shared curl' || return 1
+  assert_not_contains "$package_calls" 'python' 'APT all uninstall must keep shared Python' || return 1
+  assert_not_contains "$package_calls" 'iproute' 'APT all uninstall must keep shared iproute' || return 1
+
+  package_calls=''
+  local rpm_removed=0
+  rpm() {
+    if [ "$rpm_removed" -eq 0 ]; then
+      printf 'cloudflare-warp\nredsocks\nwireguard-tools\n'
+    fi
+  }
+  dnf() {
+    package_calls="$*"
+    rpm_removed=1
+    return 0
+  }
+  uninstall_rpm_dependencies
+  assert_contains "$package_calls" \
+    '-y --setopt=clean_requirements_on_remove=False remove cloudflare-warp redsocks wireguard-tools' \
+    'RPM all uninstall should use a DNF4/DNF5-compatible no-autoremove setting' || return 1
+  assert_not_contains "$package_calls" '--noautoremove' \
+    'RPM all uninstall must not use the DNF4-only noautoremove spelling' || return 1
+  assert_not_contains "$package_calls" ' autoremove ' 'RPM all uninstall must not run an autoremove command'
+}
+
+test_dependency_uninstall_requires_absent_postcondition() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  dpkg-query() { printf 'cloudflare-warp\tinstalled\n'; }
+  apt-get() { return 0; }
+  local output rc=0
+  output="$(uninstall_apt_dependencies 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'APT dependency uninstall succeeded while the package remained installed'
+    return 1
+  }
+  assert_contains "$output" '未彻底卸载软件包：cloudflare-warp' \
+    'APT postcondition failure should name the remaining package' || return 1
+
+  awk() { return 2; }
+  apt-get() { printf 'APT_CALLED\n'; }
+  rc=0
+  output="$(uninstall_apt_dependencies 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'APT inventory parsing failure was treated as no packages installed'
+    return 1
+  }
+  assert_contains "$output" '无法解析 dpkg' \
+    'APT inventory parser failures should stop uninstall' || return 1
+  assert_not_contains "$output" 'APT_CALLED' \
+    'APT must not mutate packages after an inventory parser failure'
+}
+
+test_rpm_dependency_postcondition_parser_fails_closed() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local rpm_removed=0
+  rpm() {
+    if [ "$rpm_removed" -eq 0 ]; then
+      printf 'cloudflare-warp\n'
+    fi
+  }
+  grep() {
+    case "${2:-}:${rpm_removed}" in
+      cloudflare-warp:0) return 0 ;;
+      cloudflare-warp:1) return 2 ;;
+      *) return 1 ;;
+    esac
+  }
+  dnf() {
+    rpm_removed=1
+    return 0
+  }
+
+  local output rc=0
+  output="$(uninstall_rpm_dependencies 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'an RPM postcondition parser failure was treated as package absence'
+    return 1
+  }
+  assert_contains "$output" 'RPM 已执行，但无法解析软件包状态' \
+    'RPM postcondition parser failures should stop uninstall'
+}
+
+test_uninstall_scope_controls_dependency_and_fallback_cleanup() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local dependency_calls=0
+  local prompt_calls=0
+  local moved_paths=''
+  require_root() { :; }
+  read_input() {
+    prompt_calls=$((prompt_calls + 1))
+    return 1
   }
   load_uninstall_config() {
     WARP_MODE=socks
     WG_IFACE=warp-vps-wg
     WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
     MANAGED_WARP_SVC=0
+    UNINSTALL_WIREGUARD_PRESENT=0
+    UNINSTALL_RUNTIME_IDENTIFIED=1
   }
-  managed_redsocks_fallback_exists() { return 1; }
-  ensure_wireguard_down_for_uninstall() { :; }
-  stop_rules_for_uninstall() { :; }
-  disable_managed_warp_service() { :; }
+  recover_uninstall_runtime_from_unit() { :; }
+  managed_redsocks_fallback_exists() { return 0; }
+  deactivate_runtime_for_uninstall() { :; }
+  date() { printf '20260718T120000Z\n'; }
+  install() { :; }
   section() { :; }
   info_line() { :; }
   print_move_target_if_exists() { :; }
+  uninstall_project_dependencies() { dependency_calls=$((dependency_calls + 1)); }
+  safe_move_if_exists() { moved_paths="${moved_paths}$1\n"; }
   uninstall_managed_swap() { :; }
-  safe_move_if_exists() { :; }
-  require_root() { :; }
+  systemctl() { :; }
 
-  cmd_uninstall >/dev/null
-  assert_contains "$systemctl_calls" 'stop warp-vps-health.timer warp-vps-health.service' \
-    'uninstall must stop an in-flight health service' || return 1
-  assert_not_contains "$systemctl_calls" 'wg-quick@' \
-    'Socks uninstall must not stop or disable WireGuard units'
+  cmd_uninstall --yes >/dev/null
+  assert_eq '0' "$dependency_calls" 'project-only uninstall must keep dependencies' || return 1
+  assert_eq '0' "$prompt_calls" '--yes must not prompt' || return 1
+  assert_not_contains "$moved_paths" "$REDSOCKS_FALLBACK_BIN" \
+    'project-only uninstall must keep a managed redsocks dependency' || return 1
+
+  moved_paths=''
+  cmd_uninstall all >/dev/null
+  assert_eq '1' "$dependency_calls" 'all uninstall must remove dependencies' || return 1
+  assert_eq '0' "$prompt_calls" 'all must not prompt' || return 1
+  assert_contains "$moved_paths" "$REDSOCKS_FALLBACK_BIN" \
+    'all uninstall must move an owned source-built redsocks binary'
+}
+
+test_dependency_failure_stops_before_file_moves() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  require_root() { :; }
+  load_uninstall_config() {
+    WARP_MODE=socks
+    WG_IFACE=warp-vps-wg
+    WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+    MANAGED_WARP_SVC=0
+    UNINSTALL_WIREGUARD_PRESENT=0
+    UNINSTALL_RUNTIME_IDENTIFIED=1
+  }
+  recover_uninstall_runtime_from_unit() { :; }
+  managed_redsocks_fallback_exists() { return 1; }
+  deactivate_runtime_for_uninstall() { :; }
+  date() { printf '20260718T120000Z\n'; }
+  install() { :; }
+  section() { :; }
+  info_line() { :; }
+  print_move_target_if_exists() { :; }
+  uninstall_project_dependencies() { return 1; }
+  safe_move_if_exists() { printf 'unexpected-move:%s\n' "$1"; }
+
+  local output rc=0
+  output="$(cmd_uninstall all 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'dependency failure was reported as a successful uninstall'
+    return 1
+  }
+  assert_not_contains "$output" 'unexpected-move:' \
+    'dependency failure must stop before any project file is moved' || return 1
+  assert_not_contains "$output" 'WARP VPS Manager 已卸载' \
+    'dependency failure must not print uninstall success'
+}
+
+test_readme_documents_all_uninstall_modes() {
+  source_without_main "$MANAGER_SCRIPT"
+  assert_file_matches "$README_FILE" 'warp-vps uninstall` \| 交互卸载' \
+    'README should document interactive uninstall' || return 1
+  assert_file_matches "$README_FILE" 'warp-vps uninstall --yes` \| 非交互卸载项目，保留依赖' \
+    'README should document direct project-only uninstall' || return 1
+  assert_file_matches "$README_FILE" 'warp-vps uninstall all` \| 非交互卸载项目及' \
+    'README should document direct all uninstall' || return 1
+  assert_file_matches "$README_FILE" '三种卸载方式都会先停止自动修复，并确认分流规则已经失效' \
+    'README should promise the verified common rule teardown' || return 1
+  assert_file_not_matches "$README_FILE" '^[-*] 卸载不会删除系统依赖包' \
+    'README must not retain the obsolete unconditional dependency promise' || return 1
+
+  local help_output
+  help_output="$(usage)"
+  assert_contains "$help_output" 'uninstall --yes' 'CLI help should document direct project-only uninstall' || return 1
+  assert_contains "$help_output" 'uninstall all' 'CLI help should document direct all uninstall'
 }
 
 test_reinstall_stops_previous_custom_wireguard_runtime() {
@@ -1101,7 +1572,7 @@ test_wireguard_uninstall_has_interface_fallback() {
   WG_IFACE=custom-wg
   WG_CONFIG="${FIXTURE_DIR}/config/custom-wireguard.env"
   wg-quick() { return 1; }
-  wg_interface_exists() { [ "$link_exists" -eq 1 ]; }
+  uninstall_wg_interface_exists() { [ "$link_exists" -eq 1 ]; }
   ip() {
     ip_calls="${ip_calls}$*\n"
     if [ "$1 $2 $3" = 'link delete dev' ]; then
@@ -1208,7 +1679,21 @@ run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'status and test do not run unlock probes' test_status_and_test_do_not_run_unlock_checks
 run_test 'restart update and heal restore required units' test_restart_and_update_restore_required_units
-run_test 'uninstall is mode scoped and keeps custom WireGuard paths' test_uninstall_is_mode_scoped_and_keeps_custom_wg_path
+run_test 'uninstall clears both rule backends and keeps custom WireGuard paths' test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path
+run_test 'uninstall scopes are explicit and VNC safe' test_uninstall_scope_is_explicit_and_vnc_safe
+run_test 'uninstall deactivation reaches inactive state' test_uninstall_deactivation_reaches_inactive_state
+run_test 'uninstall rejects rules that remain active' test_uninstall_rejects_rules_that_remain_active
+run_test 'uninstall fails closed without runtime identity' test_uninstall_fails_closed_without_runtime_identity
+run_test 'Socks uninstall clears known rules before missing ip handling' test_socks_uninstall_stops_known_rules_before_missing_ip_failure
+run_test 'uninstall state queries fail closed' test_uninstall_state_queries_fail_closed
+run_test 'missing uninstall units are already disabled' test_uninstall_missing_unit_is_already_disabled
+run_test 'uninstall teardown precedes dependencies and file moves' test_uninstall_orders_teardown_before_dependencies_and_files
+run_test 'all dependency packages are explicit and scoped' test_all_dependency_packages_are_explicit_and_scoped
+run_test 'dependency uninstall requires an absent postcondition' test_dependency_uninstall_requires_absent_postcondition
+run_test 'RPM dependency postcondition parsing fails closed' test_rpm_dependency_postcondition_parser_fails_closed
+run_test 'uninstall scope controls dependency and fallback cleanup' test_uninstall_scope_controls_dependency_and_fallback_cleanup
+run_test 'dependency failure stops before file moves' test_dependency_failure_stops_before_file_moves
+run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
 run_test 'reinstall stops the previous custom WireGuard runtime' test_reinstall_stops_previous_custom_wireguard_runtime
 run_test 'WireGuard uninstall can delete its stuck interface' test_wireguard_uninstall_has_interface_fallback
 run_test 'wgcf maps MIPS and s390x assets' test_wgcf_mips_and_s390x_asset_mapping
