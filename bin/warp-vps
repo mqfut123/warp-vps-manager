@@ -659,6 +659,8 @@ apply_wg_routes() {
     if ! ip -4 route replace "$cidr" dev "$WG_IFACE"; then
       stop_wg_routes
       die "Google IPv4 路由写入失败，已清除本项目路由：$cidr"
+      # Tests replace die() to inspect this failure path.
+      # shellcheck disable=SC2317
       return 1
     fi
   done < <(route_file_lines "${RULES_DIR}/google_ipv4.txt")
@@ -666,12 +668,16 @@ apply_wg_routes() {
     if ! ip -6 route replace "$cidr" dev "$WG_IFACE"; then
       stop_wg_routes
       die "Google IPv6 路由写入失败，已清除本项目路由：$cidr"
+      # Tests replace die() to inspect this failure path.
+      # shellcheck disable=SC2317
       return 1
     fi
   done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
   if ! wireguard_routes_local_ok; then
     stop_wg_routes
     die "WireGuard 本地路由边界检查失败，已清除本项目路由"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
     return 1
   fi
 }
@@ -1183,7 +1189,7 @@ configure_warp_runtime() {
     || true
 
   local attempt
-  for attempt in 1 2 3; do
+  for ((attempt = 1; attempt <= 3; attempt++)); do
     try_warp_command "connect" --accept-tos connect \
       || try_warp_command "connect" connect \
       || true
