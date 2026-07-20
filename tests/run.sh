@@ -7,6 +7,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 INSTALL_SCRIPT="${ROOT_DIR}/install.sh"
 MANAGER_SCRIPT="${ROOT_DIR}/bin/warp-vps"
 README_FILE="${ROOT_DIR}/README.md"
+GENERATOR_SCRIPT="${ROOT_DIR}/scripts/generate-google-rules.py"
 FIXTURE_DIR="${ROOT_DIR}/tests/fixtures"
 
 passed=0
@@ -108,6 +109,7 @@ run_test() {
 
 test_install_mode_reprompts() {
   source_without_main "$INSTALL_SCRIPT"
+  CONFIG_FILE="${FIXTURE_DIR}/config/missing.env"
 
   local answer_index=0
   local answers=('invalid' '')
@@ -115,15 +117,40 @@ test_install_mode_reprompts() {
     printf -v "$1" '%s' "${answers[$answer_index]}"
     answer_index=$((answer_index + 1))
   }
-  wireguard_recommended() { return 1; }
-
   local output
   if ! output="$(prompt_install_mode 2>/dev/null)"; then
     fail 'prompt_install_mode exited instead of asking again'
     return 1
   fi
   output="${output##*$'\n'}"
-  assert_eq 'socks' "$output" 'empty retry should select the default Socks mode'
+  assert_eq 'wireguard' "$output" 'empty retry should select the default WireGuard mode'
+}
+
+test_install_mode_keeps_explicit_numbers() {
+  source_without_main "$INSTALL_SCRIPT"
+  CONFIG_FILE="${FIXTURE_DIR}/config/missing.env"
+
+  local answer='1'
+  read_input() { printf -v "$1" '%s' "$answer"; }
+  assert_eq 'socks' "$(prompt_install_mode 2>/dev/null)" \
+    'explicit option 1 should remain Socks' || return 1
+
+  answer='2'
+  assert_eq 'wireguard' "$(prompt_install_mode 2>/dev/null)" \
+    'explicit option 2 should remain WireGuard'
+}
+
+test_reinstall_keeps_current_mode_by_default() {
+  source_without_main "$INSTALL_SCRIPT"
+  read_input() { printf -v "$1" '%s' ''; }
+
+  CONFIG_FILE="${FIXTURE_DIR}/config/socks-mode.env"
+  assert_eq 'socks' "$(prompt_install_mode 2>/dev/null)" \
+    'reinstalling an existing Socks setup must not switch modes on empty input' || return 1
+
+  CONFIG_FILE="${FIXTURE_DIR}/config/custom-wireguard.env"
+  assert_eq 'wireguard' "$(prompt_install_mode 2>/dev/null)" \
+    'reinstalling an existing WireGuard setup must keep WireGuard on empty input'
 }
 
 test_warp_port_reprompts() {
@@ -658,6 +685,274 @@ test_wireguard_config_generation_is_retryable() {
     fail 'Table must use the lowercase off value required by wg-quick'
     return 1
   fi
+  if wg_config_valid "${FIXTURE_DIR}/wireguard/ipv4-only.conf"; then
+    fail 'a WireGuard config without an IPv6 interface address must not be reused'
+    return 1
+  fi
+  if wg_config_valid "${FIXTURE_DIR}/wireguard/ipv6-only.conf"; then
+    fail 'a WireGuard config without an IPv4 interface address must not be reused'
+    return 1
+  fi
+  if wg_config_valid "${FIXTURE_DIR}/wireguard/allowed-ipv4-only.conf"; then
+    fail 'a WireGuard peer without IPv6 AllowedIPs must not be reused'
+    return 1
+  fi
+  if wg_config_valid "${FIXTURE_DIR}/wireguard/allowed-ipv6-only.conf"; then
+    fail 'a WireGuard peer without IPv4 AllowedIPs must not be reused'
+    return 1
+  fi
+}
+
+test_wireguard_route_failures_cleanup() {
+  source_without_main "$MANAGER_SCRIPT"
+  WG_IFACE=warp-vps-wg
+  RULES_DIR="${ROOT_DIR}/rules"
+  local fail_on die_message ip_calls routes4 routes6 route_del_calls
+  fail_on=''
+  die_message=''
+  ip_calls=''
+  routes4=''
+  routes6=''
+  route_del_calls=0
+
+  load_config() { :; }
+  validate_rules_file() { :; }
+  wg_interface_exists() { return 0; }
+  protect_ssh_peer_route() { :; }
+  wireguard_routes_local_ok() { return 0; }
+  route_file_lines() {
+    case "$1" in
+      *google_ipv4.txt) printf '%s\n' 8.8.8.0/24 8.8.4.0/24 8.34.208.0/20 ;;
+      *google_ipv6.txt) printf '%s\n' 2001:4860::/32 2404:6800::/32 2600:1900::/28 ;;
+    esac
+  }
+  die() { die_message="$1"; return 1; }
+  remove_mock_route() {
+    local var_name="$1"
+    local target="$2"
+    local current="${!var_name}"
+    current="$(awk -v target="$target" 'NF && $0 != target { print }' <<< "$current")"
+    printf -v "$var_name" '%s' "$current"
+  }
+  ip() {
+    ip_calls="${ip_calls}$*\n"
+    [ "$2" = route ] || return 1
+    case "$3" in
+      replace)
+        [ "$4" != "$fail_on" ] || return 1
+        if [ "$1" = -4 ]; then
+          routes4="${routes4}${routes4:+$'\n'}$4"
+        else
+          routes6="${routes6}${routes6:+$'\n'}$4"
+        fi
+        ;;
+      del)
+        route_del_calls=$((route_del_calls + 1))
+        if [ "$1" = -4 ]; then
+          remove_mock_route routes4 "$4"
+        else
+          remove_mock_route routes6 "$4"
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  local failed_cidr
+  for failed_cidr in 8.8.8.0/24 8.8.4.0/24 2001:4860::/32 2404:6800::/32; do
+    fail_on="$failed_cidr"
+    die_message=''
+    ip_calls=''
+    routes4=''
+    routes6=''
+    route_del_calls=0
+    if apply_wg_routes; then
+      fail "a route failure at $failed_cidr must fail the WireGuard apply"
+      return 1
+    fi
+    assert_eq '' "$routes4" \
+      "a route failure at $failed_cidr should remove every written IPv4 route" || return 1
+    assert_eq '' "$routes6" \
+      "a route failure at $failed_cidr should remove every written IPv6 route" || return 1
+    assert_eq '6' "$route_del_calls" \
+      "a route failure at $failed_cidr should run the real dual-stack cleanup" || return 1
+    assert_contains "$die_message" "$failed_cidr" \
+      "the failed route CIDR should be reported: $failed_cidr" || return 1
+  done
+
+  fail_on=''
+  die_message=''
+  ip_calls=''
+  routes4=''
+  routes6=''
+  route_del_calls=0
+  apply_wg_routes || {
+    fail 'route apply should not require a native IPv6 default route'
+    return 1
+  }
+  assert_contains "$ip_calls" '-6 route replace 2001:4860::/32 dev warp-vps-wg' \
+    'Google IPv6 routes must be installed without a native IPv6 probe' || return 1
+  assert_eq '0' "$route_del_calls" 'a successful dual-stack route apply should not clean routes'
+}
+
+test_wireguard_routes_work_without_native_ipv6() {
+  source_without_main "$MANAGER_SCRIPT"
+  WG_IFACE=warp-vps-wg
+  RULES_DIR=/unused
+  local routes4='' routes6='' ip_calls=''
+
+  load_config() { :; }
+  validate_rules_file() { :; }
+  wg_interface_exists() { return 0; }
+  protect_ssh_peer_route() { :; }
+  socks_table_absent() { return 0; }
+  route_file_lines() {
+    case "$1" in
+      *google_ipv4.txt) printf '8.8.8.0/24\n' ;;
+      *google_ipv6.txt) printf '2001:4860::/32\n' ;;
+    esac
+  }
+  rule_probe_ip() {
+    case "$2" in
+      4) printf '8.8.8.0\n' ;;
+      6) printf '2001:4860::\n' ;;
+    esac
+  }
+  ip() {
+    ip_calls="${ip_calls}$*\n"
+    case "$*" in
+      '-4 route replace 8.8.8.0/24 dev warp-vps-wg') routes4=8.8.8.0/24; return 0 ;;
+      '-6 route replace 2001:4860::/32 dev warp-vps-wg') routes6=2001:4860::/32; return 0 ;;
+      '-4 route get 8.8.8.0') [ -n "$routes4" ] && printf '8.8.8.0 dev warp-vps-wg\n' ;;
+      '-6 route get 2001:4860::') [ -n "$routes6" ] && printf '2001:4860:: dev warp-vps-wg\n' ;;
+      '-4 route show default dev warp-vps-wg'|'-6 route show default dev warp-vps-wg') return 0 ;;
+      '-6 route show default'|'-6 route get 2001:4860:4860::8888') return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  apply_wg_routes || {
+    fail 'Google dual-stack routes should install without a native IPv6 route'
+    return 1
+  }
+  assert_contains "$ip_calls" '-6 route replace 2001:4860::/32 dev warp-vps-wg' \
+    'the tunneled Google IPv6 route must still be installed' || return 1
+  assert_eq '2001:4860::/32' "$routes6" \
+    'the tunneled Google IPv6 route must remain installed after the real local route check'
+}
+
+test_wireguard_local_route_boundary_is_fail_closed() {
+  source_without_main "$MANAGER_SCRIPT"
+  WG_IFACE=warp-vps-wg
+  RULES_DIR=/unused
+
+  ip() {
+    case "$*" in
+      '-4 route show default dev warp-vps-wg') return 0 ;;
+      '-6 route show default dev warp-vps-wg') return 2 ;;
+    esac
+    return 1
+  }
+  if wg_default_routes_absent; then
+    fail 'an IPv6 route-table query failure must not be treated as an absent default route'
+    return 1
+  fi
+  unset -f ip
+
+  rule_probe_ip() {
+    case "$2" in
+      4) printf '8.8.8.0\n' ;;
+      6) printf '2001:4860::\n' ;;
+    esac
+  }
+  route_uses_wg4() { return 0; }
+  route_uses_wg6() { return 0; }
+  wg_default_routes_absent() { return 0; }
+  socks_table_absent() { return 0; }
+  wireguard_routes_local_ok || {
+    fail 'representative dual-stack routes without a project default route should pass'
+    return 1
+  }
+
+  wg_default_routes_absent() { return 1; }
+  if wireguard_routes_local_ok; then
+    fail 'a present or unreadable default route must fail the local boundary check'
+    return 1
+  fi
+}
+
+test_socks_nft_render_keeps_only_ipv6_block() {
+  source_without_main "$MANAGER_SCRIPT"
+  RULES_DIR=/unused
+  NFT_CONF=/dev/stdout
+  REDSOCKS_UID=987
+  REDSOCKS_PORT=23456
+  validate_rules_file() { :; }
+  join_rules() {
+    case "$1" in
+      *google_ipv4.txt) printf '8.8.8.0/24' ;;
+      *google_ipv6.txt) printf '2001:4860::/32' ;;
+    esac
+  }
+  table_exists() { return 1; }
+  chmod() { :; }
+
+  local rendered
+  rendered="$(render_nft_conf)"
+  assert_contains "$rendered" 'ip daddr @google4 meta l4proto tcp counter redirect to :23456' \
+    'Socks must keep the Google IPv4 TCP redirect' || return 1
+  assert_contains "$rendered" 'ip6 daddr @google6 counter reject' \
+    'Socks must keep the Google IPv6 reject' || return 1
+  assert_not_contains "$rendered" 'udp dport 443' \
+    'Socks must not block Google IPv4 UDP/443' || return 1
+  assert_not_contains "$rendered" 'ip daddr @google4 meta l4proto udp' \
+    'Socks must not add a replacement IPv4 UDP drop or redirect'
+}
+
+test_mode_switch_rejects_live_opposite_backend() {
+  source_without_main "$MANAGER_SCRIPT"
+  load_config() { :; }
+
+  WARP_MODE=wireguard
+  wg_interface_exists() { return 0; }
+  rule_probe_ip() {
+    case "$2" in
+      4) printf '8.8.8.0\n' ;;
+      6) printf '2001:4860::\n' ;;
+    esac
+  }
+  route_uses_wg4() { return 0; }
+  route_uses_wg6() { return 0; }
+  wg_default_routes_absent() { return 0; }
+  socks_table_absent() { return 1; }
+  if test_quiet; then
+    fail 'WireGuard local state must reject a live old Socks nft table'
+    return 1
+  fi
+  socks_table_absent() { return 0; }
+  test_quiet || {
+    fail 'WireGuard local state should pass after the old Socks table is absent'
+    return 1
+  }
+
+  WARP_MODE=socks
+  WARP_SOCKS_PORT=23456
+  REDSOCKS_PORT=23457
+  wait_for_socks_listen() { return 0; }
+  port_listening() { return 0; }
+  service_active() { return 0; }
+  table_exists() { return 0; }
+  socks_nft_rules_local_ok() { return 0; }
+  wg_interface_absent() { return 1; }
+  if test_quiet; then
+    fail 'Socks local state must reject a live old project WireGuard interface'
+    return 1
+  fi
+  wg_interface_absent() { return 0; }
+  test_quiet || {
+    fail 'Socks local state should pass after the old WireGuard interface is absent'
+    return 1
+  }
 }
 
 test_ssh_peer_route_uses_rule_check_status() {
@@ -979,6 +1274,228 @@ test_status_and_test_do_not_run_unlock_checks() {
   body="$(function_body "$MANAGER_SCRIPT" cmd_unlock_check)"
   assert_contains "$body" 'run_unlock_checks' \
     'unlock-check should remain the explicit command for external unlock probes'
+}
+
+test_local_runtime_paths_do_not_depend_on_external_probes() {
+  local body name
+  for name in test_quiet wait_for_wg_ready wait_for_warp_proxy_ready \
+    restart_wireguard_runtime reload_runtime_after_update cmd_heal; do
+    body="$(function_body "$MANAGER_SCRIPT" "$name")"
+    [ -n "$body" ] || {
+      fail "could not extract local runtime function: $name"
+      return 1
+    }
+    assert_not_contains "$body" 'google_http_probe' \
+      "$name must not run Google HTTP probes" || return 1
+    assert_not_contains "$body" 'socks_ok' \
+      "$name must not run the Cloudflare trace probe" || return 1
+    assert_not_contains "$body" 'wg_handshake_recent' \
+      "$name must not gate on a WireGuard handshake" || return 1
+    assert_not_contains "$body" 'run_external_diagnostics' \
+      "$name must not run external diagnostics" || return 1
+  done
+
+  body="$(function_body "$INSTALL_SCRIPT" run_final_self_check)"
+  assert_contains "$body" '"$BIN_PATH" status' \
+    'the installer final gate should call the local-only status command' || return 1
+  assert_not_contains "$body" '"$BIN_PATH" test' \
+    'the installer final gate must not call external diagnostics' || return 1
+
+  body="$(function_body "$MANAGER_SCRIPT" test_quiet)"
+  assert_contains "$body" 'wait_for_socks_listen 8' \
+    'the Socks local check must require its local WARP listener' || return 1
+  assert_contains "$body" 'port_listening "$REDSOCKS_PORT"' \
+    'the Socks local check must require its redsocks listener' || return 1
+  assert_contains "$body" 'socks_nft_rules_local_ok' \
+    'the Socks local check must require the intended nft rules' || return 1
+
+  body="$(function_body "$MANAGER_SCRIPT" run_self_check)"
+  assert_not_contains "$body" 'google_http_probe' \
+    'status must not call Google HTTP probes' || return 1
+  assert_not_contains "$body" 'socks_ok' \
+    'status must not call the Cloudflare trace probe'
+}
+
+test_cmd_test_returns_only_local_status() {
+  source_without_main "$MANAGER_SCRIPT"
+  require_root() { :; }
+  load_config() { :; }
+  run_self_check() { return 0; }
+  run_external_diagnostics() { return 1; }
+  cmd_test || {
+    fail 'external diagnostic failure must not fail warp-vps test when local state is healthy'
+    return 1
+  }
+
+  run_self_check() { return 1; }
+  run_external_diagnostics() { return 0; }
+  if cmd_test; then
+    fail 'external success must not hide a failed local runtime check'
+    return 1
+  fi
+}
+
+test_external_probe_failures_do_not_block_local_operations() {
+  source_without_main "$MANAGER_SCRIPT"
+  local external_calls=0 handshake_calls=0 repair_calls=0 manager_calls=''
+
+  WARP_MODE=wireguard
+  WG_IFACE=warp-vps-wg
+  require_root() { :; }
+  load_config() { :; }
+  unit_ready() { return 0; }
+  wg_interface_exists() { return 0; }
+  rule_probe_ip() {
+    case "$2" in
+      4) printf '8.8.8.0\n' ;;
+      6) printf '2001:4860::\n' ;;
+    esac
+  }
+  route_uses_wg4() { return 0; }
+  route_uses_wg6() { return 0; }
+  wg_default_routes_absent() { return 0; }
+  socks_table_absent() { return 0; }
+  google_http_probe() { external_calls=$((external_calls + 1)); return 6; }
+  socks_ok() { external_calls=$((external_calls + 1)); return 1; }
+  run_external_diagnostics() { external_calls=$((external_calls + 1)); return 1; }
+  wg_handshake_recent() { handshake_calls=$((handshake_calls + 1)); return 1; }
+
+  run_self_check >/dev/null || {
+    fail 'a missing WireGuard handshake must not fail an otherwise healthy local status'
+    return 1
+  }
+  assert_eq '0' "$external_calls" \
+    'status must not run HTTP, DNS or Cloudflare trace probes' || return 1
+  assert_eq '1' "$handshake_calls" \
+    'status may display one passive handshake observation without using it as a gate' || return 1
+
+  systemctl() { return 0; }
+  restart_wireguard_runtime() { return 0; }
+  run_self_check() { return 0; }
+  cmd_restart >/dev/null || {
+    fail 'restart must follow the healthy local result when external probes are unavailable'
+    return 1
+  }
+  assert_eq '0' "$external_calls" \
+    'restart must not call an external diagnostic' || return 1
+
+  manager_mock() {
+    manager_calls="${manager_calls}$1\n"
+    case "$1" in
+      install-systemd|status) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  BIN_PATH=manager_mock
+  reload_runtime_after_update >/dev/null || {
+    fail 'update reload must accept a healthy local status without external diagnostics'
+    return 1
+  }
+  assert_contains "$manager_calls" 'status' \
+    'update reload must validate with the local status command' || return 1
+  assert_not_contains "$manager_calls" 'test' \
+    'update reload must not call the external diagnostic command' || return 1
+
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  restart_wireguard_runtime() { repair_calls=$((repair_calls + 1)); return 0; }
+  cmd_heal >/dev/null || {
+    fail 'health check must accept a healthy local runtime without external probes'
+    return 1
+  }
+  assert_eq '0' "$external_calls" \
+    'health checks must not run external probes' || return 1
+  assert_eq '0' "$repair_calls" \
+    'external uncertainty must not trigger self-healing'
+}
+
+test_http_probe_accepts_http_error_responses() {
+  source_without_main "$MANAGER_SCRIPT"
+  local curl_calls='' simulated_http_status=429 arg
+  curl() {
+    curl_calls="${curl_calls}$*\n"
+    for arg in "$@"; do
+      case "$arg" in
+        --fail|--fail-with-body|-*[fF]*) return 22 ;;
+      esac
+    done
+    [ "$simulated_http_status" -eq 429 ] || return 1
+    return 0
+  }
+  google_http_probe -4 || {
+    fail 'an HTTP error response should still prove network reachability'
+    return 1
+  }
+  assert_not_contains "$curl_calls" ' -f' \
+    'the connectivity probe must not convert HTTP 429 into a transport failure' || return 1
+  assert_not_contains "$curl_calls" '--fail' \
+    'the connectivity probe must not use a long curl failure option for HTTP 429'
+}
+
+test_install_unlock_check_is_post_success_and_nonblocking() {
+  local body check_line complete_line disarm_line success_line unlock_line
+  body="$(function_body "$INSTALL_SCRIPT" main)"
+  check_line="$(line_number "$body" 'run_final_self_check')"
+  complete_line="$(line_number "$body" 'INSTALL_COMPLETE=1')"
+  disarm_line="$(line_number "$body" 'trap - EXIT')"
+  success_line="$(line_number "$body" 'WARP VPS Manager 安装完成')"
+  unlock_line="$(line_number "$body" '"$BIN_PATH" unlock-check || true')"
+  for name in check_line complete_line disarm_line success_line unlock_line; do
+    [ -n "${!name}" ] || {
+      fail "installer post-success marker is missing: $name"
+      return 1
+    }
+  done
+  if [ "$check_line" -ge "$complete_line" ] \
+    || [ "$complete_line" -ge "$disarm_line" ] \
+    || [ "$disarm_line" -ge "$success_line" ] \
+    || [ "$success_line" -ge "$unlock_line" ]; then
+    fail 'unlock-check must run only after local validation, completion, trap disarm and success output'
+    return 1
+  fi
+}
+
+test_generator_validates_google_cloud_subtraction() {
+  python3 - "$GENERATOR_SCRIPT" <<'PY'
+import ipaddress
+import runpy
+import sys
+
+module = runpy.run_path(sys.argv[1])
+subtract_many = module["subtract_many"]
+validate_source_ranges = module["validate_source_ranges"]
+validate_output_ranges = module["validate_output_ranges"]
+validate_metadata_counts = module["validate_metadata_counts"]
+
+goog4 = [ipaddress.ip_network("10.0.0.0/8")]
+goog6 = [ipaddress.ip_network("2001:db8::/32")]
+cloud4 = [ipaddress.ip_network("10.0.0.0/9")]
+cloud6 = [ipaddress.ip_network("2001:db8::/33")]
+out4 = subtract_many(goog4, cloud4)
+out6 = subtract_many(goog6, cloud6)
+assert out4 == [ipaddress.ip_network("10.128.0.0/9")]
+assert out6 == [ipaddress.ip_network("2001:db8:8000::/33")]
+validate_source_ranges("goog.json", goog4, goog6)
+validate_source_ranges("cloud.json", cloud4, cloud6)
+validate_output_ranges("IPv4", out4, goog4, cloud4)
+validate_output_ranges("IPv6", out6, goog6, cloud6)
+validate_metadata_counts(
+    {"ipv4_count": len(out4), "ipv6_count": len(out6)}, out4, out6
+)
+
+for call in (
+    lambda: validate_source_ranges("goog.json", [], goog6),
+    lambda: validate_output_ranges("IPv4", [], goog4, cloud4),
+    lambda: validate_output_ranges("IPv4", cloud4, goog4, cloud4),
+    lambda: validate_metadata_counts({"ipv4_count": 0, "ipv6_count": 1}, out4, out6),
+):
+    try:
+        call()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("generator validation unexpectedly accepted invalid data")
+PY
 }
 
 test_restart_and_update_restore_required_units() {
@@ -1525,6 +2042,182 @@ test_readme_documents_all_uninstall_modes() {
   assert_contains "$help_output" 'uninstall all' 'CLI help should document direct all uninstall'
 }
 
+test_reinstall_rejects_residual_socks_rules() {
+  source_without_main "$INSTALL_SCRIPT"
+  PREVIOUS_MODE=socks
+  MANAGED_WARP_SVC_VALUE=0
+  BIN_PATH=/path/that/does/not/exist
+  CONFIG_FILE="${FIXTURE_DIR}/config/socks-mode.env"
+  local table_present=1
+
+  systemctl() {
+    case "$*" in
+      'is-active --quiet '*|'is-enabled --quiet '*) return 1 ;;
+      *) return 0 ;;
+    esac
+  }
+  command() {
+    case "$*" in
+      '-v nft'|'-v ip') return 0 ;;
+      '-v wg-quick') return 1 ;;
+      *) builtin command "$@" ;;
+    esac
+  }
+  nft() {
+    case "$*" in
+      'delete table inet warp_vps') return 0 ;;
+      'list tables')
+        [ "$table_present" -eq 0 ] || printf 'table inet warp_vps\n'
+        return 0
+        ;;
+    esac
+    return 1
+  }
+  ip() {
+    case "$*" in
+      'link show warp-vps-wg') return 1 ;;
+      '-o link show') printf '1: lo: <LOOPBACK>\n'; return 0 ;;
+    esac
+    return 1
+  }
+
+  if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
+    fail 'a mode switch must not continue while the old Socks nft table remains'
+    return 1
+  fi
+
+  table_present=0
+  stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null || {
+    fail 'mode switching should continue once the old Socks data plane is absent'
+    return 1
+  }
+}
+
+test_main_executes_bidirectional_mode_switches() {
+  source_without_main "$INSTALL_SCRIPT"
+  local target_mode previous_mode unlock_rc events
+  target_mode=wireguard
+  previous_mode=socks
+  unlock_rc=124
+  events=''
+
+  require_root() { :; }
+  require_systemd() { :; }
+  validate_repo_raw_base() { :; }
+  prompt_install_mode() { printf '%s\n' "$target_mode"; }
+  collect_swap_choice() { :; }
+  read_project_warp_port() { return 1; }
+  prompt_warp_port() { printf '25000\n'; }
+  find_free_port() { printf '25001\n'; }
+  port_in_use() { return 1; }
+  capture_service_ownership() { :; }
+  read_previous_wireguard_runtime() {
+    PREVIOUS_MODE="$previous_mode"
+    PREVIOUS_WG_IFACE=warp-vps-wg
+    PREVIOUS_WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+  }
+  stage_project_files() { :; }
+  backup_project_files() { :; }
+  stop_project_runtime() { events="${events}stop:${PREVIOUS_MODE}\n"; }
+  activate_project_files() { :; }
+  write_config() { events="${events}config:$1\n"; }
+  apply_swap_choice() { :; }
+  install_dependencies() { events="${events}deps:$1\n"; }
+  disable_new_packaged_redsocks_service() { :; }
+  preflight_nft_nat() { :; }
+  ensure_redsocks_user() { :; }
+  redsocks_path() { printf '/usr/sbin/redsocks\n'; }
+  mark_managed_redsocks_if_current() { :; }
+  id() {
+    case "$1" in
+      -u) printf '991\n' ;;
+      -gn) printf 'root\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  manager_mock() {
+    events="${events}manager:$1\n"
+    [ "$1" != unlock-check ] || return "$unlock_rc"
+  }
+  BIN_PATH=manager_mock
+  systemctl() { events="${events}systemctl:$*\n"; }
+  enable_project_unit() { events="${events}enable:$1\n"; }
+  run_final_self_check() { events="${events}self-check\n"; }
+  log() { :; }
+
+  if ! main >/dev/null; then
+    fail 'Socks-to-WireGuard switching must stay successful when automatic unlock times out'
+    return 1
+  fi
+  assert_contains "$events" 'stop:socks' \
+    'Socks-to-WireGuard must stop the previous Socks runtime' || return 1
+  assert_contains "$events" 'config:wireguard' \
+    'Socks-to-WireGuard must write the WireGuard target mode' || return 1
+  assert_contains "$events" 'deps:wireguard' \
+    'Socks-to-WireGuard must install WireGuard dependencies' || return 1
+  assert_contains "$events" 'manager:setup-wireguard' \
+    'Socks-to-WireGuard must prepare the WireGuard config' || return 1
+  assert_contains "$events" 'manager:preflight-wireguard' \
+    'Socks-to-WireGuard must run the local WireGuard preflight' || return 1
+  assert_contains "$events" 'enable:wg-quick@warp-vps-wg.service' \
+    'Socks-to-WireGuard must enable the WireGuard target unit' || return 1
+  assert_not_contains "$events" 'manager:configure-warp' \
+    'Socks-to-WireGuard must not configure the Socks target' || return 1
+  assert_eq '1' "$(grep -c '^stop:' <<< "$events")" \
+    'a timed-out post-success unlock check must not trigger installation cleanup' || return 1
+
+  target_mode=socks
+  previous_mode=wireguard
+  unlock_rc=1
+  events=''
+  INSTALL_COMPLETE=0
+  INSTALL_CLEANUP_ARMED=0
+  if ! main >/dev/null; then
+    fail 'WireGuard-to-Socks switching must stay successful when automatic unlock cannot confirm'
+    return 1
+  fi
+  assert_contains "$events" 'stop:wireguard' \
+    'WireGuard-to-Socks must stop the previous WireGuard runtime' || return 1
+  assert_contains "$events" 'config:socks' \
+    'WireGuard-to-Socks must write the Socks target mode' || return 1
+  assert_contains "$events" 'deps:socks' \
+    'WireGuard-to-Socks must install Socks dependencies' || return 1
+  assert_contains "$events" 'manager:configure-warp' \
+    'WireGuard-to-Socks must configure the Socks target' || return 1
+  assert_contains "$events" 'enable:warp-vps-redsocks.service' \
+    'WireGuard-to-Socks must enable the redsocks target unit' || return 1
+  assert_not_contains "$events" 'manager:setup-wireguard' \
+    'WireGuard-to-Socks must not prepare the WireGuard target' || return 1
+  assert_eq '1' "$(grep -c '^stop:' <<< "$events")" \
+    'a failed post-success unlock check must not trigger installation cleanup'
+}
+
+test_reinstall_mode_switch_uses_the_main_install_path() {
+  local body stop_line config_line deps_line wg_line socks_line
+  body="$(function_body "$INSTALL_SCRIPT" main)"
+  stop_line="$(line_number "$body" 'stop_project_runtime "$PREVIOUS_WG_IFACE"')"
+  config_line="$(line_number "$body" 'write_config "$selected_mode"')"
+  deps_line="$(line_number "$body" 'install_dependencies "$selected_mode"')"
+  wg_line="$(line_number "$body" '"$BIN_PATH" setup-wireguard')"
+  socks_line="$(line_number "$body" '"$BIN_PATH" configure-warp')"
+  for name in stop_line config_line deps_line wg_line socks_line; do
+    [ -n "${!name}" ] || {
+      fail "mode-switch step is missing from the installer: $name"
+      return 1
+    }
+  done
+  if [ "$stop_line" -ge "$config_line" ] || [ "$config_line" -ge "$deps_line" ]; then
+    fail 'the previous mode must stop before target config and dependencies are activated'
+    return 1
+  fi
+  assert_file_matches "$README_FILE" '直接回车保持当前模式' \
+    'README should document the safe reinstall default' || return 1
+  assert_file_matches "$README_FILE" '输入 `2` 可从 Socks5 切换到 WireGuard' \
+    'README should document the supported Socks-to-WireGuard switch' || return 1
+  assert_file_matches "$README_FILE" '输入 `1` 可从 WireGuard 切换到 Socks5' \
+    'README should document the supported reverse switch'
+}
+
 test_reinstall_stops_previous_custom_wireguard_runtime() {
   source_without_main "$INSTALL_SCRIPT"
   CONFIG_FILE="${FIXTURE_DIR}/config/custom-wireguard.env"
@@ -1539,7 +2232,10 @@ test_reinstall_stops_previous_custom_wireguard_runtime() {
   BIN_PATH=/path/that/does/not/exist
   systemctl() {
     systemctl_calls="${systemctl_calls}$*\n"
-    return 0
+    case "$*" in
+      'is-active --quiet '*|'is-enabled --quiet '*) return 1 ;;
+      *) return 0 ;;
+    esac
   }
   wg-quick() {
     wg_calls="${wg_calls}$*\n"
@@ -1550,6 +2246,11 @@ test_reinstall_stops_previous_custom_wireguard_runtime() {
     case "$*" in
       'link show custom-wg') [ "$link_exists" -eq 1 ] ;;
       'link delete dev custom-wg') link_exists=0 ;;
+      '-o link show')
+        printf '1: lo: <LOOPBACK>\n'
+        [ "$link_exists" -eq 0 ] || printf '7: custom-wg: <POINTOPOINT>\n'
+        return 0
+        ;;
       *) return 1 ;;
     esac
   }
@@ -1647,6 +2348,8 @@ test_no_sha_gate() {
 }
 
 run_test 'install mode retries after invalid input' test_install_mode_reprompts
+run_test 'explicit install mode numbers remain stable' test_install_mode_keeps_explicit_numbers
+run_test 'reinstall keeps the current mode by default' test_reinstall_keeps_current_mode_by_default
 run_test 'SOCKS port retries after a stray backslash' test_warp_port_reprompts
 run_test 'reinstall can reuse its current SOCKS port' test_existing_project_port_is_reusable
 run_test 'SOCKS port checks ignore UDP-only listeners' test_port_checks_only_tcp
@@ -1669,6 +2372,11 @@ run_test 'RPM redsocks uses the Fedora package or source build path' test_rpm_re
 run_test 'iptables CLI is not an installation dependency' test_no_iptables_package_dependency
 run_test 'WireGuard support uses a real runtime preflight' test_wireguard_uses_runtime_capability
 run_test 'WireGuard generation recovers from partial state' test_wireguard_config_generation_is_retryable
+run_test 'WireGuard route failures clean partial state' test_wireguard_route_failures_cleanup
+run_test 'WireGuard routes do not require native IPv6' test_wireguard_routes_work_without_native_ipv6
+run_test 'WireGuard local route boundaries fail closed' test_wireguard_local_route_boundary_is_fail_closed
+run_test 'Socks nft output keeps only the IPv6 block' test_socks_nft_render_keeps_only_ipv6_block
+run_test 'mode switches reject a live opposite backend' test_mode_switch_rejects_live_opposite_backend
 run_test 'SSH peer protection preserves the rule-check status' test_ssh_peer_route_uses_rule_check_status
 run_test 'existing WARP registration is reused safely' test_existing_warp_registration_is_reused
 run_test 'WARP registration distinguishes present missing and unknown' test_warp_registration_has_three_states
@@ -1678,6 +2386,12 @@ run_test 'custom Swap uses decimal input and releases failed allocation' test_cu
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'status and test do not run unlock probes' test_status_and_test_do_not_run_unlock_checks
+run_test 'local runtime paths avoid external probes' test_local_runtime_paths_do_not_depend_on_external_probes
+run_test 'test exit status follows only local state' test_cmd_test_returns_only_local_status
+run_test 'external probe failures do not block local operations' test_external_probe_failures_do_not_block_local_operations
+run_test 'HTTP probes accept error responses as reachable' test_http_probe_accepts_http_error_responses
+run_test 'install unlock check is post-success and nonblocking' test_install_unlock_check_is_post_success_and_nonblocking
+run_test 'Google rule generation validates cloud subtraction' test_generator_validates_google_cloud_subtraction
 run_test 'restart update and heal restore required units' test_restart_and_update_restore_required_units
 run_test 'uninstall clears both rule backends and keeps custom WireGuard paths' test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path
 run_test 'uninstall scopes are explicit and VNC safe' test_uninstall_scope_is_explicit_and_vnc_safe
@@ -1694,6 +2408,9 @@ run_test 'RPM dependency postcondition parsing fails closed' test_rpm_dependency
 run_test 'uninstall scope controls dependency and fallback cleanup' test_uninstall_scope_controls_dependency_and_fallback_cleanup
 run_test 'dependency failure stops before file moves' test_dependency_failure_stops_before_file_moves
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
+run_test 'reinstall rejects residual Socks rules' test_reinstall_rejects_residual_socks_rules
+run_test 'main executes both mode switches and ignores unlock failures' test_main_executes_bidirectional_mode_switches
+run_test 'mode switching reuses the main install path' test_reinstall_mode_switch_uses_the_main_install_path
 run_test 'reinstall stops the previous custom WireGuard runtime' test_reinstall_stops_previous_custom_wireguard_runtime
 run_test 'WireGuard uninstall can delete its stuck interface' test_wireguard_uninstall_has_interface_fallback
 run_test 'wgcf maps MIPS and s390x assets' test_wgcf_mips_and_s390x_asset_mapping

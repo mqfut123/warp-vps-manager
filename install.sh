@@ -32,6 +32,7 @@ INSTALL_CLEANUP_ARMED=0
 INSTALL_COMPLETE=0
 PREVIOUS_WG_IFACE="$WG_IFACE"
 PREVIOUS_WG_CONFIG="$WG_CONFIG"
+PREVIOUS_MODE=""
 PROJECT_STAGE_DIR=""
 PROJECT_BACKUP_DIR=""
 
@@ -592,16 +593,35 @@ port_in_use() {
   return 1
 }
 
+read_project_mode() {
+  [ -r "$CONFIG_FILE" ] || return 1
+  local line mode=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      WARP_MODE=*) mode="${line#*=}" ;;
+    esac
+  done < "$CONFIG_FILE"
+  case "$mode" in
+    socks|wireguard) printf '%s\n' "$mode" ;;
+    *) return 1 ;;
+  esac
+}
+
 prompt_install_mode() {
-  local recommended choice
-  recommended="socks"
+  local recommended choice current_mode
+  current_mode="$(read_project_mode || true)"
+  recommended="${current_mode:-wireguard}"
 
   printf '\n请选择 WARP 分流方案：\n' >&2
-  printf '  1. Socks5 方案：更稳，低风险。命中规则的 Google IPv4 TCP 走 WARP，UDP/443 阻断后通常回落 TCP。\n' >&2
-  printf '  2. WireGuard 方案：高级模式。TCP+UDP 都可按 Google CIDR 走 WARP，安装时会实际拉起接口做预检。\n' >&2
+  printf '  1. Socks5 方案：Google IPv4 TCP 走 WARP，IPv4 UDP/QUIC 使用 VPS 原生出口，Google IPv6 拒绝。\n' >&2
+  printf '  2. WireGuard 方案：Google IPv4、IPv6、TCP、UDP 和 QUIC 都按 Google CIDR 走 WARP。\n' >&2
   printf '  3. 退出安装\n' >&2
-  printf '普通用户推荐 Socks5；明确需要 UDP/QUIC 再选 WireGuard。\n' >&2
-  printf '直接回车默认选择：Socks5\n' >&2
+  printf '普通用户推荐 WireGuard；只需要兼容本地代理模式时再选 Socks5。\n' >&2
+  if [ -n "$current_mode" ]; then
+    printf '当前模式：%s；直接回车保持当前模式。\n' "$current_mode" >&2
+  else
+    printf '直接回车默认选择：WireGuard\n' >&2
+  fi
   while true; do
     printf '请输入选项：' >&2
     read_input choice || die "无法读取输入，已退出安装"
@@ -697,11 +717,18 @@ valid_runtime_path() {
 read_previous_wireguard_runtime() {
   PREVIOUS_WG_IFACE="$WG_IFACE"
   PREVIOUS_WG_CONFIG="$WG_CONFIG"
+  PREVIOUS_MODE=""
   [ -r "$CONFIG_FILE" ] || return 0
 
   local line value
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
+      WARP_MODE=*)
+        value="${line#*=}"
+        case "$value" in
+          socks|wireguard) PREVIOUS_MODE="$value" ;;
+        esac
+        ;;
       WG_IFACE=*)
         value="${line#*=}"
         if valid_runtime_iface "$value"; then
@@ -840,6 +867,35 @@ restore_project_file() {
   fi
 }
 
+project_unit_stopped_and_disabled() {
+  local unit="$1"
+  ! systemctl is-active --quiet "$unit" \
+    && ! systemctl is-enabled --quiet "$unit"
+}
+
+project_unit_stopped() {
+  ! systemctl is-active --quiet "$1"
+}
+
+project_nft_table_absent() {
+  local tables
+  tables="$(nft list tables 2>/dev/null)" || return 1
+  ! grep -Fxq 'table inet warp_vps' <<< "$tables"
+}
+
+project_wg_interface_absent() {
+  local links
+  links="$(ip -o link show 2>/dev/null)" || return 1
+  ! awk -F ': ' -v iface="$1" '
+    {
+      name=$2
+      sub(/@.*/, "", name)
+      if (name == iface) found=1
+    }
+    END { exit !found }
+  ' <<< "$links"
+}
+
 write_config() {
   local mode="$1"
   local warp_port="$2"
@@ -881,6 +937,9 @@ stop_project_runtime() {
   fi
   if command -v nft >/dev/null 2>&1; then
     nft delete table inet warp_vps >/dev/null 2>&1 || true
+  elif [ "$PREVIOUS_MODE" = "socks" ]; then
+    log "找不到 nft，无法确认旧 Socks5 分流规则已经停用"
+    return 1
   fi
   if command -v ip >/dev/null 2>&1 && ip link show "$runtime_iface" >/dev/null 2>&1; then
     if command -v wg-quick >/dev/null 2>&1; then
@@ -893,8 +952,37 @@ stop_project_runtime() {
         || {
           log "无法停止本项目 WireGuard 网卡：$runtime_iface"
           return 1
-        }
+      }
     fi
+  elif [ "$PREVIOUS_MODE" = "wireguard" ] && ! command -v ip >/dev/null 2>&1; then
+    log "找不到 ip，无法确认旧 WireGuard 网卡已经停用"
+    return 1
+  fi
+
+  local unit
+  for unit in warp-vps-health.timer warp-vps.service warp-vps-redsocks.service \
+    "wg-quick@${runtime_iface}.service"; do
+    if ! project_unit_stopped_and_disabled "$unit"; then
+      log "本项目服务仍在运行或保持启用：$unit"
+      return 1
+    fi
+  done
+  if ! project_unit_stopped warp-vps-health.service; then
+    log "本项目健康检查仍在运行：warp-vps-health.service"
+    return 1
+  fi
+  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ] \
+    && ! project_unit_stopped_and_disabled warp-svc.service; then
+    log "本项目管理的 WARP 服务仍在运行或保持启用：warp-svc.service"
+    return 1
+  fi
+  if command -v nft >/dev/null 2>&1 && ! project_nft_table_absent; then
+    log "本项目 nftables 分流规则仍在生效或状态无法读取"
+    return 1
+  fi
+  if command -v ip >/dev/null 2>&1 && ! project_wg_interface_absent "$runtime_iface"; then
+    log "本项目 WireGuard 网卡仍在运行或状态无法读取：$runtime_iface"
+    return 1
   fi
 }
 
@@ -915,7 +1003,7 @@ enable_project_unit() {
 }
 
 run_final_self_check() {
-  if "$BIN_PATH" test; then
+  if "$BIN_PATH" status; then
     return 0
   fi
   log "最终自检失败，正在停止本项目服务和分流规则"
@@ -1016,21 +1104,21 @@ main() {
 
   printf '\nWARP VPS Manager 安装完成。\n'
   if [ "$selected_mode" = "socks" ]; then
-    printf '安装模式：Socks5 稳定模式\n'
+    printf '安装模式：Socks5 兼容模式\n'
   else
-    printf '安装模式：WireGuard 高级模式\n'
+    printf '安装模式：WireGuard 默认模式\n'
   fi
   if [ "$selected_mode" = "socks" ]; then
     printf 'WARP SOCKS 端口：%s\n' "$warp_port"
   fi
   printf '管理命令：warp-vps {status|test|restart|unlock-check|update|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ]; then
-    printf '已默认阻断 Google 目标 IPv6，避免 IPv6 泄漏。\n'
+    printf 'Google IPv4 UDP/QUIC 使用 VPS 原生出口；Google 目标 IPv6 继续拒绝。\n'
   else
-    printf 'WireGuard 模式会把命中 Google CIDR 的 TCP/UDP 流量路由到 WARP。\n'
+    printf 'WireGuard 模式会把命中 Google CIDR 的 IPv4、IPv6、TCP、UDP 和 QUIC 流量路由到 WARP。\n'
   fi
 
-  printf '\n安装后 IPv4 出口解锁检测：\n'
+  printf '\n安装已完成，以下 IPv4 出口解锁检测仅供参考，不影响安装结果：\n'
   "$BIN_PATH" unlock-check || true
 }
 

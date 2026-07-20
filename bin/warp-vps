@@ -308,7 +308,6 @@ add rule inet warp_vps output_nat ip daddr @google4 meta l4proto tcp counter red
 add chain inet warp_vps output_filter { type filter hook output priority filter; policy accept; }
 add rule inet warp_vps output_filter meta skuid ${REDSOCKS_UID} return
 add rule inet warp_vps output_filter oifname "lo" return
-add rule inet warp_vps output_filter ip daddr @google4 udp dport 443 counter reject with icmpx type admin-prohibited
 add rule inet warp_vps output_filter ip6 daddr @google6 counter reject with icmpx type admin-prohibited
 EOF
   chmod 0644 "$NFT_CONF"
@@ -318,8 +317,17 @@ wg_interface_exists() {
   ip link show "$WG_IFACE" >/dev/null 2>&1
 }
 
-ipv6_route_required() {
-  ip -6 route get 2001:4860:4860::8888 >/dev/null 2>&1 || ip -6 route show default 2>/dev/null | grep -q .
+wg_interface_absent() {
+  local links
+  links="$(ip -o link show 2>/dev/null)" || return 1
+  ! awk -F ': ' -v iface="$WG_IFACE" '
+    {
+      name=$2
+      sub(/@.*/, "", name)
+      if (name == iface) found=1
+    }
+    END { exit !found }
+  ' <<< "$links"
 }
 
 ssh_peer_ip() {
@@ -480,8 +488,13 @@ if len(private_keys) != 1 or not valid_key(private_keys[0]):
 addresses = entries(interface, "address")
 if not addresses:
     raise SystemExit("missing address")
+address_versions = set()
 for address in addresses:
-    ipaddress.ip_interface(address)
+    address_versions.add(ipaddress.ip_interface(address).version)
+if 4 not in address_versions:
+    raise SystemExit("missing IPv4 interface address")
+if 6 not in address_versions:
+    raise SystemExit("missing IPv6 interface address")
 mtus = entries(interface, "mtu")
 if len(mtus) > 1 or (mtus and (not mtus[0].isdigit() or not 576 <= int(mtus[0]) <= 65535)):
     raise SystemExit("invalid mtu")
@@ -595,33 +608,76 @@ route_file_lines() {
   awk 'NF && $1 !~ /^#/ { print $1 }' "$file"
 }
 
+rule_probe_ip() {
+  local file="$1"
+  local version="$2"
+  python3 - "$file" "$version" <<'PY'
+import ipaddress
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+version = int(sys.argv[2])
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    network = ipaddress.ip_network(line, strict=True)
+    if network.version != version:
+        raise SystemExit(f"unexpected IPv{network.version} rule in {path}")
+    print(network.network_address)
+    raise SystemExit(0)
+raise SystemExit(f"no IPv{version} rules in {path}")
+PY
+}
+
+wg_default_routes_absent() {
+  local routes4 routes6
+  routes4="$(ip -4 route show default dev "$WG_IFACE" 2>/dev/null)" || return 1
+  routes6="$(ip -6 route show default dev "$WG_IFACE" 2>/dev/null)" || return 1
+  [ -z "$routes4" ] && [ -z "$routes6" ]
+}
+
+wireguard_routes_local_ok() {
+  local probe4 probe6
+  probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" || return 1
+  probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" || return 1
+  route_uses_wg4 "$probe4" || return 1
+  route_uses_wg6 "$probe6" || return 1
+  wg_default_routes_absent || return 1
+  socks_table_absent
+}
+
 apply_wg_routes() {
+  local cidr
   load_config
   validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4
   validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
   wg_interface_exists || die "WireGuard 网卡不存在：$WG_IFACE"
   protect_ssh_peer_route
   while IFS= read -r cidr; do
-    ip -4 route replace "$cidr" dev "$WG_IFACE"
+    if ! ip -4 route replace "$cidr" dev "$WG_IFACE"; then
+      stop_wg_routes
+      die "Google IPv4 路由写入失败，已清除本项目路由：$cidr"
+      return 1
+    fi
   done < <(route_file_lines "${RULES_DIR}/google_ipv4.txt")
-  local require_ipv6 ipv6_failed
-  require_ipv6=0
-  ipv6_failed=0
-  if ipv6_route_required; then
-    require_ipv6=1
-  fi
   while IFS= read -r cidr; do
-    if ! ip -6 route replace "$cidr" dev "$WG_IFACE" 2>/dev/null; then
-      ipv6_failed=1
+    if ! ip -6 route replace "$cidr" dev "$WG_IFACE"; then
+      stop_wg_routes
+      die "Google IPv6 路由写入失败，已清除本项目路由：$cidr"
+      return 1
     fi
   done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
-  if [ "$require_ipv6" -eq 1 ]; then
-    [ "$ipv6_failed" -eq 0 ] || die "系统存在 IPv6 路由，但 Google IPv6 路由写入失败，已中止以避免泄漏"
-    route_uses_wg6 2001:4860:4860::8888 || die "系统存在 IPv6 路由，但 Google IPv6 没有走 WireGuard，已中止以避免泄漏"
+  if ! wireguard_routes_local_ok; then
+    stop_wg_routes
+    die "WireGuard 本地路由边界检查失败，已清除本项目路由"
+    return 1
   fi
 }
 
 stop_wg_routes() {
+  local cidr
   [ -r "${RULES_DIR}/google_ipv4.txt" ] || return 0
   while IFS= read -r cidr; do
     ip -4 route del "$cidr" dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" 2>/dev/null || true
@@ -635,6 +691,13 @@ stop_wg_routes() {
 
 table_exists() {
   nft list table inet warp_vps >/dev/null 2>&1
+}
+
+socks_table_absent() {
+  command -v nft >/dev/null 2>&1 || return 0
+  local tables
+  tables="$(nft list tables 2>/dev/null)" || return 1
+  ! grep -Fxq 'table inet warp_vps' <<< "$tables"
 }
 
 apply_rules() {
@@ -926,9 +989,7 @@ socks_ok() {
   socks_trace 2>/dev/null | grep -Eq '^warp=(on|plus)$'
 }
 
-wg_ok() {
-  wg_interface_exists || return 1
-  curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1 || return 1
+wg_handshake_recent() {
   local latest now
   latest="$(wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')"
   case "$latest" in ''|*[!0-9]*) return 1 ;; esac
@@ -938,10 +999,10 @@ wg_ok() {
 }
 
 wait_for_wg_ready() {
-  local timeout="${1:-90}"
+  local timeout="${1:-20}"
   local end=$((SECONDS + timeout))
   while [ "$SECONDS" -le "$end" ]; do
-    if wg_interface_exists && route_uses_wg4 8.8.8.8 && wg_ok; then
+    if wg_interface_exists && wireguard_routes_local_ok; then
       return 0
     fi
     sleep 2
@@ -950,24 +1011,17 @@ wait_for_wg_ready() {
 }
 
 restart_wireguard_runtime() {
-  local attempt
-  for attempt in 1 2; do
-    systemctl restart "wg-quick@${WG_IFACE}.service" || return 1
-    apply_rules || return 1
-    if wait_for_wg_ready 90; then
-      return 0
-    fi
-    warn_line "WireGuard 出口第 ${attempt} 次检查未就绪，正在重试"
-  done
-  return 1
+  systemctl restart "wg-quick@${WG_IFACE}.service" || return 1
+  apply_rules || return 1
+  wait_for_wg_ready 20
 }
 
 route_uses_wg4() {
-  ip -4 route get "$1" 2>/dev/null | grep -q "dev ${WG_IFACE}"
+  ip -4 route get "$1" 2>/dev/null | grep -Fq "dev ${WG_IFACE}"
 }
 
 route_uses_wg6() {
-  ip -6 route get "$1" 2>/dev/null | grep -q "dev ${WG_IFACE}"
+  ip -6 route get "$1" 2>/dev/null | grep -Fq "dev ${WG_IFACE}"
 }
 
 google_counter() {
@@ -1078,7 +1132,7 @@ wait_for_warp_proxy_ready() {
   local timeout="${1:-90}"
   local end=$((SECONDS + timeout))
   while [ "$SECONDS" -le "$end" ]; do
-    if port_listening "$WARP_SOCKS_PORT" && socks_ok; then
+    if port_listening "$WARP_SOCKS_PORT"; then
       return 0
     fi
     sleep 2
@@ -1144,34 +1198,28 @@ configure_warp_runtime() {
   return 1
 }
 
+socks_nft_rules_local_ok() {
+  local nat_rules filter_rules
+  nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null)" || return 1
+  filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null)" || return 1
+  grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" || return 1
+  grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules" || return 1
+  ! grep -Eq 'udp dport 443.*(drop|reject)' <<< "$filter_rules"
+}
+
 test_quiet() {
   load_config
   if [ "$WARP_MODE" = "wireguard" ]; then
     wg_interface_exists || return 1
-    wg_ok || return 1
-    route_uses_wg4 8.8.8.8 || return 1
-    curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1 || return 1
-    if route_uses_wg4 1.1.1.1; then
-      return 1
-    fi
-    if ipv6_route_required && ! route_uses_wg6 2001:4860:4860::8888; then
-      return 1
-    fi
-    return 0
+    wireguard_routes_local_ok
+    return
   fi
   wait_for_socks_listen 8 || return 1
-  socks_ok || return 1
+  port_listening "$REDSOCKS_PORT" || return 1
   service_active warp-vps-redsocks.service || return 1
+  wg_interface_absent || return 1
   table_exists || return 1
-  nft list chain inet warp_vps output_filter >/dev/null 2>&1 || return 1
-
-  local before after
-  before="$(google_counter)"
-  [ -n "$before" ] || return 1
-  curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1 || return 1
-  after="$(google_counter)"
-  [ -n "$after" ] || return 1
-  [ "$after" -gt "$before" ] || return 1
+  socks_nft_rules_local_ok
 }
 
 print_rule_summary() {
@@ -1426,14 +1474,69 @@ run_unlock_checks() {
   info_line "检测基于公开网页特征和本机 IPv4 出口；若 Google 页面或地区策略变化，可能显示无法确认。"
 }
 
+google_http_probe() {
+  local family="$1"
+  curl "$family" -sS --connect-timeout 5 --max-time 12 -o /dev/null \
+    https://www.google.com/generate_204 >/dev/null 2>&1
+}
+
+run_external_diagnostics() {
+  section "外部连通性诊断（仅供参考）"
+  if ! command -v curl >/dev/null 2>&1; then
+    warn_line "找不到 curl，无法执行外部连通性诊断"
+    return 0
+  fi
+
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    if google_http_probe -4; then
+      ok_line "Google IPv4 已返回 HTTP 响应"
+    else
+      warn_line "Google IPv4 暂时无法确认；不影响本地运行状态"
+    fi
+    if google_http_probe -6; then
+      ok_line "Google IPv6 已返回 HTTP 响应"
+    else
+      warn_line "Google IPv6 暂时无法确认；不影响本地运行状态"
+    fi
+    if wg_handshake_recent; then
+      ok_line "WireGuard 最近有握手"
+    else
+      warn_line "WireGuard 暂无近期握手；不影响本地运行状态"
+    fi
+    return 0
+  fi
+
+  if socks_ok; then
+    ok_line "Cloudflare WARP SOCKS 外部出口已确认"
+  else
+    warn_line "Cloudflare WARP SOCKS 外部出口暂时无法确认；不影响本地运行状态"
+  fi
+
+  local before after
+  before="$(google_counter || true)"
+  if google_http_probe -4; then
+    after="$(google_counter || true)"
+    if [ -n "$before" ] && [ -n "$after" ] && [ "$after" -gt "$before" ]; then
+      ok_line "Google IPv4 测试请求命中 SOCKS 分流规则"
+    else
+      warn_line "Google IPv4 已返回 HTTP 响应，但暂时无法确认计数器变化"
+    fi
+  else
+    warn_line "Google IPv4 暂时无法确认；不影响本地运行状态"
+  fi
+  return 0
+}
+
 run_self_check() {
   local failed=0
+  local nat_rules=""
   local filter_rules=""
-  local before after
+  local probe4=""
+  local probe6=""
 
-  section "状态自检"
+  section "本地状态自检"
   if [ "$WARP_MODE" = "wireguard" ]; then
-    info_line "当前模式：WireGuard 高级模式"
+    info_line "当前模式：WireGuard 默认模式"
     info_line "WireGuard 网卡：${WG_IFACE}"
 
     if unit_ready "wg-quick@${WG_IFACE}.service"; then
@@ -1464,46 +1567,45 @@ run_self_check() {
       failed=1
     fi
 
-    if wg_ok; then
-      ok_line "WARP WireGuard 出口可用"
+    if probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" \
+      && route_uses_wg4 "$probe4"; then
+      ok_line "代表性 Google IPv4 路由已走 WireGuard"
     else
-      fail_line "WARP WireGuard 出口不可用"
+      fail_line "代表性 Google IPv4 路由没有走 WireGuard"
       failed=1
     fi
 
-    if route_uses_wg4 8.8.8.8; then
-      ok_line "Google IPv4 路由已走 WARP"
+    if probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" \
+      && route_uses_wg6 "$probe6"; then
+      ok_line "代表性 Google IPv6 路由已走 WireGuard"
     else
-      fail_line "Google IPv4 路由没有走 WARP"
+      fail_line "代表性 Google IPv6 路由没有走 WireGuard"
       failed=1
     fi
 
-    if route_uses_wg4 1.1.1.1; then
-      fail_line "普通 IPv4 流量也走了 WARP，分流异常"
-      failed=1
+    if wg_default_routes_absent; then
+      ok_line "项目 WireGuard 网卡没有接管默认路由"
     else
-      ok_line "普通 IPv4 流量保持直连"
-    fi
-
-    if curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1; then
-      ok_line "Google TCP 测试请求正常"
-    else
-      fail_line "Google TCP 测试请求失败"
+      fail_line "项目 WireGuard 网卡接管了默认路由，或无法读取默认路由状态"
       failed=1
     fi
 
-    if route_uses_wg6 2001:4860:4860::8888; then
-      ok_line "Google IPv6 路由已走 WARP"
-    elif ipv6_route_required; then
-      fail_line "系统存在 IPv6 路由，但 Google IPv6 没有走 WARP"
-      failed=1
+    if socks_table_absent; then
+      ok_line "未发现旧 Socks5 nftables 分流规则"
     else
-      warn_line "未检测到 Google IPv6 路由命中，可能是系统没有 IPv6 或内核不支持"
+      fail_line "旧 Socks5 nftables 分流规则仍在生效，或状态无法读取"
+      failed=1
+    fi
+
+    if wg_handshake_recent; then
+      ok_line "WireGuard 最近有握手"
+    else
+      warn_line "WireGuard 暂无近期握手；这不代表本地配置失败"
     fi
 
     section "结论"
     if [ "$failed" -eq 0 ]; then
-      ok_line "本机分流链路正常。命中规则的 Google 相关 TCP/UDP 流量会走 WARP。"
+      ok_line "本地运行态正常。可运行 warp-vps test 查看非阻塞外部诊断。"
       return 0
     fi
     fail_line "当前异常。请先运行：warp-vps restart"
@@ -1511,7 +1613,9 @@ run_self_check() {
     return 1
   fi
 
+  info_line "当前模式：Socks5 兼容模式"
   info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
+  info_line "本地转发端口：${REDSOCKS_PORT}"
 
   if unit_ready warp-svc.service; then
     ok_line "WARP 官方客户端服务正常"
@@ -1548,10 +1652,10 @@ run_self_check() {
     failed=1
   fi
 
-  if socks_ok; then
-    ok_line "WARP 出口可用"
+  if port_listening "$REDSOCKS_PORT"; then
+    ok_line "本地透明转发端口已监听"
   else
-    fail_line "WARP 出口不可用"
+    fail_line "本地透明转发端口没有监听"
     failed=1
   fi
 
@@ -1569,26 +1673,27 @@ run_self_check() {
     failed=1
   fi
 
-  before="$(google_counter || true)"
-  if [ -n "$before" ] && curl -4 -fsS --connect-timeout 8 --max-time 15 -o /dev/null https://www.google.com/generate_204 >/dev/null 2>&1; then
-    after="$(google_counter || true)"
-    if [ -n "$after" ] && [ "$after" -gt "$before" ]; then
-      ok_line "Google 测试流量已走 WARP 分流"
-    else
-      fail_line "Google 测试流量没有命中分流规则"
-      failed=1
-    fi
+  if wg_interface_absent; then
+    ok_line "未发现旧 WireGuard 项目网卡"
   else
-    fail_line "Google 测试请求失败"
+    fail_line "旧 WireGuard 项目网卡仍在运行，或状态无法读取"
+    failed=1
+  fi
+
+  nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null || true)"
+  if grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules"; then
+    ok_line "Google IPv4 TCP 重定向规则已加载"
+  else
+    fail_line "未找到 Google IPv4 TCP 重定向规则"
     failed=1
   fi
 
   filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null || true)"
-  if grep -Eq 'udp dport 443.*reject' <<< "$filter_rules"; then
-    ok_line "已阻断 Google/YouTube QUIC，防止 UDP 直连绕过"
-  else
-    fail_line "未找到 UDP/443 阻断规则"
+  if grep -Eq 'udp dport 443.*(drop|reject)' <<< "$filter_rules"; then
+    fail_line "仍存在 Google IPv4 UDP/443 阻断规则"
     failed=1
+  else
+    ok_line "Google IPv4 UDP/QUIC 未被项目阻断，将使用 VPS 原生出口"
   fi
 
   if grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"; then
@@ -1600,7 +1705,7 @@ run_self_check() {
 
   section "结论"
   if [ "$failed" -eq 0 ]; then
-    ok_line "本机分流链路正常。命中规则的 Google 相关 IPv4 TCP 流量会走 WARP。"
+    ok_line "本地运行态正常。Google IPv4 TCP 走 WARP，IPv4 UDP/QUIC 使用 VPS 原生出口，Google IPv6 继续拒绝。"
     return 0
   fi
 
@@ -1612,7 +1717,10 @@ run_self_check() {
 cmd_test() {
   require_root
   load_config
-  run_self_check
+  local local_rc=0
+  run_self_check || local_rc=$?
+  run_external_diagnostics || true
+  return "$local_rc"
 }
 
 cmd_status() {
@@ -1620,10 +1728,10 @@ cmd_status() {
   load_config
   section "当前配置"
   if [ "$WARP_MODE" = "wireguard" ]; then
-    info_line "工作模式：WireGuard 高级模式，Google / YouTube / Gemini 的 TCP+UDP 走 WARP"
+    info_line "工作模式：WireGuard 默认模式，Google IPv4、IPv6、TCP、UDP 和 QUIC 走 WARP"
     info_line "WireGuard 网卡：${WG_IFACE}"
   else
-    info_line "工作模式：Socks5 稳定模式，命中规则的 Google IPv4 TCP 走 WARP，UDP/443 阻断后通常回落"
+    info_line "工作模式：Socks5 兼容模式，Google IPv4 TCP 走 WARP，IPv4 UDP/QUIC 使用 VPS 原生出口，Google IPv6 拒绝"
     info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
     info_line "本地转发端口：${REDSOCKS_PORT}"
   fi
@@ -1651,22 +1759,22 @@ cmd_restart() {
     info_line "正在重启 WireGuard WARP 网卡和分流路由，请稍等"
     systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null \
       || die "无法启用 WireGuard 项目服务"
-    restart_wireguard_runtime || die "重启后 WireGuard 出口不可用"
+    restart_wireguard_runtime || die "重启后 WireGuard 本地运行态未就绪"
     systemctl restart warp-vps.service || die "无法重启分流规则服务"
     systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
-    cmd_test
+    run_self_check
     return
   fi
 
   info_line "正在重启 WARP 和本地分流服务，请稍等"
   systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null \
     || die "无法启用 Socks5 项目服务"
-  configure_warp_runtime || die "重启后 Cloudflare WARP SOCKS 不可用"
+  configure_warp_runtime || die "重启后 Cloudflare WARP SOCKS 本地代理未就绪"
   systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
   apply_rules || die "无法重新加载分流规则"
   systemctl restart warp-vps.service || die "无法重启分流规则服务"
   systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
-  cmd_test
+  run_self_check
 }
 
 cmd_setup_wireguard() {
@@ -1809,7 +1917,7 @@ reload_runtime_after_update() {
     systemctl restart warp-vps.service || return 1
     systemctl start warp-vps-health.timer || return 1
   fi
-  "$BIN_PATH" test || return 1
+  "$BIN_PATH" status || return 1
 }
 
 cmd_update() {
@@ -1833,14 +1941,14 @@ cmd_update() {
     restore_update_backup "$backup" || die "更新文件激活失败，且无法恢复旧文件"
     die "更新失败，已恢复旧文件"
   fi
-  ok_line "更新完成，正在运行自检"
+  ok_line "更新完成，正在运行本地自检"
   if reload_runtime_after_update; then
-    ok_line "更新后的链路自检通过"
+    ok_line "更新后的本地运行态自检通过"
     return 0
   fi
 
-  warn_line "更新后自检失败，正在恢复旧版本"
-  restore_update_backup "$backup" || die "更新后自检失败，且无法恢复旧文件"
+  warn_line "更新后本地自检失败，正在恢复旧版本"
+  restore_update_backup "$backup" || die "更新后本地自检失败，且无法恢复旧文件"
   if reload_runtime_after_update; then
     die "更新失败，已恢复旧版本"
   fi
@@ -1886,7 +1994,7 @@ cmd_wait_wireguard() {
   require_root
   load_config
   [ "$WARP_MODE" = "wireguard" ] || die "当前不是 WireGuard 模式"
-  wait_for_wg_ready 90
+  wait_for_wg_ready 20
 }
 
 cmd_logs() {
@@ -2307,8 +2415,8 @@ usage() {
 用法：warp-vps <命令>
 
 常用命令：
-  status          查看中文状态自检
-  test            运行一次中文自检
+  status          快速检查本地运行态
+  test            检查本地运行态并运行非阻塞外部诊断
   restart         重启 WARP 分流链路
   unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
   update          更新脚本和固定规则快照

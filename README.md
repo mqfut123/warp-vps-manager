@@ -1,6 +1,6 @@
 # WARP VPS Manager
 
-只把 Google 相关流量转到 Cloudflare WARP，其他流量继续使用 VPS 原生出口。
+按所选模式处理 Google 官方地址范围，其他流量继续使用 VPS 原生出口。
 
 适合 VPS 原生 IP 无法正常使用 Gemini、Google Search 或 YouTube Premium，又不想修改 Xray、sing-box、Hysteria、3x-ui 配置的情况。
 
@@ -12,7 +12,7 @@
 curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash
 ```
 
-模式选择直接回车时使用 Socks5，端口直接回车时随机选择空闲端口。输错内容会重新询问，不需要重跑脚本。
+首次安装时，模式选择直接回车使用 WireGuard；已有安装会显示当前模式，直接回车保持不变。选择 Socks5 后，端口直接回车时会随机选择空闲端口。输错内容会重新询问，不需要重跑脚本。
 
 如果安装中途失败，处理报错后再次运行同一条命令即可，不需要先卸载。
 
@@ -20,10 +20,22 @@ curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh
 
 | 模式 | 适合谁 | 效果 |
 |---|---|---|
-| Socks5 | 大多数用户，直接选这个 | Google IPv4 TCP 走 WARP。UDP/443 和 Google IPv6 会被阻断，让支持回落的客户端改用 TCP |
-| WireGuard | 需要 UDP 或 QUIC 的用户 | 命中 Google IP 规则的 IPv4、IPv6、TCP 和 UDP 都走 WARP |
+| WireGuard | 大多数用户，直接回车使用 | 命中 Google IP 规则的 IPv4、IPv6、TCP、UDP 和 QUIC 都走 WARP |
+| Socks5 | 只需要兼容代理模式的用户 | Google IPv4 TCP 走 WARP，IPv4 UDP 和 QUIC 使用 VPS 原生出口，Google IPv6 继续拒绝 |
 
 Socks5 对现有网络改动较少。WireGuard 会增加网卡和路由，如果 VPS 已经有 WireGuard 或复杂路由，请先确认不会冲突。
+
+Socks5 无法通过本地代理转发 UDP，因此同一 Google 会话可能同时出现 WARP 和 VPS 原生出口，增加触发 Google 异常流量检查的概率。需要 Google IPv4、IPv6、TCP、UDP 和 QUIC 使用同一 WARP 出口时，请选择 WireGuard。
+
+## 切换模式
+
+重新运行安装命令即可切换模式，不需要先卸载：
+
+```bash
+curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash
+```
+
+安装器会显示当前模式。直接回车保持当前模式；输入 `2` 可从 Socks5 切换到 WireGuard，输入 `1` 可从 WireGuard 切换到 Socks5。切换时会先停用本项目旧模式的服务和分流规则，再安装目标模式所需依赖并启用新规则；不会主动删除另一模式已经安装的系统依赖。
 
 ## 和其他方案的区别
 
@@ -41,9 +53,9 @@ Socks5 对现有网络改动较少。WireGuard 会增加网卡和路由，如果
 
 | 命令 | 用途 |
 |---|---|
-| `warp-vps status` | 查看当前配置和链路状态 |
-| `warp-vps test` | 测试分流是否正常 |
-| `warp-vps unlock-check` | 检测 Gemini 和 YouTube Premium |
+| `warp-vps status` | 查看本地服务、接口、端口和分流规则状态，不依赖外部站点 |
+| `warp-vps test` | 运行分流和外部连通性诊断；外部探测失败只会提示，不改变运行状态 |
+| `warp-vps unlock-check` | 检测当前 IPv4 出口的 Gemini 和 YouTube Premium；安装完成后自动运行，也可手动运行 |
 | `warp-vps restart` | 重启 WARP 分流链路 |
 | `warp-vps update` | 更新脚本和 Google IP 规则 |
 | `warp-vps logs` | 查看最近的服务日志 |
@@ -58,6 +70,8 @@ warp-vps status
 warp-vps logs
 ```
 
+安装程序会在本地配置确认完成后自动运行 `unlock-check`。Google、Cloudflare、DNS 或其他外部目标暂时超时或不可用时，检测结果只作提示，不会把已经完成的安装判为失败，也不会停止服务或撤销分流规则。手动运行 `test` 或 `unlock-check` 同样不会改变项目运行状态。
+
 ## 卸载
 
 直接运行 `warp-vps uninstall`，会询问是否一并卸载相关运行依赖；直接回车默认保留依赖。
@@ -69,7 +83,7 @@ warp-vps logs
 ## 使用前需要知道
 
 - 这是 IP 分流，不是域名识别。Google 调整 IP 后，请运行 `warp-vps update` 获取新规则。
-- Socks5 模式不能转发 UDP。无法回落到 TCP 的客户端可能连接失败。
+- Socks5 模式不能通过 WARP 本地代理转发 UDP。Google IPv4 UDP 和 QUIC 会使用 VPS 原生出口，Google IPv6 仍会被拒绝；如果需要双栈和 UDP 都走 WARP，请使用 WireGuard。
 - 如果系统已经安装 Cloudflare WARP 客户端，Socks5 模式会复用它并切换到本地代理模式。保留依赖卸载不会恢复客户端原来的模式；`all` 会直接卸载该客户端。
 - 卸载时项目文件和脚本创建的 Swap 会移到 `/var/backups/warp-vps-manager/`，不会永久删除。
 
