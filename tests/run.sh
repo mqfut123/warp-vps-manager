@@ -2241,6 +2241,12 @@ test_reinstall_stops_previous_custom_wireguard_runtime() {
     wg_calls="${wg_calls}$*\n"
     return 1
   }
+  nft() {
+    case "$*" in
+      'delete table inet warp_vps'|'list tables') return 0 ;;
+      *) return 1 ;;
+    esac
+  }
   ip() {
     ip_calls="${ip_calls}$*\n"
     case "$*" in
