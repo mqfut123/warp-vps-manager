@@ -867,12 +867,6 @@ restore_project_file() {
   fi
 }
 
-project_unit_stopped_and_disabled() {
-  local unit="$1"
-  ! systemctl is-active --quiet "$unit" \
-    && ! systemctl is-enabled --quiet "$unit"
-}
-
 project_unit_stopped() {
   ! systemctl is-active --quiet "$1"
 }
@@ -926,9 +920,11 @@ EOF
 stop_project_runtime() {
   local runtime_iface="${1:-$WG_IFACE}"
   local runtime_config="${2:-$WG_CONFIG}"
+  local unit
   systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
-  systemctl disable --now warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl disable warp-vps-health.timer >/dev/null 2>&1 || true
   if ! project_unit_stopped warp-vps-health.timer; then
     log "健康检查定时器仍在运行：warp-vps-health.timer"
     return 1
@@ -937,11 +933,16 @@ stop_project_runtime() {
     log "本项目健康检查仍在运行：warp-vps-health.service"
     return 1
   fi
-  systemctl disable --now warp-vps.service >/dev/null 2>&1 || true
-  systemctl disable --now warp-vps-redsocks.service "wg-quick@${runtime_iface}.service" \
-    >/dev/null 2>&1 || true
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  systemctl disable warp-vps.service >/dev/null 2>&1 || true
+  # Either mode-specific backend unit may not exist yet.
+  for unit in warp-vps-redsocks.service "wg-quick@${runtime_iface}.service"; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+  done
   if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ]; then
-    systemctl disable --now warp-svc.service >/dev/null 2>&1 || true
+    systemctl stop warp-svc.service >/dev/null 2>&1 || true
+    systemctl disable warp-svc.service >/dev/null 2>&1 || true
   fi
   if [ -x "$BIN_PATH" ] && [ -r "$CONFIG_FILE" ]; then
     "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
@@ -970,7 +971,6 @@ stop_project_runtime() {
     return 1
   fi
 
-  local unit
   for unit in warp-vps-health.timer warp-vps-health.service warp-vps.service; do
     if ! project_unit_stopped "$unit"; then
       log "本项目服务仍在运行：$unit"
@@ -978,15 +978,24 @@ stop_project_runtime() {
     fi
   done
   for unit in warp-vps-redsocks.service "wg-quick@${runtime_iface}.service"; do
-    if ! project_unit_stopped_and_disabled "$unit"; then
-      log "旧模式服务仍在运行或保持启用：$unit"
+    if ! project_unit_stopped "$unit"; then
+      log "旧模式服务仍在运行：$unit"
+      return 1
+    fi
+    if systemctl is-enabled --quiet "$unit"; then
+      log "旧模式服务仍保持启用：$unit"
       return 1
     fi
   done
-  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ] \
-    && ! project_unit_stopped_and_disabled warp-svc.service; then
-    log "本项目管理的 WARP 服务仍在运行或保持启用：warp-svc.service"
-    return 1
+  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ]; then
+    if ! project_unit_stopped warp-svc.service; then
+      log "本项目管理的 WARP 服务仍在运行：warp-svc.service"
+      return 1
+    fi
+    if systemctl is-enabled --quiet warp-svc.service; then
+      log "本项目管理的 WARP 服务仍保持启用：warp-svc.service"
+      return 1
+    fi
   fi
   if command -v nft >/dev/null 2>&1 && ! project_nft_table_absent; then
     log "本项目 nftables 分流规则仍在生效或状态无法读取"

@@ -1555,33 +1555,51 @@ test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path() {
   WG_IFACE=warp-vps-wg
   stop_project_units_for_uninstall
   assert_contains "$systemctl_calls" \
-    'stop warp-vps-health.timer\nstop warp-vps-health.service\ndisable --now warp-vps-health.timer' \
+    'stop warp-vps-health.timer\nstop warp-vps-health.service\nstop warp-vps-health.timer\ndisable warp-vps-health.timer' \
     'uninstall must quiesce the timer before stopping an in-flight health service' || return 1
-  assert_contains "$systemctl_calls" 'wg-quick@warp-vps-wg.service' \
-    'uninstall must also stop its dedicated WireGuard unit'
+  assert_contains "$systemctl_calls" \
+    'stop warp-vps-redsocks.service\ndisable warp-vps-redsocks.service\nstop wg-quick@warp-vps-wg.service\ndisable wg-quick@warp-vps-wg.service' \
+    'uninstall must stop each backend independently'
 }
 
 test_uninstall_quiesces_health_before_backends() {
   source_without_main "$MANAGER_SCRIPT"
   WG_IFACE=warp-vps-wg
-  local backend_stop_calls=0 health_active=1 systemctl_calls=''
+  local backend_stop_calls=0 health_active=1 redsocks_active=1 redsocks_enabled=1
+  local systemctl_calls='' unexpected_systemctl_calls=0
   local timer_active=1 timer_enabled=1 timer_stuck=0
 
   systemctl() {
     systemctl_calls="${systemctl_calls}$*\n"
     case "$*" in
-      'stop warp-vps-health.timer') timer_active=0 ;;
+      'stop warp-vps-health.timer') [ "$timer_stuck" -eq 1 ] || timer_active=0 ;;
       'stop warp-vps-health.service')
         health_active=0
         timer_active=1
         timer_enabled=1
         ;;
-      'disable --now warp-vps-health.timer')
-        [ "$timer_stuck" -eq 1 ] || timer_active=0
-        timer_enabled=0
-        ;;
-      'disable --now warp-vps.service'|'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service')
+      'disable warp-vps-health.timer') timer_enabled=0 ;;
+      'stop warp-vps.service') backend_stop_calls=$((backend_stop_calls + 1)) ;;
+      'disable warp-vps.service') ;;
+      'stop warp-vps-redsocks.service')
         backend_stop_calls=$((backend_stop_calls + 1))
+        redsocks_active=0
+        ;;
+      'disable warp-vps-redsocks.service') redsocks_enabled=0 ;;
+      'stop wg-quick@warp-vps-wg.service')
+        backend_stop_calls=$((backend_stop_calls + 1))
+        return 5
+        ;;
+      'disable wg-quick@warp-vps-wg.service')
+        return 5
+        ;;
+      'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service')
+        backend_stop_calls=$((backend_stop_calls + 1))
+        return 5
+        ;;
+      *)
+        unexpected_systemctl_calls=$((unexpected_systemctl_calls + 1))
+        return 64
         ;;
     esac
     return 0
@@ -1590,12 +1608,14 @@ test_uninstall_quiesces_health_before_backends() {
     case "$1" in
       warp-vps-health.timer) [ "$timer_active" -eq 1 ] ;;
       warp-vps-health.service) [ "$health_active" -eq 1 ] ;;
+      warp-vps-redsocks.service) [ "$redsocks_active" -eq 1 ] ;;
       *) return 1 ;;
     esac
   }
   uninstall_unit_is_enabled() {
     case "$1" in
       warp-vps-health.timer) [ "$timer_enabled" -eq 1 ] ;;
+      warp-vps-redsocks.service) [ "$redsocks_enabled" -eq 1 ] ;;
       *) return 1 ;;
     esac
   }
@@ -1605,19 +1625,30 @@ test_uninstall_quiesces_health_before_backends() {
     return 1
   }
   assert_contains "$systemctl_calls" \
-    'stop warp-vps-health.timer\nstop warp-vps-health.service\ndisable --now warp-vps-health.timer' \
+    'stop warp-vps-health.timer\nstop warp-vps-health.service\nstop warp-vps-health.timer\ndisable warp-vps-health.timer' \
     'uninstall must stop the timer again after the healer exits' || return 1
-  assert_eq '2' "$backend_stop_calls" \
+  assert_contains "$systemctl_calls" \
+    'stop warp-vps-redsocks.service\ndisable warp-vps-redsocks.service\nstop wg-quick@warp-vps-wg.service\ndisable wg-quick@warp-vps-wg.service' \
+    'a missing WireGuard unit must not prevent an installed redsocks unit from stopping' || return 1
+  assert_not_contains "$systemctl_calls" \
+    'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service' \
+    'uninstall must not batch an installed backend with a potentially missing backend' || return 1
+  assert_eq '3' "$backend_stop_calls" \
     'uninstall may stop common and backend units only after health automation is quiescent' || return 1
+  assert_eq '0' "$unexpected_systemctl_calls" \
+    'uninstall regression must model every systemctl operation' || return 1
 
   timer_active=1
   timer_enabled=1
   health_active=1
   timer_stuck=1
+  backend_stop_calls=0
   if ( stop_project_units_for_uninstall >/dev/null 2>&1 ); then
     fail 'uninstall must fail before backend teardown when the timer remains active'
     return 1
   fi
+  assert_eq '0' "$backend_stop_calls" \
+    'uninstall must not touch backends while health automation remains active'
 }
 
 test_uninstall_scope_is_explicit_and_vnc_safe() {
@@ -1943,6 +1974,74 @@ test_all_dependency_packages_are_explicit_and_scoped() {
   assert_not_contains "$package_calls" ' autoremove ' 'RPM all uninstall must not run an autoremove command'
 }
 
+test_dependency_services_stop_independently() {
+  source_without_main "$MANAGER_SCRIPT"
+  local dependency_calls=0 redsocks_active=0 redsocks_missing=1
+  local systemctl_calls='' unexpected_systemctl_calls=0 warp_active=1 warp_missing=0
+
+  systemctl() {
+    systemctl_calls="${systemctl_calls}$*\n"
+    case "$*" in
+      'stop warp-svc.service')
+        [ "$warp_missing" -eq 1 ] && return 5
+        warp_active=0
+        ;;
+      'disable warp-svc.service') [ "$warp_missing" -eq 0 ] || return 5 ;;
+      'stop redsocks.service')
+        [ "$redsocks_missing" -eq 1 ] && return 5
+        redsocks_active=0
+        ;;
+      'disable redsocks.service') [ "$redsocks_missing" -eq 0 ] || return 5 ;;
+      'disable --now warp-svc.service redsocks.service') return 5 ;;
+      *)
+        unexpected_systemctl_calls=$((unexpected_systemctl_calls + 1))
+        return 64
+        ;;
+    esac
+    return 0
+  }
+  uninstall_unit_is_active() {
+    case "$1" in
+      warp-svc.service) [ "$warp_missing" -eq 0 ] && [ "$warp_active" -eq 1 ] ;;
+      redsocks.service) [ "$redsocks_missing" -eq 0 ] && [ "$redsocks_active" -eq 1 ] ;;
+      *) return 1 ;;
+    esac
+  }
+  command() {
+    case "$*" in
+      '-v apt-get'|'-v dpkg-query') return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  uninstall_apt_dependencies() { dependency_calls=$((dependency_calls + 1)); }
+
+  uninstall_project_dependencies >/dev/null || {
+    fail 'an installed warp-svc must stop when the vendor redsocks unit is missing'
+    return 1
+  }
+  assert_contains "$systemctl_calls" \
+    'stop warp-svc.service\ndisable warp-svc.service\nstop redsocks.service\ndisable redsocks.service' \
+    'dependency services must stop independently' || return 1
+  assert_not_contains "$systemctl_calls" 'disable --now warp-svc.service redsocks.service' \
+    'a missing dependency service must not poison another service stop' || return 1
+  assert_eq '0' "$unexpected_systemctl_calls" \
+    'dependency regression must model every systemctl operation' || return 1
+
+  systemctl_calls=''
+  warp_missing=1
+  warp_active=0
+  redsocks_missing=0
+  redsocks_active=1
+  uninstall_project_dependencies >/dev/null || {
+    fail 'an installed vendor redsocks service must stop when warp-svc is missing'
+    return 1
+  }
+  assert_eq '2' "$dependency_calls" \
+    'both missing-peer directions must proceed to package removal' || return 1
+  assert_eq '0' "$unexpected_systemctl_calls" \
+    'reverse dependency regression must model every systemctl operation'
+}
+
 test_dependency_uninstall_requires_absent_postcondition() {
   source_without_main "$MANAGER_SCRIPT"
 
@@ -2153,39 +2252,73 @@ test_reinstall_rejects_residual_socks_rules() {
   }
 }
 
-test_reinstall_quiesces_health_without_enabled_state_blocker() {
+test_reinstall_quiesces_health_and_optional_backends() {
   source_without_main "$INSTALL_SCRIPT"
   PREVIOUS_MODE=socks
   MANAGED_WARP_SVC_VALUE=0
   BIN_PATH=/path/that/does/not/exist
-  local backend_enabled=0 common_stop_calls=0 health_active=1 health_stuck=0
-  local log_output='' redsocks_active=0 systemctl_calls='' timer_active=1 timer_stuck=0
-  local wg_active=0 wg_enabled=0
+  local common_stop_calls=0 health_active=1 health_stuck=0 log_output=''
+  local redsocks_active=1 redsocks_disable_stuck=0 redsocks_enabled=1 redsocks_missing=0
+  local redsocks_stop_stuck=0
+  local systemctl_calls='' timer_active=1 timer_stuck=0 unexpected_systemctl_calls=0
+  local wg_active=0 wg_disable_stuck=0 wg_enabled=0 wg_missing=1 wg_stop_stuck=0
 
   systemctl() {
     systemctl_calls="${systemctl_calls}$*\n"
     case "$*" in
-      'stop warp-vps-health.timer') timer_active=0; return 0 ;;
+      'stop warp-vps-health.timer')
+        [ "$timer_stuck" -eq 1 ] || timer_active=0
+        return 0
+        ;;
       'stop warp-vps-health.service')
         [ "$health_stuck" -eq 1 ] || health_active=0
         timer_active=1
         return 0
         ;;
-      'disable --now warp-vps-health.timer')
-        [ "$timer_stuck" -eq 1 ] || timer_active=0
+      'disable warp-vps-health.timer') return 0 ;;
+      'stop warp-vps.service') common_stop_calls=$((common_stop_calls + 1)); return 0 ;;
+      'disable warp-vps.service') return 0 ;;
+      'stop warp-vps-redsocks.service')
+        [ "$redsocks_missing" -eq 1 ] && return 5
+        [ "$redsocks_stop_stuck" -eq 1 ] || redsocks_active=0
         return 0
         ;;
-      'disable --now warp-vps.service') common_stop_calls=$((common_stop_calls + 1)); return 0 ;;
-      'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service') return 0 ;;
+      'disable warp-vps-redsocks.service')
+        [ "$redsocks_missing" -eq 1 ] && return 5
+        [ "$redsocks_disable_stuck" -eq 1 ] || redsocks_enabled=0
+        return 0
+        ;;
+      'stop wg-quick@warp-vps-wg.service')
+        [ "$wg_missing" -eq 1 ] && return 5
+        [ "$wg_stop_stuck" -eq 1 ] || wg_active=0
+        return 0
+        ;;
+      'disable wg-quick@warp-vps-wg.service')
+        [ "$wg_missing" -eq 1 ] && return 5
+        [ "$wg_disable_stuck" -eq 1 ] || wg_enabled=0
+        return 0
+        ;;
+      'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service') return 5 ;;
       'is-active --quiet warp-vps-health.timer') [ "$timer_active" -eq 1 ] ;;
       'is-active --quiet warp-vps-health.service') [ "$health_active" -eq 1 ] ;;
-      'is-active --quiet warp-vps-redsocks.service') [ "$redsocks_active" -eq 1 ] ;;
-      'is-active --quiet wg-quick@warp-vps-wg.service') [ "$wg_active" -eq 1 ] ;;
+      'is-active --quiet warp-vps-redsocks.service')
+        [ "$redsocks_missing" -eq 0 ] && [ "$redsocks_active" -eq 1 ]
+        ;;
+      'is-active --quiet wg-quick@warp-vps-wg.service')
+        [ "$wg_missing" -eq 0 ] && [ "$wg_active" -eq 1 ]
+        ;;
       'is-active --quiet '*) return 1 ;;
       'is-enabled --quiet warp-vps-health.timer'|'is-enabled --quiet warp-vps.service') return 0 ;;
-      'is-enabled --quiet warp-vps-redsocks.service') [ "$backend_enabled" -eq 1 ] ;;
-      'is-enabled --quiet wg-quick@warp-vps-wg.service') [ "$wg_enabled" -eq 1 ] ;;
-      *) return 0 ;;
+      'is-enabled --quiet warp-vps-redsocks.service')
+        [ "$redsocks_missing" -eq 0 ] && [ "$redsocks_enabled" -eq 1 ]
+        ;;
+      'is-enabled --quiet wg-quick@warp-vps-wg.service')
+        [ "$wg_missing" -eq 0 ] && [ "$wg_enabled" -eq 1 ]
+        ;;
+      *)
+        unexpected_systemctl_calls=$((unexpected_systemctl_calls + 1))
+        return 64
+        ;;
     esac
   }
   log() { log_output="${log_output}$*\n"; }
@@ -2208,8 +2341,14 @@ test_reinstall_quiesces_health_without_enabled_state_blocker() {
     return 1
   }
   assert_contains "$systemctl_calls" \
-    'stop warp-vps-health.timer\nstop warp-vps-health.service\ndisable --now warp-vps-health.timer' \
+    'stop warp-vps-health.timer\nstop warp-vps-health.service\nstop warp-vps-health.timer\ndisable warp-vps-health.timer' \
     'the timer must stop before the healer and be stopped again after the healer exits' || return 1
+  assert_contains "$systemctl_calls" \
+    'stop warp-vps-redsocks.service\ndisable warp-vps-redsocks.service\nstop wg-quick@warp-vps-wg.service\ndisable wg-quick@warp-vps-wg.service' \
+    'an installed Socks backend must stop before the missing WireGuard unit is handled' || return 1
+  assert_not_contains "$systemctl_calls" \
+    'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service' \
+    'an installed backend must not share a systemctl batch with a potentially missing backend' || return 1
   assert_not_contains "$systemctl_calls" 'is-enabled --quiet warp-vps-health.timer' \
     'the shared health timer enabled state must not be a transition blocker' || return 1
   assert_not_contains "$systemctl_calls" 'is-enabled --quiet warp-vps.service' \
@@ -2219,7 +2358,52 @@ test_reinstall_quiesces_health_without_enabled_state_blocker() {
 
   timer_active=1
   health_active=1
+  redsocks_active=1
+  redsocks_enabled=0
+  stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null || {
+    fail 'an active but already disabled Socks backend must still be stopped'
+    return 1
+  }
+
+  timer_active=1
+  health_active=1
+  PREVIOUS_MODE=wireguard
+  redsocks_missing=1
+  wg_missing=0
+  wg_active=1
+  wg_enabled=1
+  stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null || {
+    fail 'an installed WireGuard backend must stop when the redsocks unit is missing'
+    return 1
+  }
+
+  timer_active=1
+  health_active=1
+  PREVIOUS_MODE=socks
+  redsocks_missing=0
+  redsocks_active=1
+  redsocks_enabled=1
+  wg_active=1
+  wg_enabled=1
+  stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null || {
+    fail 'cleanup must independently stop both backends after a partial mode switch'
+    return 1
+  }
+
+  timer_active=1
+  health_active=1
+  redsocks_missing=1
+  wg_missing=1
+  stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null || {
+    fail 'missing optional backend units must be an idempotent cleanup success'
+    return 1
+  }
+
+  timer_active=1
+  health_active=1
   timer_stuck=1
+  redsocks_missing=0
+  wg_missing=1
   common_stop_calls=0
   log_output=''
   if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
@@ -2250,6 +2434,8 @@ test_reinstall_quiesces_health_without_enabled_state_blocker() {
   health_active=1
   health_stuck=0
   redsocks_active=1
+  redsocks_enabled=0
+  redsocks_stop_stuck=1
   log_output=''
   if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
     fail 'an active old redsocks backend must block a mode switch'
@@ -2257,11 +2443,15 @@ test_reinstall_quiesces_health_without_enabled_state_blocker() {
   fi
   assert_contains "$log_output" 'warp-vps-redsocks.service' \
     'an active redsocks failure must identify the old backend' || return 1
+  assert_contains "$log_output" '仍在运行' \
+    'an active redsocks failure must report the active state' || return 1
 
   timer_active=1
   health_active=1
+  redsocks_stop_stuck=0
   redsocks_active=0
-  backend_enabled=1
+  redsocks_enabled=1
+  redsocks_disable_stuck=1
   log_output=''
   if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
     fail 'an enabled old redsocks backend must still block a mode switch'
@@ -2269,11 +2459,16 @@ test_reinstall_quiesces_health_without_enabled_state_blocker() {
   fi
   assert_contains "$log_output" 'warp-vps-redsocks.service' \
     'an enabled redsocks failure must identify the old backend' || return 1
+  assert_contains "$log_output" '仍保持启用' \
+    'an enabled redsocks failure must report the enabled state' || return 1
 
   timer_active=1
   health_active=1
-  backend_enabled=0
+  redsocks_disable_stuck=0
+  redsocks_enabled=0
+  wg_missing=0
   wg_active=1
+  wg_stop_stuck=1
   log_output=''
   if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
     fail 'an active old WireGuard backend must block a mode switch'
@@ -2284,15 +2479,19 @@ test_reinstall_quiesces_health_without_enabled_state_blocker() {
 
   timer_active=1
   health_active=1
+  wg_stop_stuck=0
   wg_active=0
   wg_enabled=1
+  wg_disable_stuck=1
   log_output=''
   if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
     fail 'an enabled old WireGuard backend must block a mode switch'
     return 1
   fi
   assert_contains "$log_output" 'wg-quick@warp-vps-wg.service' \
-    'an enabled WireGuard failure must identify the old backend'
+    'an enabled WireGuard failure must identify the old backend' || return 1
+  assert_eq '0' "$unexpected_systemctl_calls" \
+    'mode-switch regression must model every systemctl operation'
 }
 
 test_main_executes_bidirectional_mode_switches() {
@@ -2612,13 +2811,14 @@ run_test 'uninstall state queries fail closed' test_uninstall_state_queries_fail
 run_test 'missing uninstall units are already disabled' test_uninstall_missing_unit_is_already_disabled
 run_test 'uninstall teardown precedes dependencies and file moves' test_uninstall_orders_teardown_before_dependencies_and_files
 run_test 'all dependency packages are explicit and scoped' test_all_dependency_packages_are_explicit_and_scoped
+run_test 'dependency services stop independently' test_dependency_services_stop_independently
 run_test 'dependency uninstall requires an absent postcondition' test_dependency_uninstall_requires_absent_postcondition
 run_test 'RPM dependency postcondition parsing fails closed' test_rpm_dependency_postcondition_parser_fails_closed
 run_test 'uninstall scope controls dependency and fallback cleanup' test_uninstall_scope_controls_dependency_and_fallback_cleanup
 run_test 'dependency failure stops before file moves' test_dependency_failure_stops_before_file_moves
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
 run_test 'reinstall rejects residual Socks rules' test_reinstall_rejects_residual_socks_rules
-run_test 'reinstall quiesces health without an enabled-state blocker' test_reinstall_quiesces_health_without_enabled_state_blocker
+run_test 'reinstall quiesces health and optional backends' test_reinstall_quiesces_health_and_optional_backends
 run_test 'main executes both mode switches and ignores unlock failures' test_main_executes_bidirectional_mode_switches
 run_test 'mode switching reuses the main install path' test_reinstall_mode_switch_uses_the_main_install_path
 run_test 'reinstall stops the previous custom WireGuard runtime' test_reinstall_stops_previous_custom_wireguard_runtime

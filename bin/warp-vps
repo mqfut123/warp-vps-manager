@@ -2181,10 +2181,12 @@ verify_project_units_for_uninstall() {
 }
 
 stop_project_units_for_uninstall() {
+  local unit
   local wg_unit="wg-quick@${WG_IFACE}.service"
   systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
-  systemctl disable --now warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl disable warp-vps-health.timer >/dev/null 2>&1 || true
   if uninstall_unit_is_active warp-vps-health.timer; then
     die "健康检查定时器仍在运行，卸载已中止：warp-vps-health.timer"
   fi
@@ -2194,8 +2196,13 @@ stop_project_units_for_uninstall() {
   if uninstall_unit_is_enabled warp-vps-health.timer; then
     die "健康检查定时器仍会开机启动，卸载已中止：warp-vps-health.timer"
   fi
-  systemctl disable --now warp-vps.service >/dev/null 2>&1 || true
-  systemctl disable --now warp-vps-redsocks.service "$wg_unit" >/dev/null 2>&1 || true
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  systemctl disable warp-vps.service >/dev/null 2>&1 || true
+  # Either mode-specific backend unit may be absent; keep their operations independent.
+  for unit in warp-vps-redsocks.service "$wg_unit"; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+  done
   verify_project_units_for_uninstall
 }
 
@@ -2324,8 +2331,10 @@ uninstall_rpm_dependencies() {
 uninstall_project_dependencies() {
   local unit
   info_line "正在卸载相关运行依赖；不会主动执行 autoremove，共享基础包不在直接卸载清单"
-  systemctl disable --now warp-svc.service redsocks.service >/dev/null 2>&1 || true
+  # Either dependency service may already be absent.
   for unit in warp-svc.service redsocks.service; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
     if uninstall_unit_is_active "$unit"; then
       die "依赖服务仍在运行，不能安全卸载：$unit"
     fi
