@@ -1554,10 +1554,70 @@ test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path() {
   uninstall_unit_is_enabled() { return 1; }
   WG_IFACE=warp-vps-wg
   stop_project_units_for_uninstall
-  assert_contains "$systemctl_calls" 'stop warp-vps-health.timer warp-vps-health.service' \
-    'uninstall must stop an in-flight health service' || return 1
+  assert_contains "$systemctl_calls" \
+    'stop warp-vps-health.timer\nstop warp-vps-health.service\ndisable --now warp-vps-health.timer' \
+    'uninstall must quiesce the timer before stopping an in-flight health service' || return 1
   assert_contains "$systemctl_calls" 'wg-quick@warp-vps-wg.service' \
     'uninstall must also stop its dedicated WireGuard unit'
+}
+
+test_uninstall_quiesces_health_before_backends() {
+  source_without_main "$MANAGER_SCRIPT"
+  WG_IFACE=warp-vps-wg
+  local backend_stop_calls=0 health_active=1 systemctl_calls=''
+  local timer_active=1 timer_enabled=1 timer_stuck=0
+
+  systemctl() {
+    systemctl_calls="${systemctl_calls}$*\n"
+    case "$*" in
+      'stop warp-vps-health.timer') timer_active=0 ;;
+      'stop warp-vps-health.service')
+        health_active=0
+        timer_active=1
+        timer_enabled=1
+        ;;
+      'disable --now warp-vps-health.timer')
+        [ "$timer_stuck" -eq 1 ] || timer_active=0
+        timer_enabled=0
+        ;;
+      'disable --now warp-vps.service'|'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service')
+        backend_stop_calls=$((backend_stop_calls + 1))
+        ;;
+    esac
+    return 0
+  }
+  uninstall_unit_is_active() {
+    case "$1" in
+      warp-vps-health.timer) [ "$timer_active" -eq 1 ] ;;
+      warp-vps-health.service) [ "$health_active" -eq 1 ] ;;
+      *) return 1 ;;
+    esac
+  }
+  uninstall_unit_is_enabled() {
+    case "$1" in
+      warp-vps-health.timer) [ "$timer_enabled" -eq 1 ] ;;
+      *) return 1 ;;
+    esac
+  }
+
+  stop_project_units_for_uninstall || {
+    fail 'uninstall should quiesce a healer that reactivates its timer while exiting'
+    return 1
+  }
+  assert_contains "$systemctl_calls" \
+    'stop warp-vps-health.timer\nstop warp-vps-health.service\ndisable --now warp-vps-health.timer' \
+    'uninstall must stop the timer again after the healer exits' || return 1
+  assert_eq '2' "$backend_stop_calls" \
+    'uninstall may stop common and backend units only after health automation is quiescent' || return 1
+
+  timer_active=1
+  timer_enabled=1
+  health_active=1
+  timer_stuck=1
+  if ( stop_project_units_for_uninstall >/dev/null 2>&1 ); then
+    fail 'uninstall must fail before backend teardown when the timer remains active'
+    return 1
+  fi
 }
 
 test_uninstall_scope_is_explicit_and_vnc_safe() {
@@ -2093,6 +2153,148 @@ test_reinstall_rejects_residual_socks_rules() {
   }
 }
 
+test_reinstall_quiesces_health_without_enabled_state_blocker() {
+  source_without_main "$INSTALL_SCRIPT"
+  PREVIOUS_MODE=socks
+  MANAGED_WARP_SVC_VALUE=0
+  BIN_PATH=/path/that/does/not/exist
+  local backend_enabled=0 common_stop_calls=0 health_active=1 health_stuck=0
+  local log_output='' redsocks_active=0 systemctl_calls='' timer_active=1 timer_stuck=0
+  local wg_active=0 wg_enabled=0
+
+  systemctl() {
+    systemctl_calls="${systemctl_calls}$*\n"
+    case "$*" in
+      'stop warp-vps-health.timer') timer_active=0; return 0 ;;
+      'stop warp-vps-health.service')
+        [ "$health_stuck" -eq 1 ] || health_active=0
+        timer_active=1
+        return 0
+        ;;
+      'disable --now warp-vps-health.timer')
+        [ "$timer_stuck" -eq 1 ] || timer_active=0
+        return 0
+        ;;
+      'disable --now warp-vps.service') common_stop_calls=$((common_stop_calls + 1)); return 0 ;;
+      'disable --now warp-vps-redsocks.service wg-quick@warp-vps-wg.service') return 0 ;;
+      'is-active --quiet warp-vps-health.timer') [ "$timer_active" -eq 1 ] ;;
+      'is-active --quiet warp-vps-health.service') [ "$health_active" -eq 1 ] ;;
+      'is-active --quiet warp-vps-redsocks.service') [ "$redsocks_active" -eq 1 ] ;;
+      'is-active --quiet wg-quick@warp-vps-wg.service') [ "$wg_active" -eq 1 ] ;;
+      'is-active --quiet '*) return 1 ;;
+      'is-enabled --quiet warp-vps-health.timer'|'is-enabled --quiet warp-vps.service') return 0 ;;
+      'is-enabled --quiet warp-vps-redsocks.service') [ "$backend_enabled" -eq 1 ] ;;
+      'is-enabled --quiet wg-quick@warp-vps-wg.service') [ "$wg_enabled" -eq 1 ] ;;
+      *) return 0 ;;
+    esac
+  }
+  log() { log_output="${log_output}$*\n"; }
+  nft() {
+    case "$*" in
+      'delete table inet warp_vps'|'list tables') return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  ip() {
+    case "$*" in
+      'link show warp-vps-wg') return 1 ;;
+      '-o link show') printf '1: lo: <LOOPBACK>\n'; return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null || {
+    fail 'a stopped shared health timer must not block a mode switch only because it remains enabled'
+    return 1
+  }
+  assert_contains "$systemctl_calls" \
+    'stop warp-vps-health.timer\nstop warp-vps-health.service\ndisable --now warp-vps-health.timer' \
+    'the timer must stop before the healer and be stopped again after the healer exits' || return 1
+  assert_not_contains "$systemctl_calls" 'is-enabled --quiet warp-vps-health.timer' \
+    'the shared health timer enabled state must not be a transition blocker' || return 1
+  assert_not_contains "$systemctl_calls" 'is-enabled --quiet warp-vps.service' \
+    'the shared routing service enabled state must not be a transition blocker' || return 1
+  assert_eq '1' "$common_stop_calls" \
+    'shared routing must stop only after health automation is quiescent' || return 1
+
+  timer_active=1
+  health_active=1
+  timer_stuck=1
+  common_stop_calls=0
+  log_output=''
+  if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
+    fail 'an active health timer after the second stop must block a mode switch'
+    return 1
+  fi
+  assert_eq '0' "$common_stop_calls" \
+    'the installer must not touch the data plane while health automation can still revive it' || return 1
+  assert_contains "$log_output" 'warp-vps-health.timer' \
+    'an active timer failure must identify the timer' || return 1
+
+  timer_active=1
+  health_active=1
+  timer_stuck=0
+  health_stuck=1
+  common_stop_calls=0
+  log_output=''
+  if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
+    fail 'an active health service after the stop must block a mode switch'
+    return 1
+  fi
+  assert_eq '0' "$common_stop_calls" \
+    'the installer must not touch the data plane while the healer is still active' || return 1
+  assert_contains "$log_output" 'warp-vps-health.service' \
+    'an active healer failure must identify the health service' || return 1
+
+  timer_active=1
+  health_active=1
+  health_stuck=0
+  redsocks_active=1
+  log_output=''
+  if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
+    fail 'an active old redsocks backend must block a mode switch'
+    return 1
+  fi
+  assert_contains "$log_output" 'warp-vps-redsocks.service' \
+    'an active redsocks failure must identify the old backend' || return 1
+
+  timer_active=1
+  health_active=1
+  redsocks_active=0
+  backend_enabled=1
+  log_output=''
+  if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
+    fail 'an enabled old redsocks backend must still block a mode switch'
+    return 1
+  fi
+  assert_contains "$log_output" 'warp-vps-redsocks.service' \
+    'an enabled redsocks failure must identify the old backend' || return 1
+
+  timer_active=1
+  health_active=1
+  backend_enabled=0
+  wg_active=1
+  log_output=''
+  if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
+    fail 'an active old WireGuard backend must block a mode switch'
+    return 1
+  fi
+  assert_contains "$log_output" 'wg-quick@warp-vps-wg.service' \
+    'an active WireGuard failure must identify the old backend' || return 1
+
+  timer_active=1
+  health_active=1
+  wg_active=0
+  wg_enabled=1
+  log_output=''
+  if stop_project_runtime warp-vps-wg /etc/wireguard/warp-vps-wg.conf >/dev/null; then
+    fail 'an enabled old WireGuard backend must block a mode switch'
+    return 1
+  fi
+  assert_contains "$log_output" 'wg-quick@warp-vps-wg.service' \
+    'an enabled WireGuard failure must identify the old backend'
+}
+
 test_main_executes_bidirectional_mode_switches() {
   source_without_main "$INSTALL_SCRIPT"
   local target_mode previous_mode unlock_rc events
@@ -2400,6 +2602,7 @@ run_test 'install unlock check is post-success and nonblocking' test_install_unl
 run_test 'Google rule generation validates cloud subtraction' test_generator_validates_google_cloud_subtraction
 run_test 'restart update and heal restore required units' test_restart_and_update_restore_required_units
 run_test 'uninstall clears both rule backends and keeps custom WireGuard paths' test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path
+run_test 'uninstall quiesces health before backend teardown' test_uninstall_quiesces_health_before_backends
 run_test 'uninstall scopes are explicit and VNC safe' test_uninstall_scope_is_explicit_and_vnc_safe
 run_test 'uninstall deactivation reaches inactive state' test_uninstall_deactivation_reaches_inactive_state
 run_test 'uninstall rejects rules that remain active' test_uninstall_rejects_rules_that_remain_active
@@ -2415,6 +2618,7 @@ run_test 'uninstall scope controls dependency and fallback cleanup' test_uninsta
 run_test 'dependency failure stops before file moves' test_dependency_failure_stops_before_file_moves
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
 run_test 'reinstall rejects residual Socks rules' test_reinstall_rejects_residual_socks_rules
+run_test 'reinstall quiesces health without an enabled-state blocker' test_reinstall_quiesces_health_without_enabled_state_blocker
 run_test 'main executes both mode switches and ignores unlock failures' test_main_executes_bidirectional_mode_switches
 run_test 'mode switching reuses the main install path' test_reinstall_mode_switch_uses_the_main_install_path
 run_test 'reinstall stops the previous custom WireGuard runtime' test_reinstall_stops_previous_custom_wireguard_runtime

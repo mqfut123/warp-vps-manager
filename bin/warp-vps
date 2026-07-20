@@ -2182,22 +2182,20 @@ verify_project_units_for_uninstall() {
 
 stop_project_units_for_uninstall() {
   local wg_unit="wg-quick@${WG_IFACE}.service"
-  local -a stop_units=(
-    warp-vps-health.timer
-    warp-vps-health.service
-    warp-vps.service
-    warp-vps-redsocks.service
-    "$wg_unit"
-  )
-  local -a enabled_units=(
-    warp-vps-health.timer
-    warp-vps.service
-    warp-vps-redsocks.service
-    "$wg_unit"
-  )
-
-  systemctl stop "${stop_units[@]}" >/dev/null 2>&1 || true
-  systemctl disable "${enabled_units[@]}" >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
+  systemctl disable --now warp-vps-health.timer >/dev/null 2>&1 || true
+  if uninstall_unit_is_active warp-vps-health.timer; then
+    die "健康检查定时器仍在运行，卸载已中止：warp-vps-health.timer"
+  fi
+  if uninstall_unit_is_active warp-vps-health.service; then
+    die "健康检查仍在运行，卸载已中止：warp-vps-health.service"
+  fi
+  if uninstall_unit_is_enabled warp-vps-health.timer; then
+    die "健康检查定时器仍会开机启动，卸载已中止：warp-vps-health.timer"
+  fi
+  systemctl disable --now warp-vps.service >/dev/null 2>&1 || true
+  systemctl disable --now warp-vps-redsocks.service "$wg_unit" >/dev/null 2>&1 || true
   verify_project_units_for_uninstall
 }
 
