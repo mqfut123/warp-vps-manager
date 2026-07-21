@@ -20,6 +20,8 @@ SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
 APT_LOCK_TIMEOUT=1200
+DOWNLOAD_CONNECT_TIMEOUT=10
+DOWNLOAD_MAX_TIME=120
 REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
 REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
 REDSOCKS_SOURCE_URL="https://github.com/darkk/redsocks/archive/${REDSOCKS_SOURCE_COMMIT}.tar.gz"
@@ -51,6 +53,10 @@ TARGET_PREP_STARTED=0
 PREVIOUS_HEALTH_TIMER_ACTIVE=0
 OPERATION_LOCK_HELD=0
 MENU_ACTION_RC=0
+INSTALL_NONINTERACTIVE=0
+INSTALL_MODE_OPTION=""
+INSTALL_SWAP_OPTION=""
+INSTALL_SOCKS_PORT_OPTION=""
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -64,6 +70,10 @@ read_input() {
     # shellcheck disable=SC2229
     IFS= read -r "$var_name"
   fi
+}
+
+interactive_terminal_available() {
+  [ -t 0 ] || [ -t 1 ] || [ -t 2 ]
 }
 
 require_root() {
@@ -291,8 +301,40 @@ prompt_swap_creation() {
   done
 }
 
+collect_noninteractive_swap_choice() {
+  local swap_total selected max_mb swap_gb
+  SWAP_ACTION="none"
+  SWAP_SIZE_MB=0
+  swap_total="$(swap_total_mb)"
+  if [ "$swap_total" -gt 0 ]; then
+    return 0
+  fi
+
+  case "${INSTALL_SWAP_OPTION:-auto}" in
+    auto) selected=1024 ;;
+    none)
+      log "非交互安装已选择不创建 Swap"
+      return 0
+      ;;
+    *)
+      swap_gb=$((10#$INSTALL_SWAP_OPTION))
+      selected=$((swap_gb * 1024))
+      ;;
+  esac
+
+  max_mb="$(max_creatable_swap_mb)"
+  [ "$selected" -le "$max_mb" ] \
+    || die "磁盘空间不足，最多建议创建 $(format_gb "$max_mb") Swap；可使用 --swap none 明确跳过"
+  SWAP_ACTION="create"
+  SWAP_SIZE_MB="$selected"
+}
+
 collect_swap_choice() {
   local mem_mb swap_total swap_free total_available choice
+  if [ "$INSTALL_NONINTERACTIVE" -eq 1 ]; then
+    collect_noninteractive_swap_choice
+    return 0
+  fi
   SWAP_ACTION="none"
   SWAP_SIZE_MB=0
   mem_mb="$(mem_available_mb)"
@@ -329,6 +371,9 @@ apply_swap_choice() {
     if create_swap_file "$SWAP_SIZE_MB"; then
       return 0
     fi
+    if [ "$INSTALL_NONINTERACTIVE" -eq 1 ]; then
+      die "Swap 创建失败，已撤销本次创建"
+    fi
     printf 'Swap 创建失败，已撤销本次创建。请重新选择。\n'
     mem_mb="$(mem_available_mb)"
     prompt_swap_creation "$mem_mb"
@@ -359,7 +404,8 @@ pkg_install_apt() {
   fi
 
   install -d -m 0755 /usr/share/keyrings
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+  curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+    https://pkg.cloudflareclient.com/pubkey.gpg \
     | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
   local codename="$OS_CODENAME"
@@ -434,7 +480,8 @@ build_redsocks_from_source() {
   install -d -m 0755 "$build_root"
 
   log "正在下载固定版本 redsocks 源码：${REDSOCKS_SOURCE_COMMIT}"
-  curl -LfsS "$REDSOCKS_SOURCE_URL" -o "$archive"
+  curl -LfsS --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+    "$REDSOCKS_SOURCE_URL" -o "$archive"
 
   tar -xzf "$archive" -C "$build_root"
   src="${build_root}/redsocks-${REDSOCKS_SOURCE_COMMIT}"
@@ -489,6 +536,7 @@ rpm_install_redsocks() {
 pkg_install_rpm() {
   local mode="$1"
   local manager="$2"
+  local key_file key_tmp repo_file repo_tmp
   if [ "$mode" = "wireguard" ]; then
     "$manager" install -y curl ca-certificates coreutils iproute python3 wireguard-tools
     return
@@ -500,9 +548,24 @@ pkg_install_rpm() {
   "$manager" install -y curl ca-certificates coreutils nftables iproute python3
   rpm_install_redsocks "$manager"
   if ! warp_client_complete; then
-    rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
-    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
-      -o /etc/yum.repos.d/cloudflare-warp.repo
+    key_file="${STATE_DIR}/cloudflare-warp-pubkey.gpg"
+    key_tmp="${key_file}.new"
+    repo_file=/etc/yum.repos.d/cloudflare-warp.repo
+    repo_tmp="${repo_file}.new"
+    install -d -m 0755 "$STATE_DIR" /etc/yum.repos.d
+    curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+      https://pkg.cloudflareclient.com/pubkey.gpg \
+      -o "$key_tmp" \
+      || die "Cloudflare WARP RPM 公钥下载失败"
+    rpm --import "$key_tmp" || die "Cloudflare WARP RPM 公钥导入失败"
+    chmod 0644 "$key_tmp"
+    mv "$key_tmp" "$key_file" || die "无法保存 Cloudflare WARP RPM 公钥"
+    curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+      https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
+      -o "$repo_tmp" \
+      || die "Cloudflare WARP RPM 软件源下载失败"
+    chmod 0644 "$repo_tmp"
+    mv "$repo_tmp" "$repo_file" || die "无法启用 Cloudflare WARP RPM 软件源"
     if rpm -q cloudflare-warp >/dev/null 2>&1; then
       "$manager" reinstall -y cloudflare-warp
     else
@@ -534,13 +597,13 @@ install_dependencies() {
   command -v curl >/dev/null 2>&1 || die "依赖安装后仍找不到 curl"
   command -v ip >/dev/null 2>&1 || die "依赖安装后仍找不到 ip"
   command -v python3 >/dev/null 2>&1 || die "依赖安装后仍找不到 python3"
+  command -v timeout >/dev/null 2>&1 || die "依赖安装后仍找不到 timeout"
   if [ "$mode" = "wireguard" ]; then
     command -v wg >/dev/null 2>&1 || die "依赖安装后仍找不到 wg"
     command -v wg-quick >/dev/null 2>&1 || die "依赖安装后仍找不到 wg-quick"
     unit_file_exists 'wg-quick@.service' || die "wireguard-tools 已安装但找不到 wg-quick@.service"
   else
     command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
-    command -v timeout >/dev/null 2>&1 || die "依赖安装后仍找不到 timeout"
     command -v nft >/dev/null 2>&1 || die "依赖安装后仍找不到 nftables"
     warp_client_complete || die "cloudflare-warp 安装不完整，找不到 warp-cli 或 warp-svc.service"
     redsocks_path >/dev/null 2>&1 || die "依赖安装后仍找不到 redsocks"
@@ -552,6 +615,7 @@ mode_dependencies_complete() {
   command -v curl >/dev/null 2>&1 \
     && command -v ip >/dev/null 2>&1 \
     && command -v python3 >/dev/null 2>&1 \
+    && command -v timeout >/dev/null 2>&1 \
     || return 1
   case "$mode" in
     wireguard)
@@ -561,7 +625,6 @@ mode_dependencies_complete() {
       ;;
     socks)
       command -v ss >/dev/null 2>&1 \
-        && command -v timeout >/dev/null 2>&1 \
         && command -v nft >/dev/null 2>&1 \
         && warp_client_complete \
         && redsocks_path >/dev/null 2>&1
@@ -706,6 +769,31 @@ prompt_install_mode() {
   done
 }
 
+select_install_mode() {
+  local current_mode="${1:-}"
+  if [ "$INSTALL_NONINTERACTIVE" -eq 0 ]; then
+    prompt_install_mode "$current_mode"
+    return
+  fi
+
+  case "$INSTALL_MODE_OPTION" in
+    '')
+      if [ -n "$current_mode" ]; then
+        printf '%s\n' "$current_mode"
+      else
+        printf 'wireguard\n'
+      fi
+      ;;
+    keep)
+      [ -n "$current_mode" ] \
+        || { installer_cli_error "全新安装不能使用 --mode keep"; return 2; }
+      printf '%s\n' "$current_mode"
+      ;;
+    socks|wireguard) printf '%s\n' "$INSTALL_MODE_OPTION" ;;
+    *) installer_cli_error "内部错误：未识别的安装模式选项" ;;
+  esac
+}
+
 find_free_port() {
   local avoid="${1:-}"
   local candidate
@@ -760,6 +848,34 @@ prompt_warp_port() {
     printf '%s\n' "$input"
     return 0
   done
+}
+
+select_noninteractive_warp_port() {
+  local reusable_port="${1:-}"
+  local selected="${INSTALL_SOCKS_PORT_OPTION:-}"
+  if [ -z "$selected" ] && [ -n "${WARP_SOCKS_PORT:-}" ]; then
+    selected="$WARP_SOCKS_PORT"
+  fi
+  if [ -z "$selected" ]; then
+    if [ -n "$reusable_port" ]; then
+      printf '%s\n' "$reusable_port"
+    else
+      find_free_port
+    fi
+    return 0
+  fi
+  if [ "$selected" = "auto" ]; then
+    find_free_port "$reusable_port"
+    return 0
+  fi
+  if ! valid_port "$selected"; then
+    installer_cli_error "--socks-port 必须是 auto 或 1-65535 的端口"
+    return 2
+  fi
+  if [ "$selected" != "$reusable_port" ] && port_in_use "$selected"; then
+    die "--socks-port 指定的端口已被占用：$selected"
+  fi
+  printf '%s\n' "$selected"
 }
 
 read_project_warp_port() {
@@ -884,7 +1000,8 @@ fetch_asset() {
 
   local url
   url="$(raw_asset_url "$rel")"
-  curl -fsSL "$url" -o "$dest" || die "下载项目文件失败：${rel}（${url}）"
+  curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+    "$url" -o "$dest" || die "下载项目文件失败：${rel}（${url}）"
   chmod "$mode" "$dest"
 }
 
@@ -1188,6 +1305,18 @@ target_wireguard_config_valid() {
       _ "$PROJECT_STAGE_DIR/bin/warp-vps"
 }
 
+current_socks_backend_local_ready() {
+  local warp_port="$1"
+  bash -c '. "$1"; WARP_SOCKS_PORT="$2"; warp_proxy_local_ready' \
+    _ "$PROJECT_STAGE_DIR/bin/warp-vps" "$warp_port"
+}
+
+current_redsocks_backend_local_ready() {
+  local redsocks_port="$1"
+  bash -c '. "$1"; REDSOCKS_PORT="$2"; redsocks_local_ready' \
+    _ "$PROJECT_STAGE_DIR/bin/warp-vps" "$redsocks_port"
+}
+
 current_backend_reusable() {
   local selected_mode="$1"
   local warp_port="$2"
@@ -1210,10 +1339,7 @@ current_backend_reusable() {
     return 1
   fi
   [ -n "$reusable_warp_port" ] && [ "$warp_port" = "$reusable_warp_port" ] || return 1
-  local service_rc=0
-  project_unit_active warp-svc.service || service_rc=$?
-  [ "$service_rc" -ne 2 ] || die "无法确认当前 WARP SOCKS 服务状态；未执行重装"
-  [ "$service_rc" -eq 0 ] && port_in_use "$warp_port"
+  current_socks_backend_local_ready "$warp_port"
 }
 
 quiesce_health_automation() {
@@ -1700,16 +1826,104 @@ installer_menu() {
 
 installer_usage() {
   cat <<'EOF'
-用法：install.sh [--menu|--install]
+用法：
+  install.sh
+  install.sh --menu
+  install.sh --install
+  install.sh --install --non-interactive [--mode keep|wireguard|socks]
+             [--swap auto|none|N] [--socks-port auto|PORT]
 
-  无参数     未安装时开始安装；检测到已有项目安装时进入管理菜单
-  --menu    进入管理菜单；未安装时开始安装
-  --install 强制进入安装、重装或模式切换流程
+  无参数 / --menu  需要终端；未安装时开始安装，已有安装时进入管理菜单
+  --install         需要终端；进入安装、重装或模式切换流程
+  --non-interactive 禁止读取输入；全新默认 WireGuard、无 Swap 时创建 1G
+  --mode             选择模式；keep 仅适用于已有安装
+  --swap             auto 默认按需创建 1G；N 为 GiB；none 明确跳过
+  --socks-port       Socks5 使用自动空闲端口或指定端口
 EOF
+}
+
+installer_cli_error() {
+  printf '[warp-vps] 错误：%s\n' "$*" >&2
+  return 2
+}
+
+parse_install_options() {
+  local seen_noninteractive=0 seen_mode=0 seen_swap=0 seen_port=0 value
+  INSTALL_NONINTERACTIVE=0
+  INSTALL_MODE_OPTION=""
+  INSTALL_SWAP_OPTION=""
+  INSTALL_SOCKS_PORT_OPTION=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --non-interactive)
+        [ "$seen_noninteractive" -eq 0 ] \
+          || { installer_cli_error "--non-interactive 不能重复"; return 2; }
+        INSTALL_NONINTERACTIVE=1
+        seen_noninteractive=1
+        shift
+        ;;
+      --mode)
+        [ "$seen_mode" -eq 0 ] || { installer_cli_error "--mode 不能重复"; return 2; }
+        [ "$#" -ge 2 ] || { installer_cli_error "--mode 缺少参数"; return 2; }
+        value="$2"
+        case "$value" in
+          keep|wireguard|socks) ;;
+          *) installer_cli_error "--mode 只接受 keep、wireguard 或 socks"; return 2 ;;
+        esac
+        INSTALL_MODE_OPTION="$value"
+        seen_mode=1
+        shift 2
+        ;;
+      --swap)
+        [ "$seen_swap" -eq 0 ] || { installer_cli_error "--swap 不能重复"; return 2; }
+        [ "$#" -ge 2 ] || { installer_cli_error "--swap 缺少参数"; return 2; }
+        value="$2"
+        case "$value" in
+          auto|none) ;;
+          ''|*[!0-9]*) installer_cli_error "--swap 只接受 auto、none 或正整数 GiB"; return 2 ;;
+          *)
+            [ "${#value}" -le 6 ] \
+              || { installer_cli_error "--swap 的 GiB 数值不能超过 6 位"; return 2; }
+            [ "$((10#$value))" -gt 0 ] \
+              || { installer_cli_error "--swap 只接受 auto、none 或正整数 GiB"; return 2; }
+            ;;
+        esac
+        INSTALL_SWAP_OPTION="$value"
+        seen_swap=1
+        shift 2
+        ;;
+      --socks-port)
+        [ "$seen_port" -eq 0 ] \
+          || { installer_cli_error "--socks-port 不能重复"; return 2; }
+        [ "$#" -ge 2 ] || { installer_cli_error "--socks-port 缺少参数"; return 2; }
+        value="$2"
+        if [ "$value" != "auto" ] && ! valid_port "$value"; then
+          installer_cli_error "--socks-port 必须是 auto 或 1-65535 的端口"
+          return 2
+        fi
+        INSTALL_SOCKS_PORT_OPTION="$value"
+        seen_port=1
+        shift 2
+        ;;
+      *) installer_cli_error "未知安装参数：$1"; return 2 ;;
+    esac
+  done
+
+  if [ "$INSTALL_NONINTERACTIVE" -eq 0 ] \
+    && { [ "$seen_mode" -eq 1 ] || [ "$seen_swap" -eq 1 ] || [ "$seen_port" -eq 1 ]; }; then
+    installer_cli_error "--mode、--swap 和 --socks-port 必须与 --non-interactive 一起使用"
+    return 2
+  fi
 }
 
 dispatch_installer() {
   if [ "$#" -eq 0 ]; then
+    if ! interactive_terminal_available; then
+      installer_cli_error "当前没有交互终端；自动化安装请使用 --install --non-interactive" || true
+      installer_usage >&2
+      return 2
+    fi
     if project_installation_present; then
       installer_menu
     else
@@ -1718,21 +1932,34 @@ dispatch_installer() {
     return
   fi
 
-  if [ "$#" -ne 1 ]; then
-    installer_usage >&2
-    return 2
-  fi
-
   case "$1" in
     --menu)
+      [ "$#" -eq 1 ] || { installer_usage >&2; return 2; }
+      if ! interactive_terminal_available; then
+        installer_cli_error "管理菜单需要交互终端；请改用 warp-vps 的显式命令" || true
+        installer_usage >&2
+        return 2
+      fi
       if project_installation_present; then
         installer_menu
       else
         main
       fi
       ;;
-    --install) main ;;
-    -h|--help|help) installer_usage ;;
+    --install)
+      shift
+      parse_install_options "$@" || { installer_usage >&2; return 2; }
+      if [ "$INSTALL_NONINTERACTIVE" -eq 0 ] && ! interactive_terminal_available; then
+        installer_cli_error "交互安装需要终端；自动化安装请增加 --non-interactive" || true
+        installer_usage >&2
+        return 2
+      fi
+      main
+      ;;
+    -h|--help|help)
+      [ "$#" -eq 1 ] || { installer_usage >&2; return 2; }
+      installer_usage
+      ;;
     *) installer_usage >&2; return 2 ;;
   esac
 }
@@ -1754,13 +1981,21 @@ main() {
   else
     prompted_mode=""
   fi
-  selected_mode="$(prompt_install_mode "$prompted_mode")"
+  selected_mode="$(select_install_mode "$prompted_mode")"
   TARGET_MODE="$selected_mode"
+  if [ "$selected_mode" = "wireguard" ] && [ -n "$INSTALL_SOCKS_PORT_OPTION" ]; then
+    installer_cli_error "WireGuard 模式不能使用 --socks-port"
+    return 2
+  fi
   collect_swap_choice
   if [ "$selected_mode" = "socks" ]; then
     reusable_warp_port="$(read_project_warp_port || true)"
     reusable_redsocks_port="$(read_project_redsocks_port || true)"
-    warp_port="$(prompt_warp_port "$reusable_warp_port")"
+    if [ "$INSTALL_NONINTERACTIVE" -eq 1 ]; then
+      warp_port="$(select_noninteractive_warp_port "$reusable_warp_port")"
+    else
+      warp_port="$(prompt_warp_port "$reusable_warp_port")"
+    fi
     valid_port "$warp_port" || die "内部错误：选择的 WARP SOCKS 端口无效"
     if [ "$warp_port" = "$reusable_warp_port" ] && [ -n "$reusable_redsocks_port" ]; then
       redsocks_port="$reusable_redsocks_port"
@@ -1811,11 +2046,17 @@ main() {
   if [ "$selected_mode" = "socks" ]; then
     disable_new_packaged_redsocks_service
     preflight_nft_nat
-    if [ "$warp_port" != "$reusable_warp_port" ] && port_in_use "$warp_port"; then
-      die "安装依赖期间端口 $warp_port 被占用，请直接重跑安装器选择其他端口"
+    if port_in_use "$warp_port"; then
+      if [ "$warp_port" != "$reusable_warp_port" ] \
+        || ! current_socks_backend_local_ready "$warp_port"; then
+        die "端口 $warp_port 已被其他进程占用，不能作为 WARP SOCKS 端口；请直接重跑安装器选择其他端口"
+      fi
     fi
-    if [ "$redsocks_port" != "$reusable_redsocks_port" ] && port_in_use "$redsocks_port"; then
-      die "安装依赖期间内部端口 $redsocks_port 被占用，请直接重跑安装器"
+    if port_in_use "$redsocks_port"; then
+      if [ "$redsocks_port" != "$reusable_redsocks_port" ] \
+        || ! current_redsocks_backend_local_ready "$redsocks_port"; then
+        die "内部端口 $redsocks_port 已被其他进程占用，不能作为项目透明转发端口；请直接重跑安装器"
+      fi
     fi
     ensure_redsocks_user
     redsocks_uid="$(id -u "$REDSOCKS_USER")"
@@ -1904,7 +2145,7 @@ main() {
     printf 'WARP SOCKS 端口：%s\n' "$warp_port"
   fi
   printf '交互菜单：warp-vps\n'
-  printf '显式命令：warp-vps {status|test|restart|unlock-check|update|logs|uninstall}\n'
+  printf '显式命令：warp-vps {status|test|restart|unlock-check|update|reinstall|switch|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ]; then
     printf 'Google IPv4 UDP/QUIC 使用 VPS 原生出口；Google 目标 IPv6 继续拒绝。\n'
   else

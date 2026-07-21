@@ -9,14 +9,31 @@
 使用 `root` 用户运行：
 
 ```bash
-curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash
+bash -o pipefail -c \
+  'curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash'
 ```
 
 全新安装的默认组合是 **WireGuard + 1G Swap**：模式选择直接回车使用 WireGuard；系统没有 Swap 时，下一步直接回车创建 1G。检测到已有项目安装时，再运行上面的安装命令会进入全局管理菜单，不会立即重装；在菜单中选择“重装或切换模式”后，直接回车保持当前模式，也可选择另一模式。已有 Swap 时不会重复创建。首次选择 Socks5 时，端口直接回车会随机选择空闲端口；同模式重装时直接回车会保留当前端口。输错内容会重新询问，不需要重跑脚本。
 
 重装或切换模式时，目标模式所需依赖已经齐全就直接复用，不会重复运行系统包管理器；确实缺少依赖时才会安装，并在停用旧分流前完成。健康的同模式 WireGuard 或 WARP SOCKS 后端会保持运行，只重新加载本项目规则；切换目标会先准备配置，暂停旧分流后再检查接口、端口、规则和代表性路由，不等待 Google/Cloudflare HTTP 响应或 WireGuard 握手。后续本地安装失败时会尝试恢复原模式。
 
-如果安装中途失败，处理报错后再次运行同一条命令即可，不需要先卸载。
+如果安装中途失败，处理报错后再次运行同一条命令即可，不需要先卸载。首次安装且没有可复用的 WARP 注册、账户或 WireGuard 配置时，必要的程序下载、Cloudflare 注册或配置生成失败（包括限流 `429` 或超时）会返回退出码 `1`，因为此时还没有可运行的目标配置；脚本不会把这种情况伪装成安装成功，稍后重试即可。它与本地安装已经完成后自动运行的解锁检测不同：后者依赖外部站点，失败只作提示，不会撤销已成功的安装。
+
+自动化环境使用明确的非交互入口，不会读取标准输入或 `/dev/tty`：
+
+```bash
+bash -o pipefail -c \
+  'curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash -s -- --install --non-interactive'
+```
+
+省略选项时仍采用全新默认值 WireGuard + 1G Swap；已有安装则保持当前模式，已有 Swap 不会重复创建。可按需增加 `--mode wireguard|socks|keep`、`--swap auto|none|N`（`N` 为 GiB）和 `--socks-port auto|PORT`。例如，全新非交互安装 Socks5 并自动选择端口：
+
+```bash
+bash -o pipefail -c \
+  'curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash -s -- --install --non-interactive --mode socks --socks-port auto'
+```
+
+`--swap none` 表示明确跳过 Swap；非交互创建 Swap 失败时会撤销本次创建并返回失败，不会停下来等待人工输入。菜单和普通交互安装必须有终端；无终端时会立即提示应使用的非交互入口。
 
 ## 模式选择
 
@@ -34,10 +51,21 @@ Socks5 无法通过本地代理转发 UDP，因此同一 Google 会话可能同�
 直接运行 `warp-vps`，选择“重装或切换模式”，不需要先卸载。也可以重新运行安装命令进入同一个管理菜单：
 
 ```bash
-curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash
+bash -o pipefail -c \
+  'curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash'
 ```
 
 进入重装或切换流程后会显示当前模式。直接回车保持当前模式；输入 `2` 可从 Socks5 切换到 WireGuard，输入 `1` 可从 WireGuard 切换到 Socks5。切换时会先准备并校验目标模式所需依赖和配置，再停用旧模式服务和分流规则并启用新规则；不会主动删除另一模式已经安装的系统依赖。
+
+脚本或批量运维无需进入菜单：
+
+```bash
+warp-vps reinstall
+warp-vps switch wireguard
+warp-vps switch socks --socks-port auto
+```
+
+`reinstall` 默认保持当前模式；也可使用 `warp-vps reinstall --mode wireguard|socks`。这些命令都委托给同一个安装事务，与菜单切换具有相同的校验、回滚和本地验收逻辑。
 
 ## 和其他方案的区别
 
@@ -53,7 +81,7 @@ curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh
 
 ## 管理命令
 
-安装完成后，直接运行 `warp-vps` 或 `warp-vps menu` 会打开交互式管理菜单，可查看状态、诊断、检测解锁、重启、更新、重装或切换模式、查看日志和卸载。更新、重装或卸载成功后菜单会结束；再次运行 `warp-vps` 即可继续管理。显式命令保持不变，仍适合脚本或直接排障：
+安装完成后，在终端直接运行 `warp-vps` 或 `warp-vps menu` 会打开交互式管理菜单，可查看状态、诊断、检测解锁、重启、更新、重装或切换模式、查看日志和卸载。更新、重装或卸载成功后菜单会结束；再次运行 `warp-vps` 即可继续管理。所有菜单动作都有适合脚本的显式命令；除交互菜单和不带范围的 `uninstall` 外，以下命令不会读取输入：
 
 | 命令 | 用途 |
 |---|---|
@@ -63,10 +91,15 @@ curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh
 | `warp-vps unlock-check` | 检测当前 IPv4 出口的 Gemini 和 YouTube Premium；安装完成后自动运行，也可手动运行 |
 | `warp-vps restart` | 重启 WARP 分流链路 |
 | `warp-vps update` | 更新脚本和 Google IP 规则 |
+| `warp-vps reinstall` | 非交互重装并保持当前模式 |
+| `warp-vps reinstall --mode wireguard\|socks` | 非交互重装或选择目标模式；还可传入 `--swap`、`--socks-port` |
+| `warp-vps switch wireguard\|socks` | 非交互切换到指定模式；Socks5 可增加 `--socks-port auto\|PORT` |
 | `warp-vps logs` | 查看最近的服务日志 |
 | `warp-vps uninstall` | 交互卸载，并询问是否一并卸载相关运行依赖 |
 | `warp-vps uninstall --yes` | 非交互卸载项目，保留依赖 |
 | `warp-vps uninstall all` | 非交互卸载项目及 WARP、redsocks、wireguard-tools |
+
+显式命令会严格检查参数，拼错或多余参数不会继续执行。退出码 `0` 表示请求的本地动作已完成，`1` 表示真实的下载、配置或运行错误，`2` 表示命令用法错误或在无终端环境请求交互菜单。`test` 和 `unlock-check` 的外部探测失败仍只作诊断提示，不会把正常本地运行态改成失败。
 
 安装完成后如果访问异常，先运行：
 

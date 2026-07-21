@@ -262,6 +262,35 @@ test_port_checks_only_tcp() {
     'the proc fallback must only treat TCP LISTEN sockets as occupied'
 }
 
+test_noninteractive_socks_port_selection() {
+  source_without_main "$INSTALL_SCRIPT"
+  local generated=24000 rc=0 output
+  read_input() { fail 'noninteractive port selection must not read input'; }
+  find_free_port() { printf '%s\n' "$generated"; }
+  port_in_use() { [ "$1" = 25000 ]; }
+
+  INSTALL_SOCKS_PORT_OPTION=''
+  unset WARP_SOCKS_PORT || true
+  assert_eq '24000' "$(select_noninteractive_warp_port '')" \
+    'fresh Socks installation must choose an available port automatically' || return 1
+  assert_eq '23456' "$(select_noninteractive_warp_port 23456)" \
+    'same-mode Socks reinstall must preserve its port by default' || return 1
+
+  INSTALL_SOCKS_PORT_OPTION=auto
+  generated=24001
+  assert_eq '24001' "$(select_noninteractive_warp_port 23456)" \
+    'explicit auto must select a new available port' || return 1
+
+  INSTALL_SOCKS_PORT_OPTION=24567
+  assert_eq '24567' "$(select_noninteractive_warp_port '')" \
+    'an explicit free Socks port must be retained' || return 1
+
+  INSTALL_SOCKS_PORT_OPTION=25000
+  output="$(select_noninteractive_warp_port '' 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'an occupied explicit Socks port must return a runtime failure' || return 1
+  assert_contains "$output" '端口已被占用' 'the occupied-port error must identify its cause'
+}
+
 test_stdin_execution_without_bash_source() {
   local file guard output body dispatcher
   for file in "$INSTALL_SCRIPT" "$MANAGER_SCRIPT"; do
@@ -281,6 +310,8 @@ test_stdin_execution_without_bash_source() {
     'set -u' \
     'SCRIPT_SOURCE=' \
     'REPO_RAW_BASE=https://example.invalid/project/main' \
+    'DOWNLOAD_CONNECT_TIMEOUT=10' \
+    'DOWNLOAD_MAX_TIME=120' \
     'raw_asset_url() { printf "%s/%s\\n" "${REPO_RAW_BASE%/}" "$1"; }' \
     'curl() { printf "download:%s\\n" "$*"; }' \
     'chmod() { :; }' \
@@ -288,7 +319,13 @@ test_stdin_execution_without_bash_source() {
     'fetch_asset bin/warp-vps /tmp/unused 0755' \
     | bash)"
   assert_contains "$output" 'https://example.invalid/project/main/bin/warp-vps' \
-    'stdin execution should download assets when no script path exists'
+    'stdin execution should download assets when no script path exists' || return 1
+
+  guard="$(tail -n 3 "$INSTALL_SCRIPT")"
+  output="$(printf 'dispatch_installer() { printf "%%s" "$*"; }\n%s\n' "$guard" \
+    | bash -s -- --install --non-interactive --mode wireguard)"
+  assert_eq '--install --non-interactive --mode wireguard' "$output" \
+    'bash -s -- must deliver noninteractive installer arguments through the stdin entrypoint'
 }
 
 test_installer_entrypoint_routes_fresh_and_installed_hosts() {
@@ -297,6 +334,7 @@ test_installer_entrypoint_routes_fresh_and_installed_hosts() {
   project_installation_present() { [ "$installed" -eq 1 ]; }
   installer_menu() { calls="${calls}menu "; }
   main() { calls="${calls}install "; }
+  interactive_terminal_available() { return 0; }
 
   dispatch_installer
   assert_eq 'install ' "$calls" 'fresh no-argument installer entry should start installation' || return 1
@@ -330,6 +368,156 @@ test_installer_entrypoint_routes_fresh_and_installed_hosts() {
   dispatch_installer --menu extra >/dev/null 2>&1 || rc=$?
   assert_eq '2' "$rc" 'extra installer options should fail before running an action' || return 1
   assert_eq '' "$calls" 'extra installer options must not run an action'
+}
+
+test_installer_noninteractive_option_contract() {
+  source_without_main "$INSTALL_SCRIPT"
+  local rc=0 output
+
+  parse_install_options --non-interactive --mode socks --swap 2 --socks-port 24567
+  assert_eq '1' "$INSTALL_NONINTERACTIVE" 'noninteractive parsing must set its execution mode' || return 1
+  assert_eq 'socks' "$INSTALL_MODE_OPTION" 'the requested mode must be retained' || return 1
+  assert_eq '2' "$INSTALL_SWAP_OPTION" 'the requested Swap size must be retained' || return 1
+  assert_eq '24567' "$INSTALL_SOCKS_PORT_OPTION" 'the requested Socks port must be retained' || return 1
+
+  parse_install_options --non-interactive --swap 08
+  assert_eq '08' "$INSTALL_SWAP_OPTION" 'a nonzero leading-zero Swap value must stay decimal' || return 1
+
+  for args in \
+    '--mode socks' \
+    '--non-interactive --non-interactive' \
+    '--non-interactive --mode' \
+    '--non-interactive --mode invalid' \
+    '--non-interactive --mode socks --mode wireguard' \
+    '--non-interactive --swap' \
+    '--non-interactive --swap 0' \
+    '--non-interactive --swap 00' \
+    '--non-interactive --swap invalid' \
+    '--non-interactive --swap 1 --swap 2' \
+    '--non-interactive --socks-port 65536' \
+    '--non-interactive --socks-port' \
+    '--non-interactive --socks-port auto --socks-port 24000' \
+    '--non-interactive --unknown'; do
+    rc=0
+    # shellcheck disable=SC2086
+    parse_install_options $args >/dev/null 2>&1 || rc=$?
+    assert_eq '2' "$rc" "invalid install options must return usage status: $args" || return 1
+  done
+
+  INSTALL_NONINTERACTIVE=1
+  INSTALL_MODE_OPTION=''
+  read_input() { fail 'noninteractive mode selection must not read input'; }
+  assert_eq 'wireguard' "$(select_install_mode '')" \
+    'fresh noninteractive installation must default to WireGuard' || return 1
+  assert_eq 'socks' "$(select_install_mode socks)" \
+    'noninteractive reinstall must retain the existing mode' || return 1
+  INSTALL_MODE_OPTION=keep
+  rc=0
+  output="$(select_install_mode '' 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'explicit keep on a fresh host must be a usage error' || return 1
+  assert_contains "$output" '全新安装不能使用 --mode keep' \
+    'fresh keep rejection must explain the conflict'
+}
+
+test_installer_rejects_semantic_conflicts_before_side_effects() {
+  source_without_main "$INSTALL_SCRIPT"
+  local calls='' output rc=0
+  require_root() { :; }
+  require_systemd() { :; }
+  validate_repo_raw_base() { :; }
+  read_project_mode() { printf 'socks\n'; }
+  collect_swap_choice() { calls="${calls}swap "; }
+  acquire_operation_lock() { calls="${calls}lock "; }
+
+  parse_install_options --non-interactive --mode wireguard --socks-port auto
+  output="$(main 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'WireGuard with a Socks-only port option must be a usage error' || return 1
+  assert_contains "$output" 'WireGuard 模式不能使用 --socks-port' \
+    'the semantic conflict should explain the incompatible option' || return 1
+  assert_eq '' "$calls" \
+    'semantic option conflicts must stop before Swap collection, locking or host mutation'
+}
+
+test_project_installation_detection_requires_command_and_config() {
+  source_without_main "$INSTALL_SCRIPT"
+  local root
+  root="$(mktemp -d)"
+  BIN_PATH="$root/warp-vps"
+  CONFIG_FILE="$root/config.env"
+
+  printf '#!/usr/bin/env bash\n' > "$BIN_PATH"
+  chmod 0755 "$BIN_PATH"
+  printf 'WARP_MODE=wireguard\n' > "$CONFIG_FILE"
+  project_installation_present || {
+    fail 'a command plus config should be recognized as an installed project'
+    return 1
+  }
+
+  chmod 0644 "$BIN_PATH"
+  if project_installation_present; then
+    fail 'a non-executable command must not be mistaken for a complete installation'
+    return 1
+  fi
+  chmod 0755 "$BIN_PATH"
+  CONFIG_FILE="$root/missing-config.env"
+  if project_installation_present; then
+    fail 'a command without its config must be treated as a partial installation'
+    return 1
+  fi
+  BIN_PATH="$root/missing-command"
+  CONFIG_FILE="$root/config.env"
+  if project_installation_present; then
+    fail 'a config without its command must be treated as a partial installation'
+    return 1
+  fi
+  CONFIG_FILE="$root/missing-config.env"
+  if project_installation_present; then
+    fail 'a host with neither project artifact must remain a fresh installation'
+    return 1
+  fi
+}
+
+test_installer_noninteractive_entry_never_reads_tty() {
+  source_without_main "$INSTALL_SCRIPT"
+  local calls='' rc=0
+  interactive_terminal_available() { return 1; }
+  project_installation_present() { return 0; }
+  installer_menu() { calls="${calls}menu "; }
+  read_input() { calls="${calls}read "; return 1; }
+  main() {
+    calls="${calls}install:${INSTALL_NONINTERACTIVE}:${INSTALL_MODE_OPTION}:${INSTALL_SWAP_OPTION} "
+  }
+
+  dispatch_installer >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'no-argument installer without a TTY must reject ambiguous interaction' || return 1
+  assert_eq '' "$calls" 'a no-TTY rejection must happen before menu or input' || return 1
+
+  rc=0
+  dispatch_installer --menu >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'an explicit menu request without a TTY must return usage status' || return 1
+  assert_eq '' "$calls" 'a no-TTY menu request must not read input' || return 1
+
+  rc=0
+  dispatch_installer --install >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'interactive install without a TTY must return usage status' || return 1
+  assert_eq '' "$calls" 'an interactive no-TTY install must not start main' || return 1
+
+  dispatch_installer --install --non-interactive --mode wireguard --swap none
+  assert_eq 'install:1:wireguard:none ' "$calls" \
+    'the explicit noninteractive entry must reach main without reading input'
+}
+
+test_real_no_tty_installer_requests_are_bounded() {
+  local output rc=0
+  output="$(bash "$INSTALL_SCRIPT" --menu </dev/null 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'a real no-TTY menu request must fail immediately with usage status' || return 1
+  assert_contains "$output" '管理菜单需要交互终端' \
+    'the real no-TTY menu rejection must explain the explicit-command alternative' || return 1
+
+  rc=0
+  output="$(bash "$INSTALL_SCRIPT" --install --non-interactive --mode invalid </dev/null 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'invalid noninteractive arguments must fail before host preflight' || return 1
+  assert_contains "$output" '--mode 只接受' 'invalid mode output must be actionable'
 }
 
 test_installer_menu_maps_public_actions_and_recovers() {
@@ -465,7 +653,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   main
   main help
   interactive=0
-  main
+  main >/dev/null 2>&1 || true
   assert_eq 'menu menu usage usage ' "$calls" \
     'menu, interactive no-argument, help, and noninteractive no-argument dispatch must stay distinct' || return 1
 
@@ -477,6 +665,8 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   cmd_update() { calls="${calls}update "; }
   cmd_logs() { calls="${calls}logs "; }
   cmd_uninstall() { calls="${calls}uninstall:$* "; }
+  cmd_reinstall() { calls="${calls}reinstall:$* "; }
+  cmd_switch() { calls="${calls}switch:$* "; }
   run_with_runtime_lock() {
     local policy="$1"
     shift
@@ -490,8 +680,14 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   main update
   main logs
   main uninstall --yes
-  assert_eq 'status test unlock-check lock:wait restart lock:wait update logs lock:wait uninstall:--yes ' \
-    "$calls" 'all existing public CLI commands must retain their dispatcher and arguments' || return 1
+  main reinstall --mode socks
+  main switch wireguard --swap none
+  assert_eq 'status test unlock-check lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
+    "$calls" 'all public CLI commands must retain their dispatcher and arguments' || return 1
+  assert_contains "$calls" 'reinstall:--mode socks ' \
+    'noninteractive reinstall arguments must reach their dispatcher' || return 1
+  assert_contains "$calls" 'switch:wireguard --swap none ' \
+    'noninteractive switch arguments must reach their dispatcher' || return 1
 
   local menu_body main_body
   menu_body="$(function_body "$MANAGER_SCRIPT" cmd_menu)"
@@ -500,18 +696,92 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
     'manager menu entry should delegate once to the installed canonical menu' || return 1
   assert_not_contains "$menu_body" 'run_with_runtime_lock' \
     'opening the menu must not hold the shared mutation lock' || return 1
-  assert_contains "$main_body" 'uninstall) run_with_runtime_lock wait cmd_uninstall "${@:2}"' \
+  assert_contains "$main_body" 'run_with_runtime_lock wait cmd_uninstall "$@"' \
     'existing uninstall arguments must keep their original dispatcher'
+}
+
+test_manager_noninteractive_commands_and_strict_arguments() {
+  source_without_main "$MANAGER_SCRIPT"
+  local calls='' cmd rc output
+  require_root() { :; }
+  interactive_terminal_available() { return 1; }
+  cmd_status() { calls="${calls}status "; }
+  cmd_test() { calls="${calls}test "; }
+  cmd_unlock_check() { calls="${calls}unlock "; }
+  cmd_restart() { calls="${calls}restart "; }
+  cmd_update() { calls="${calls}update "; }
+  cmd_logs() { calls="${calls}logs "; }
+  cmd_heal() { calls="${calls}heal "; }
+  apply_rules() { calls="${calls}apply "; }
+  stop_rules() { calls="${calls}stop-rules "; }
+  cmd_configure_warp() { calls="${calls}configure "; }
+  cmd_setup_wireguard() { calls="${calls}setup "; }
+  cmd_preflight_wireguard() { calls="${calls}preflight "; }
+  cmd_wait_wireguard() { calls="${calls}wait "; }
+  install_systemd() { calls="${calls}systemd "; }
+  run_with_runtime_lock() { shift; "$@"; }
+
+  for cmd in menu status test unlock-check restart update logs heal apply stop-rules \
+    configure-warp setup-wireguard preflight-wireguard wait-wireguard install-systemd help; do
+    calls=''
+    rc=0
+    main "$cmd" unexpected >/dev/null 2>&1 || rc=$?
+    assert_eq '2' "$rc" "$cmd must reject extra arguments" || return 1
+    assert_eq '' "$calls" "$cmd must reject bad arguments before running its action" || return 1
+  done
+
+  rc=0
+  output="$(main menu 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'an explicit manager menu without a TTY must return usage status' || return 1
+  assert_contains "$output" '管理菜单需要交互终端' \
+    'the manager no-TTY menu rejection must recommend explicit commands' || return 1
+
+  cmd_reinstall() { calls="${calls}reinstall:$* "; }
+  calls=''
+  main reinstall --mode socks --swap none --socks-port auto
+  assert_eq 'reinstall:--mode socks --swap none --socks-port auto ' "$calls" \
+    'reinstall must remain a noninteractive argument-forwarding command' || return 1
+
+  calls=''
+  main switch socks --swap none
+  assert_eq 'reinstall:--mode socks --swap none ' "$calls" \
+    'switch must translate its target into the canonical reinstall options' || return 1
+  rc=0
+  main switch invalid >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'switch must reject an unknown target mode' || return 1
+  rc=0
+  main switch >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'switch must reject a missing target mode' || return 1
+  rc=0
+  main unknown-command >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'the manager must reject an unknown command' || return 1
+
+  local switch_body reinstall_body logs_body
+  switch_body="$(function_body "$MANAGER_SCRIPT" cmd_switch)"
+  reinstall_body="$(function_body "$MANAGER_SCRIPT" cmd_reinstall)"
+  logs_body="$(function_body "$MANAGER_SCRIPT" cmd_logs)"
+  assert_contains "$switch_body" 'cmd_reinstall --mode "$mode" "$@"' \
+    'switch must reuse the canonical reinstall transaction' || return 1
+  assert_contains "$reinstall_body" 'exec "${APP_DIR}/install.sh" --install --non-interactive "$@"' \
+    'reinstall must delegate once to the installed noninteractive installer' || return 1
+  assert_contains "$logs_body" '--no-pager' 'logs must never open an interactive pager' || return 1
+  assert_not_contains "$logs_body" 'read_input' 'logs must not read input'
 }
 
 test_manager_no_argument_non_tty_is_immediate_usage() {
   local output rc=0
-  output="$(bash "$MANAGER_SCRIPT" </dev/null)" || rc=$?
-  assert_eq '0' "$rc" 'noninteractive no-argument manager invocation should return success' || return 1
+  output="$(bash "$MANAGER_SCRIPT" </dev/null 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'noninteractive no-argument manager invocation must reject a no-op' || return 1
   assert_contains "$output" '用法：warp-vps [命令]' \
     'noninteractive no-argument manager invocation should show usage' || return 1
   assert_not_contains "$output" 'WARP VPS Manager 管理菜单' \
-    'noninteractive no-argument manager invocation must not wait in the menu'
+    'noninteractive no-argument manager invocation must not wait in the menu' || return 1
+
+  rc=0
+  output="$(bash "$MANAGER_SCRIPT" menu </dev/null 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'an explicit no-TTY manager menu must return usage status' || return 1
+  assert_contains "$output" '管理菜单需要交互终端' \
+    'the explicit no-TTY menu request must explain why it was rejected'
 }
 
 test_menu_contract_is_documented_without_a_second_switch_path() {
@@ -537,8 +807,8 @@ test_inputs_precede_side_effects() {
     return 1
   }
 
-  mode_line="$(line_number "$body" 'prompt_install_mode')"
-  port_line="$(line_number "$body" 'prompt_warp_port')"
+  mode_line="$(line_number "$body" 'select_install_mode')"
+  port_line="$(awk '/select_noninteractive_warp_port|prompt_warp_port/ { line=NR } END { print line }' <<< "$body")"
   [ -n "$mode_line" ] || {
     fail 'main() does not collect the install mode'
     return 1
@@ -671,15 +941,15 @@ test_manager_operation_lock_policies() {
     'hosts without flock must still run the requested operation'
 
   main_body="$(function_body "$MANAGER_SCRIPT" main)"
-  assert_contains "$main_body" 'restart) run_with_runtime_lock wait cmd_restart' \
+  assert_contains "$main_body" 'run_with_runtime_lock wait cmd_restart' \
     'restart must use the shared short-wait operation lock' || return 1
-  assert_contains "$main_body" 'update) run_with_runtime_lock wait cmd_update' \
+  assert_contains "$main_body" 'run_with_runtime_lock wait cmd_update' \
     'update must use the shared short-wait operation lock' || return 1
-  assert_contains "$main_body" 'uninstall) run_with_runtime_lock wait cmd_uninstall' \
+  assert_contains "$main_body" 'run_with_runtime_lock wait cmd_uninstall' \
     'uninstall must use the shared short-wait operation lock' || return 1
-  assert_contains "$main_body" 'heal) run_with_runtime_lock skip cmd_heal' \
+  assert_contains "$main_body" 'run_with_runtime_lock skip cmd_heal' \
     'automatic healing must skip a busy operation lock without failing' || return 1
-  assert_contains "$main_body" 'configure-warp) cmd_configure_warp' \
+  assert_contains "$main_body" 'cmd_configure_warp' \
     'installer-internal WARP setup must not recursively acquire the same operation lock' || return 1
   assert_not_contains "$main_body" 'configure-warp) run_with_runtime_lock' \
     'installer-internal WARP setup must not self-deadlock on the shared lock'
@@ -1179,7 +1449,7 @@ test_wireguard_dependencies_do_not_require_socks_tools() {
     [ "$1" = '-v' ] || return 1
     checks="${checks} $2"
     case "$2" in
-      curl|ip|python3|wg|wg-quick) return 0 ;;
+      curl|ip|python3|timeout|wg|wg-quick) return 0 ;;
       *) return 1 ;;
     esac
   }
@@ -1190,8 +1460,19 @@ test_wireguard_dependencies_do_not_require_socks_tools() {
     return 1
   }
   assert_not_contains "$checks" ' ss' 'WireGuard dependency checks must not require ss' || return 1
-  assert_not_contains "$checks" ' timeout' 'WireGuard dependency checks must not require timeout' || return 1
-  assert_not_contains "$checks" ' nft' 'WireGuard dependency checks must not require nftables'
+  assert_contains "$checks" ' timeout' 'WireGuard dependency checks must bound wgcf execution' || return 1
+  assert_not_contains "$checks" ' nft' 'WireGuard dependency checks must not require nftables' || return 1
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl|ip|python3|wg|wg-quick) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  if mode_dependencies_complete wireguard; then
+    fail 'WireGuard dependencies without timeout must not skip coreutils repair'
+  fi
 }
 
 test_wireguard_dependency_reuse_requires_systemd_template() {
@@ -1200,7 +1481,7 @@ test_wireguard_dependency_reuse_requires_systemd_template() {
   command() {
     [ "$1" = '-v' ] || return 1
     case "$2" in
-      curl|ip|python3|wg|wg-quick) return 0 ;;
+      curl|ip|python3|timeout|wg|wg-quick) return 0 ;;
       *) return 1 ;;
     esac
   }
@@ -1283,12 +1564,16 @@ test_wireguard_uses_runtime_capability() {
 }
 
 test_wireguard_config_generation_is_retryable() {
-  local body
+  local body root event output wg_config_valid_definition
   body="$(function_body "$MANAGER_SCRIPT" generate_wg_config)"
   assert_contains "$body" 'wg_config_valid "$WG_CONFIG"' \
     'an existing WireGuard config must be parsed before reuse' || return 1
   assert_contains "$body" 'register --accept-tos' \
     'wgcf registration should use its noninteractive accept-tos flag' || return 1
+  assert_contains "$body" 'run_wgcf_command register --accept-tos' \
+    'wgcf registration must use the bounded command wrapper' || return 1
+  assert_contains "$body" '&& run_wgcf_command generate' \
+    'wgcf generation must not continue after registration fails' || return 1
   assert_not_contains "$body" "printf 'yes" \
     'wgcf registration must not depend on an interactive prompt pipe' || return 1
   assert_contains "$body" 'config_tmp="${WG_CONFIG}.new.$$"' \
@@ -1297,6 +1582,70 @@ test_wireguard_config_generation_is_retryable() {
     'a validated WireGuard config should be activated atomically' || return 1
 
   source_without_main "$MANAGER_SCRIPT"
+  local timeout_args='' rc=0
+  WGCF_BIN=/opt/warp-vps-manager/bin/wgcf
+  timeout() { timeout_args="$*"; return 124; }
+  run_wgcf_command register --accept-tos >/dev/null 2>&1 || rc=$?
+  assert_eq '124' "$rc" 'a wgcf timeout must propagate to the installation transaction' || return 1
+  assert_eq '-k 5 120 /opt/warp-vps-manager/bin/wgcf register --accept-tos' "$timeout_args" \
+    'wgcf must have both a total deadline and a forced-kill deadline' || return 1
+
+  root="$(mktemp -d)"
+  event="$root/wgcf-events"
+  STATE_DIR="$root/state"
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG="$root/warp-vps-wg.conf"
+  WGCF_BIN="$root/wgcf"
+  mkdir -p "$STATE_DIR/wgcf"
+  printf 'existing-account\n' > "$STATE_DIR/wgcf/wgcf-account.toml"
+  : > "$event"
+  install() {
+    local mode src dst path
+    if [ "$1" = '-d' ]; then
+      shift
+      if [ "${1:-}" = '-m' ]; then shift 2; fi
+      for path in "$@"; do
+        [ "$path" = /etc/wireguard ] || mkdir -p "$path"
+      done
+      return 0
+    fi
+    if [ "$1" = '-m' ]; then
+      mode="$2"
+      src="$3"
+      dst="$4"
+      /bin/cp "$src" "$dst"
+      chmod "$mode" "$dst"
+      return
+    fi
+    command install "$@"
+  }
+  install_wgcf_binary() { :; }
+  wg_config_valid_definition="$(declare -f wg_config_valid)"
+  wg_config_valid() { return 1; }
+  run_wgcf_command() {
+    printf '%s\n' "$*" >> "$event"
+    return 124
+  }
+  rc=0
+  output="$(generate_wg_config 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'a timed-out existing-account generation must fail the transaction' || return 1
+  assert_contains "$output" '生成 WireGuard 配置超时' \
+    'an existing-account timeout should have a specific local error' || return 1
+  assert_eq 'generate' "$(< "$event")" \
+    'an existing-account timeout must not discard it and attempt a fresh registration' || return 1
+
+  STATE_DIR="$root/fresh-state"
+  : > "$event"
+  rc=0
+  output="$(generate_wg_config 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'a fresh registration timeout must fail the transaction' || return 1
+  assert_contains "$output" '注册或生成 WireGuard 配置超时' \
+    'a fresh timeout should explain which necessary phase failed' || return 1
+  assert_eq 'register --accept-tos' "$(< "$event")" \
+    'wgcf generate must not run after fresh registration times out' || return 1
+
+  eval "$wg_config_valid_definition"
+
   wg-quick() {
     [ "$1" = 'strip' ]
   }
@@ -1770,7 +2119,7 @@ test_mode_switch_rejects_live_opposite_backend() {
   WARP_SOCKS_PORT=23456
   REDSOCKS_PORT=23457
   wait_for_socks_listen() { return 0; }
-  port_listening() { return 0; }
+  redsocks_local_ready() { return 0; }
   service_active() { return 0; }
   table_exists() { return 0; }
   socks_nft_rules_local_ok() { return 0; }
@@ -1934,6 +2283,105 @@ test_warp_command_errors_defer_to_real_readiness() {
     'an unknown registration state must not trigger speculative registration'
 }
 
+test_socks_local_readiness_rejects_unowned_or_invalid_listeners() {
+  source_without_main "$MANAGER_SCRIPT"
+  local listener_pid="$$" python_rc=0 python_args='' python_body=''
+  systemctl() {
+    case "$1" in
+      is-active) return 0 ;;
+      show)
+        printf 'MainPID=%s\nControlGroup=/system.slice/warp-svc.service\n' "$$"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  ss() {
+    printf 'LISTEN 0 1024 127.0.0.1:24000 0.0.0.0:* users:(("listener",pid=%s,fd=7))\n' \
+      "$listener_pid"
+  }
+
+  service_owns_listening_port warp-svc.service 24000 || {
+    fail 'the systemd main PID should prove ownership of its listening port'
+    return 1
+  }
+  listener_pid=99999999
+  if service_owns_listening_port warp-svc.service 24000; then
+    fail 'an unrelated listener PID must not be accepted as the project service'
+    return 1
+  fi
+
+  python3() {
+    python_args="$*"
+    python_body="$(command cat)"
+    return "$python_rc"
+  }
+  socks5_greeting_ok 24000 || {
+    fail 'a successful local SOCKS5 greeting should be accepted'
+    return 1
+  }
+  assert_eq '- 24000' "$python_args" 'the greeting must target only the configured loopback port' || return 1
+  assert_contains "$python_body" 'response != b"\x05\x00"' \
+    'the local check must require a real SOCKS5 no-auth response' || return 1
+  python_rc=1
+  if socks5_greeting_ok 24000; then
+    fail 'a non-SOCKS listener must not be accepted as WARP Local Proxy'
+    return 1
+  fi
+
+  WARP_SOCKS_PORT=24000
+  service_owns_listening_port() { return 0; }
+  socks5_greeting_ok() { return 1; }
+  if warp_proxy_local_ready; then
+    fail 'WARP local readiness must include the SOCKS5 protocol check'
+    return 1
+  fi
+}
+
+test_reused_socks_port_conflict_stops_before_runtime_mutation() {
+  source_without_main "$INSTALL_SCRIPT"
+  local root event output rc=0
+  root="$(mktemp -d)"
+  event="$root/events"
+  CONFIG_FILE="$root/config.env"
+  printf 'WARP_MODE=socks\nWARP_SOCKS_PORT=24000\nREDSOCKS_PORT=24001\n' > "$CONFIG_FILE"
+  : > "$event"
+
+  INSTALL_NONINTERACTIVE=1
+  INSTALL_MODE_OPTION=socks
+  INSTALL_SWAP_OPTION=none
+  INSTALL_SOCKS_PORT_OPTION=''
+  require_root() { :; }
+  require_systemd() { :; }
+  validate_repo_raw_base() { :; }
+  read_project_mode() { printf 'socks\n'; }
+  read_project_warp_port() { printf '24000\n'; }
+  read_project_redsocks_port() { printf '24001\n'; }
+  collect_swap_choice() { SWAP_ACTION=none; SWAP_SIZE_MB=0; }
+  acquire_operation_lock() { :; }
+  capture_service_ownership() { :; }
+  read_previous_wireguard_runtime() { PREVIOUS_MODE=socks; }
+  stage_project_files() { PROJECT_STAGE_DIR="$root/stage"; }
+  validate_existing_config() { :; }
+  backup_project_files() { return 0; }
+  apply_swap_choice() { :; }
+  install_dependencies() { :; }
+  validate_staged_rules() { return 0; }
+  disable_new_packaged_redsocks_service() { :; }
+  preflight_nft_nat() { :; }
+  port_in_use() { [ "$1" = 24000 ]; }
+  current_socks_backend_local_ready() { return 1; }
+  ensure_redsocks_user() { printf 'ensure-redsocks\n' >> "$event"; }
+  quiesce_health_automation() { printf 'quiesce\n' >> "$event"; }
+  log() { :; }
+
+  output="$(main 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'an unowned process on the reusable WARP port must fail installation' || return 1
+  assert_contains "$output" '已被其他进程占用' \
+    'the deterministic local conflict should have an actionable error' || return 1
+  assert_eq '' "$(< "$event")" \
+    'the port conflict must stop before user creation, old-runtime quiesce or rule changes'
+}
+
 test_swap_failure_returns_to_selection() {
   source_without_main "$INSTALL_SCRIPT"
   local create_calls=0
@@ -2027,6 +2475,49 @@ test_custom_swap_is_decimal_and_rollback_releases_space() {
     fail 'Swap rollback must stop the live Swap before changing its boot record'
     return 1
   fi
+}
+
+test_noninteractive_swap_choices_and_failure_are_bounded() {
+  source_without_main "$INSTALL_SCRIPT"
+  INSTALL_NONINTERACTIVE=1
+  swap_total_mb() { printf '%s\n' "$mock_swap_total"; }
+  max_creatable_swap_mb() { printf '%s\n' "$mock_max_swap"; }
+  local mock_swap_total=0 mock_max_swap=4096 output rc=0
+
+  INSTALL_SWAP_OPTION=''
+  collect_swap_choice
+  assert_eq 'create' "$SWAP_ACTION" 'noninteractive no-Swap default must create Swap' || return 1
+  assert_eq '1024' "$SWAP_SIZE_MB" 'noninteractive default Swap must be exactly 1G' || return 1
+
+  INSTALL_SWAP_OPTION=2
+  collect_swap_choice
+  assert_eq '2048' "$SWAP_SIZE_MB" 'an explicit Swap value must be interpreted as GiB' || return 1
+
+  INSTALL_SWAP_OPTION=none
+  collect_swap_choice >/dev/null
+  assert_eq 'none' "$SWAP_ACTION" '--swap none must skip creation without prompting' || return 1
+
+  mock_swap_total=512
+  INSTALL_SWAP_OPTION=2
+  collect_swap_choice
+  assert_eq 'none' "$SWAP_ACTION" 'an existing Swap must never be duplicated' || return 1
+
+  mock_swap_total=0
+  mock_max_swap=512
+  INSTALL_SWAP_OPTION=''
+  output="$(collect_swap_choice 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'insufficient disk for the requested Swap must fail before installation' || return 1
+  assert_contains "$output" '--swap none' 'the disk-space error must identify the explicit skip option' || return 1
+
+  SWAP_ACTION=create
+  SWAP_SIZE_MB=1024
+  create_swap_file() { return 1; }
+  prompt_swap_creation() { printf 'PROMPTED\n'; }
+  rc=0
+  output="$(apply_swap_choice 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'a noninteractive Swap creation failure must propagate' || return 1
+  assert_not_contains "$output" 'PROMPTED' \
+    'a noninteractive Swap failure must not fall back to an input prompt'
 }
 
 evaluate_gemini_fixture() {
@@ -2158,6 +2649,7 @@ test_status_and_test_do_not_run_unlock_checks() {
 test_local_runtime_paths_do_not_depend_on_external_probes() {
   local body name
   for name in test_quiet wait_for_wg_ready wait_for_warp_proxy_ready \
+    warp_proxy_local_ready socks5_greeting_ok \
     restart_wireguard_runtime reload_runtime_after_update cmd_heal; do
     body="$(function_body "$MANAGER_SCRIPT" "$name")"
     [ -n "$body" ] || {
@@ -2183,8 +2675,8 @@ test_local_runtime_paths_do_not_depend_on_external_probes() {
   body="$(function_body "$MANAGER_SCRIPT" test_quiet)"
   assert_contains "$body" 'wait_for_socks_listen 8' \
     'the Socks local check must require its local WARP listener' || return 1
-  assert_contains "$body" 'port_listening "$REDSOCKS_PORT"' \
-    'the Socks local check must require its redsocks listener' || return 1
+  assert_contains "$body" 'redsocks_local_ready' \
+    'the Socks local check must require a redsocks listener owned by its project service' || return 1
   assert_contains "$body" 'socks_nft_rules_local_ok' \
     'the Socks local check must require the intended nft rules' || return 1
 
@@ -2550,7 +3042,8 @@ test_update_reuses_healthy_backends() {
   WARP_SOCKS_PORT=24000
   service_active() { return 0; }
   wg_interface_is_wireguard() { return 0; }
-  port_listening() { return 0; }
+  warp_proxy_local_ready() { return 0; }
+  wait_for_redsocks_ready() { return 0; }
   configure_warp_runtime() { configure_calls=$((configure_calls + 1)); }
   restart_wireguard_runtime() { restart_wg_calls=$((restart_wg_calls + 1)); }
   systemctl() { systemctl_calls="${systemctl_calls}$*\n"; }
@@ -2596,7 +3089,8 @@ test_update_repairs_only_missing_backends() {
     'an update should rebuild WireGuard only when its local interface is missing' || return 1
 
   WARP_MODE=socks
-  port_listening() { return 1; }
+  warp_proxy_local_ready() { return 1; }
+  wait_for_redsocks_ready() { return 0; }
   configure_warp_runtime() { configure_calls=$((configure_calls + 1)); }
   reload_runtime_after_update || return 1
   assert_eq '1' "$configure_calls" \
@@ -2618,7 +3112,8 @@ test_socks_runtime_configuration_and_update_order() {
   WARP_MODE=socks
   WARP_SOCKS_PORT=24000
   service_active() { return 0; }
-  port_listening() { return 0; }
+  warp_proxy_local_ready() { return 0; }
+  wait_for_redsocks_ready() { return 0; }
   systemctl() {
     systemctl_calls="${systemctl_calls}$*"$'\n'
     return 0
@@ -2647,7 +3142,8 @@ test_restart_reuses_healthy_backends() {
   run_self_check() { return 0; }
   service_active() { return 0; }
   wg_interface_is_wireguard() { return 0; }
-  port_listening() { return 0; }
+  warp_proxy_local_ready() { return 0; }
+  wait_for_redsocks_ready() { return 0; }
   restart_wireguard_runtime() { restart_wg_calls=$((restart_wg_calls + 1)); }
   configure_warp_runtime() { configure_calls=$((configure_calls + 1)); }
   systemctl() { systemctl_calls="${systemctl_calls}$*\n"; return 0; }
@@ -2812,10 +3308,11 @@ test_socks_heal_waits_for_redsocks_before_routing() {
       *) return 1 ;;
     esac
   }
-  port_listening() { [ "$1" = "$WARP_SOCKS_PORT" ]; }
+  warp_proxy_local_ready() { return 0; }
+  redsocks_local_ready() { [ "$post_repair" -eq 1 ]; }
   render_redsocks_conf() { record_event 'render-redsocks'; }
-  wait_for_port_listen() {
-    record_event "wait-listener:$1"
+  wait_for_redsocks_ready() {
+    record_event 'wait-listener:24001'
     [ "$listener_ok" -eq 1 ] || return 1
     post_repair=1
   }
@@ -2851,7 +3348,7 @@ test_socks_heal_waits_for_redsocks_before_routing() {
     return 1
   }
   events="$(< "$event_log")"
-  assert_contains "$output" '没有监听，未重新加载分流规则' \
+  assert_contains "$output" '没有正确监听，未重新加载分流规则' \
     'the failed heal should explain why routing remained disabled' || return 1
   assert_not_contains "$events" 'systemctl:restart warp-vps.service' \
     'Socks heal must not reactivate transparent routing without a redsocks listener'
@@ -3315,7 +3812,7 @@ test_uninstall_orders_teardown_before_dependencies_and_files() {
 
   local main_body
   main_body="$(function_body "$MANAGER_SCRIPT" main)"
-  assert_contains "$main_body" 'cmd_uninstall "${@:2}"' \
+  assert_contains "$main_body" 'cmd_uninstall "$@"' \
     'main must forward uninstall options instead of silently ignoring them'
 }
 
@@ -3934,18 +4431,26 @@ test_main_executes_bidirectional_mode_switches() {
   backend_reusable=0
   prepare_calls=0
   record_main_event() { events="${events}$1"$'\n'; }
+  INSTALL_NONINTERACTIVE=1
+  INSTALL_MODE_OPTION="$target_mode"
+  INSTALL_SWAP_OPTION=none
+  INSTALL_SOCKS_PORT_OPTION=''
+  unset WARP_SOCKS_PORT || true
 
   require_root() { :; }
   require_systemd() { :; }
   validate_repo_raw_base() { :; }
   acquire_operation_lock() { record_main_event 'lock:acquire'; }
   release_operation_lock() { record_main_event 'lock:release'; }
-  prompt_install_mode() { printf '%s\n' "$target_mode"; }
+  read_input() { fail 'the noninteractive main transaction must not read input'; }
+  prompt_install_mode() { fail 'the noninteractive main transaction must not prompt for a mode'; }
   collect_swap_choice() { :; }
   read_project_warp_port() { return 1; }
   read_project_redsocks_port() { return 1; }
-  prompt_warp_port() { printf '25000\n'; }
-  find_free_port() { printf '25001\n'; }
+  prompt_warp_port() { fail 'the noninteractive main transaction must not prompt for a port'; }
+  find_free_port() {
+    if [ -n "${1:-}" ]; then printf '25001\n'; else printf '25000\n'; fi
+  }
   port_in_use() { return 1; }
   capture_service_ownership() { :; }
   read_previous_wireguard_runtime() {
@@ -4041,6 +4546,7 @@ test_main_executes_bidirectional_mode_switches() {
     'a timed-out post-success unlock check must not trigger installation cleanup' || return 1
 
   target_mode=socks
+  INSTALL_MODE_OPTION="$target_mode"
   previous_mode=wireguard
   unlock_rc=1
   events=''
@@ -4074,6 +4580,7 @@ test_main_executes_bidirectional_mode_switches() {
     'a failed post-success unlock check must not trigger installation cleanup' || return 1
 
   target_mode=wireguard
+  INSTALL_MODE_OPTION="$target_mode"
   previous_mode=wireguard
   backend_reusable=1
   prepare_calls=0
@@ -4102,13 +4609,13 @@ test_main_executes_bidirectional_mode_switches() {
     'main should pass through the target preparation gate exactly once' || return 1
 
   target_mode=socks
+  INSTALL_MODE_OPTION="$target_mode"
   previous_mode=socks
   backend_reusable=1
   prepare_calls=0
   events=''
   read_project_warp_port() { printf '24000\n'; }
   read_project_redsocks_port() { printf '24001\n'; }
-  prompt_warp_port() { printf '24000\n'; }
   INSTALL_COMPLETE=0
   INSTALL_CLEANUP_ARMED=0
   INSTALL_BACKEND_REUSED=0
@@ -4189,8 +4696,7 @@ test_reinstall_reuses_healthy_backends_without_external_setup() {
     'healthy WireGuard reuse must skip wgcf and wg-quick preflight' || return 1
 
   PREVIOUS_MODE=socks
-  project_unit_active() { return 0; }
-  port_in_use() { return 0; }
+  current_socks_backend_local_ready() { return 0; }
   current_backend_reusable socks 24000 24000 || {
     fail 'an existing same-port WARP SOCKS listener should be reusable'
     return 1
@@ -4505,6 +5011,8 @@ test_reused_socks_post_restart_failure_restores_old_redsocks() {
   disable_new_packaged_redsocks_service() { :; }
   preflight_nft_nat() { :; }
   port_in_use() { return 0; }
+  current_socks_backend_local_ready() { return 0; }
+  current_redsocks_backend_local_ready() { return 0; }
   ensure_redsocks_user() { :; }
   redsocks_path() { printf '/usr/sbin/redsocks\n'; }
   mark_managed_redsocks_if_current() { :; }
@@ -4719,6 +5227,44 @@ test_no_sha_gate() {
     'manager downloads must not be blocked by embedded SHA comparisons'
 }
 
+test_noninteractive_contract_is_documented_and_downloads_are_bounded() {
+  local install_fetch update_fetch rpm_install
+  install_fetch="$(function_body "$INSTALL_SCRIPT" fetch_asset)"
+  update_fetch="$(function_body "$MANAGER_SCRIPT" download_update_asset)"
+  rpm_install="$(function_body "$INSTALL_SCRIPT" pkg_install_rpm)"
+  assert_contains "$install_fetch" '--connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT"' \
+    'installer project downloads must have a connection deadline' || return 1
+  assert_contains "$install_fetch" '--max-time "$DOWNLOAD_MAX_TIME"' \
+    'installer project downloads must have an overall deadline' || return 1
+  assert_contains "$update_fetch" '--connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT"' \
+    'update downloads must have a connection deadline' || return 1
+  assert_contains "$update_fetch" '--max-time "$DOWNLOAD_MAX_TIME"' \
+    'update downloads must have an overall deadline' || return 1
+  assert_contains "$rpm_install" '--connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT"' \
+    'RPM key and repository downloads must have a connection deadline' || return 1
+  assert_contains "$rpm_install" '--max-time "$DOWNLOAD_MAX_TIME"' \
+    'RPM key and repository downloads must have an overall deadline' || return 1
+  assert_contains "$rpm_install" 'rpm --import "$key_tmp"' \
+    'RPM key import must use the completed local download' || return 1
+  assert_not_contains "$rpm_install" 'rpm --import https://' \
+    'RPM must not perform an unbounded remote key import' || return 1
+  assert_file_matches "$README_FILE" 'bash -s -- --install --non-interactive' \
+    'README must show the stdin-safe noninteractive installation entry' || return 1
+  assert_file_matches "$README_FILE" 'warp-vps switch wireguard' \
+    'README must document noninteractive mode switching' || return 1
+  assert_file_matches "$README_FILE" '退出码 `0`.*`1`.*`2`' \
+    'README must document automation exit statuses' || return 1
+  awk '
+    /^```bash$/ { in_bash=1; has_pipefail=0; next }
+    /^```$/ { in_bash=0; next }
+    in_bash && /bash -o pipefail -c/ { has_pipefail=1 }
+    in_bash && /raw\.githubusercontent\.com\/mqfut123\/warp-vps-manager\/main\/install\.sh/ {
+      if (!has_pipefail || index($0, "curl -fsSL") == 0) bad=1
+    }
+    END { exit bad }
+  ' "$README_FILE" || fail 'every documented remote installer pipeline must propagate curl failures'
+}
+
 run_test 'install mode retries after invalid input' test_install_mode_reprompts
 run_test 'explicit install mode numbers remain stable' test_install_mode_keeps_explicit_numbers
 run_test 'reinstall keeps the current mode by default' test_reinstall_keeps_current_mode_by_default
@@ -4726,12 +5272,19 @@ run_test 'existing config validation precedes runtime mutation' test_existing_co
 run_test 'SOCKS port retries after a stray backslash' test_warp_port_reprompts
 run_test 'reinstall can reuse its current SOCKS port' test_existing_project_port_is_reusable
 run_test 'SOCKS port checks ignore UDP-only listeners' test_port_checks_only_tcp
+run_test 'noninteractive SOCKS port selection is deterministic' test_noninteractive_socks_port_selection
 run_test 'stdin execution works without BASH_SOURCE' test_stdin_execution_without_bash_source
 run_test 'installer routes fresh and installed entrypoints' test_installer_entrypoint_routes_fresh_and_installed_hosts
+run_test 'installer noninteractive options are strict' test_installer_noninteractive_option_contract
+run_test 'installer semantic conflicts stop before side effects' test_installer_rejects_semantic_conflicts_before_side_effects
+run_test 'installed-host detection requires command and config' test_project_installation_detection_requires_command_and_config
+run_test 'installer noninteractive entry never reads TTY' test_installer_noninteractive_entry_never_reads_tty
+run_test 'real no-TTY installer requests return immediately' test_real_no_tty_installer_requests_are_bounded
 run_test 'management menu maps public actions and recovers' test_installer_menu_maps_public_actions_and_recovers
 run_test 'rollback accepts originally absent files that remain absent' test_restore_helpers_accept_already_absent_new_files
 run_test 'terminal menu actions do not run stale code' test_installer_menu_terminal_actions_do_not_run_stale_code
 run_test 'manager menu entry preserves explicit CLI dispatch' test_manager_menu_entry_preserves_explicit_cli_dispatch
+run_test 'manager noninteractive commands reject bad arguments' test_manager_noninteractive_commands_and_strict_arguments
 run_test 'non-TTY no-argument manager invocation is immediate usage' test_manager_no_argument_non_tty_is_immediate_usage
 run_test 'menu contract reuses switching and is documented' test_menu_contract_is_documented_without_a_second_switch_path
 run_test 'all interactive input precedes installation side effects' test_inputs_precede_side_effects
@@ -4773,11 +5326,14 @@ run_test 'SSH peer protection preserves the rule-check status' test_ssh_peer_rou
 run_test 'existing WARP registration is reused safely' test_existing_warp_registration_is_reused
 run_test 'WARP registration distinguishes present missing and unknown' test_warp_registration_has_three_states
 run_test 'WARP readiness wins over intermediate command exit codes' test_warp_command_errors_defer_to_real_readiness
+run_test 'Socks readiness rejects unowned and invalid listeners' test_socks_local_readiness_rejects_unowned_or_invalid_listeners
+run_test 'reused Socks port conflicts stop before runtime mutation' test_reused_socks_port_conflict_stops_before_runtime_mutation
 run_test 'failed Swap creation returns to selection' test_swap_failure_returns_to_selection
 run_test 'empty Swap choice defaults to 1G' test_swap_defaults_to_one_gig
 run_test 'no-Swap hosts default to 1G even with sufficient memory' test_no_swap_defaults_to_one_gig_even_with_sufficient_memory
 run_test 'Swap creation supports older coreutils' test_swap_creation_works_with_older_coreutils
 run_test 'custom Swap uses decimal input and releases failed allocation' test_custom_swap_is_decimal_and_rollback_releases_space
+run_test 'noninteractive Swap choices and failures are bounded' test_noninteractive_swap_choices_and_failure_are_bounded
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'status and test do not run unlock probes' test_status_and_test_do_not_run_unlock_checks
@@ -4835,6 +5391,7 @@ run_test 'main is the single public project source' test_main_is_the_single_publ
 run_test 'logs follow the configured WireGuard interface' test_logs_follow_custom_wireguard_interface
 run_test 'project version and GitHub commit API gates are absent' test_no_project_version_or_commit_api_gate
 run_test 'embedded SHA gates are absent' test_no_sha_gate
+run_test 'noninteractive CLI and bounded downloads are documented' test_noninteractive_contract_is_documented_and_downloads_are_bounded
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

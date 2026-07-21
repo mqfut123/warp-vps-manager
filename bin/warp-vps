@@ -25,6 +25,9 @@ REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 UNLOCK_CONNECT_TIMEOUT=5
 UNLOCK_MAX_TIME=12
+DOWNLOAD_CONNECT_TIMEOUT=10
+DOWNLOAD_MAX_TIME=120
+WGCF_OPERATION_TIMEOUT=120
 WARP_REGISTRATION_STATE="unknown"
 WARP_REGISTRATION_DETAIL=""
 WARP_RUNTIME_DETAILS=""
@@ -453,6 +456,11 @@ install_wgcf_binary() {
   log "已下载 wgcf：${DEFAULT_WGCF_VERSION} ${asset_name}"
 }
 
+run_wgcf_command() {
+  command -v timeout >/dev/null 2>&1 || die "找不到 timeout，无法限制 wgcf 执行时间"
+  timeout -k 5 "$WGCF_OPERATION_TIMEOUT" "$WGCF_BIN" "$@"
+}
+
 wg_config_valid() {
   local file="$1"
   [ -s "$file" ] || return 1
@@ -581,6 +589,7 @@ generate_wg_config() {
   fi
 
   local stage fresh profile_dir account_source config_stage config_tmp account_tmp backup_dir
+  local wgcf_rc=0
   stage="${STATE_DIR}/wgcf-stage-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fresh="${stage}/fresh"
   account_source="${STATE_DIR}/wgcf/wgcf-account.toml"
@@ -596,19 +605,31 @@ generate_wg_config() {
     install -m 0600 "$account_source" "${stage}/wgcf-account.toml"
     if (
       cd "$stage"
-      "$WGCF_BIN" generate >/dev/null
+      run_wgcf_command generate >/dev/null
     ); then
       profile_dir="$stage"
+    else
+      wgcf_rc=$?
+      case "$wgcf_rc" in
+        124|137) die "wgcf 生成 WireGuard 配置超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
+      esac
     fi
   fi
 
   if [ -z "$profile_dir" ]; then
     install -d -m 0700 "$fresh"
+    wgcf_rc=0
     (
-      cd "$fresh"
-      "$WGCF_BIN" register --accept-tos >/dev/null
-      "$WGCF_BIN" generate >/dev/null
-    ) || die "wgcf 注册或生成 WireGuard 配置失败"
+      cd "$fresh" \
+        && run_wgcf_command register --accept-tos >/dev/null \
+        && run_wgcf_command generate >/dev/null
+    ) || wgcf_rc=$?
+    if [ "$wgcf_rc" -ne 0 ]; then
+      case "$wgcf_rc" in
+        124|137) die "wgcf 注册或生成 WireGuard 配置超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
+        *) die "wgcf 注册或生成 WireGuard 配置失败" ;;
+      esac
+    fi
     profile_dir="$fresh"
   fi
 
@@ -1143,20 +1164,81 @@ port_listening() {
   ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
 }
 
-wait_for_port_listen() {
+service_owns_listening_port() {
+  local unit="$1"
+  local port="$2"
+  local listeners identity main_pid control_group pids pid cgroup_line cgroup_path
+  service_active "$unit" || return 1
+  listeners="$(ss -H -ltnp "sport = :${port}" 2>/dev/null)" || return 1
+  [ -n "$listeners" ] || return 1
+  pids="$(grep -oE 'pid=[0-9]+' <<< "$listeners" | cut -d= -f2 | sort -u)" || return 1
+  [ -n "$pids" ] || return 1
+  identity="$(systemctl show "$unit" -p MainPID -p ControlGroup --no-pager 2>/dev/null)" \
+    || return 1
+  main_pid="$(awk -F= '$1 == "MainPID" { print $2; exit }' <<< "$identity")"
+  control_group="$(awk -F= '$1 == "ControlGroup" { print $2; exit }' <<< "$identity")"
+  case "$main_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$main_pid" -gt 0 ] || return 1
+
+  while IFS= read -r pid; do
+    [ "$pid" = "$main_pid" ] && return 0
+    [ -n "$control_group" ] || continue
+    [ -r "/proc/${pid}/cgroup" ] || continue
+    while IFS= read -r cgroup_line; do
+      cgroup_path="${cgroup_line##*:}"
+      case "$cgroup_path" in
+        "$control_group"|"${control_group}/"*) return 0 ;;
+      esac
+    done < "/proc/${pid}/cgroup"
+  done <<< "$pids"
+  return 1
+}
+
+socks5_greeting_ok() {
   local port="$1"
-  local max_wait="${2:-20}"
+  python3 - "$port" >/dev/null 2>&1 <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+    client.settimeout(2)
+    client.sendall(b"\x05\x01\x00")
+    response = client.recv(2)
+if response != b"\x05\x00":
+    raise SystemExit(1)
+PY
+}
+
+warp_proxy_local_ready() {
+  service_owns_listening_port warp-svc.service "$WARP_SOCKS_PORT" \
+    && socks5_greeting_ok "$WARP_SOCKS_PORT"
+}
+
+redsocks_local_ready() {
+  service_owns_listening_port warp-vps-redsocks.service "$REDSOCKS_PORT"
+}
+
+wait_for_redsocks_ready() {
+  local max_wait="${1:-20}"
   local waited=0
   while [ "$waited" -lt "$max_wait" ]; do
-    port_listening "$port" && return 0
+    redsocks_local_ready && return 0
     sleep 1
     waited=$((waited + 1))
   done
-  port_listening "$port"
+  redsocks_local_ready
 }
 
 wait_for_socks_listen() {
-  wait_for_port_listen "$WARP_SOCKS_PORT" "${1:-20}"
+  local max_wait="${1:-20}"
+  local waited=0
+  while [ "$waited" -lt "$max_wait" ]; do
+    warp_proxy_local_ready && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warp_proxy_local_ready
 }
 
 socks_trace() {
@@ -1400,15 +1482,7 @@ try_warp_command() {
 }
 
 wait_for_warp_proxy_ready() {
-  local timeout="${1:-90}"
-  local end=$((SECONDS + timeout))
-  while [ "$SECONDS" -le "$end" ]; do
-    if port_listening "$WARP_SOCKS_PORT"; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
+  wait_for_socks_listen "${1:-90}"
 }
 
 print_warp_diagnostics() {
@@ -1462,7 +1536,7 @@ configure_warp_runtime() {
     try_warp_command "connect" --accept-tos connect \
       || try_warp_command "connect" connect \
       || true
-    port_listening "$WARP_SOCKS_PORT" && break
+    warp_proxy_local_ready && break
     sleep 2
   done
 
@@ -1490,8 +1564,7 @@ test_quiet() {
     return
   fi
   wait_for_socks_listen 8 || return 1
-  port_listening "$REDSOCKS_PORT" || return 1
-  service_active warp-vps-redsocks.service || return 1
+  redsocks_local_ready || return 1
   table_exists || return 1
   socks_nft_rules_local_ok || return 1
   socks_wireguard_routes_absent
@@ -1919,17 +1992,10 @@ run_self_check() {
     failed=1
   fi
 
-  if port_listening "$REDSOCKS_PORT"; then
-    ok_line "本地透明转发端口已监听"
+  if redsocks_local_ready; then
+    ok_line "本地透明转发端口由项目服务正常监听"
   else
-    fail_line "本地透明转发端口没有监听"
-    failed=1
-  fi
-
-  if service_active warp-vps-redsocks.service; then
-    ok_line "本地透明转发进程正常"
-  else
-    fail_line "本地透明转发进程未运行"
+    fail_line "本地透明转发端口未由项目服务监听"
     failed=1
   fi
 
@@ -2039,10 +2105,11 @@ cmd_restart() {
   info_line "正在重启 WARP 和本地分流服务，请稍等"
   systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service >/dev/null \
     || die "无法启用 Socks5 项目服务"
-  if ! service_active warp-svc.service || ! port_listening "$WARP_SOCKS_PORT"; then
+  if ! warp_proxy_local_ready; then
     configure_warp_runtime || die "重启后 Cloudflare WARP SOCKS 本地代理未就绪"
   fi
   systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
+  wait_for_redsocks_ready 8 || die "本地透明转发服务重启后没有正确监听"
   systemctl restart warp-vps.service || die "无法重启分流规则服务"
   run_self_check
   finish_runtime_maintenance
@@ -2095,7 +2162,8 @@ download_update_asset() {
   local dest="$2"
   local url
   url="$(raw_asset_url "$rel")"
-  curl -fsSL "$url" -o "$dest" || die "下载项目文件失败：${rel}（${url}）"
+  curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+    "$url" -o "$dest" || die "下载项目文件失败：${rel}（${url}）"
 }
 
 validate_update_stage() {
@@ -2207,10 +2275,11 @@ reload_runtime_after_update() {
     systemctl start warp-vps.service || return 1
   else
     systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service >/dev/null || return 1
-    if ! service_active warp-svc.service || ! port_listening "$WARP_SOCKS_PORT"; then
+    if ! warp_proxy_local_ready; then
       configure_warp_runtime || return 1
     fi
     systemctl restart warp-vps-redsocks.service || return 1
+    wait_for_redsocks_ready 8 || return 1
     systemctl start warp-vps.service || return 1
   fi
   "$BIN_PATH" status || return 1
@@ -2331,20 +2400,20 @@ cmd_heal() {
   fi
   systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service >/dev/null \
     || die "无法启用 Socks5 项目服务"
-  if ! service_active warp-svc.service || ! port_listening "$WARP_SOCKS_PORT"; then
+  if ! warp_proxy_local_ready; then
     configure_warp_runtime || die "自动修复后 Cloudflare WARP SOCKS 仍不可用"
   fi
   if ! service_active warp-vps.service || ! table_exists || ! socks_nft_rules_local_ok; then
     repair_rules=1
   fi
-  if ! service_active warp-vps-redsocks.service || ! port_listening "$REDSOCKS_PORT"; then
+  if ! redsocks_local_ready; then
     repair_redsocks=1
   fi
   if [ "$repair_redsocks" -eq 1 ]; then
     render_redsocks_conf
     systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
-    wait_for_port_listen "$REDSOCKS_PORT" 8 \
-      || die "本地透明转发服务重启后没有监听，未重新加载分流规则"
+    wait_for_redsocks_ready 8 \
+      || die "本地透明转发服务重启后没有正确监听，未重新加载分流规则"
   fi
   if [ "$repair_rules" -eq 1 ]; then
     systemctl restart warp-vps.service || die "无法重启分流规则服务"
@@ -2798,6 +2867,11 @@ usage() {
   restart         重启 WARP 分流链路
   unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
   update          更新脚本和固定规则快照
+  reinstall       非交互重装并保持当前模式
+  reinstall [安装选项]
+                  非交互重装；支持 --mode、--swap、--socks-port
+  switch wireguard|socks [安装选项]
+                  非交互切换模式；复用同一安装事务
   logs            查看最近日志
   uninstall       交互卸载，并询问是否一并卸载相关运行依赖
   uninstall --yes 非交互卸载项目，保留依赖
@@ -2815,45 +2889,79 @@ usage() {
 EOF
 }
 
+cli_error() {
+  printf '[warp-vps] 错误：%s\n' "$*" >&2
+  usage >&2
+  return 2
+}
+
 interactive_terminal_available() {
   [ -t 0 ] || [ -t 1 ] || [ -t 2 ]
 }
 
 cmd_menu() {
+  interactive_terminal_available \
+    || { cli_error "管理菜单需要交互终端；请使用显式命令"; return 2; }
   require_root
   [ -x "${APP_DIR}/install.sh" ] \
     || die "找不到管理菜单：${APP_DIR}/install.sh；请重新运行安装命令修复项目文件"
   exec "${APP_DIR}/install.sh" --menu
 }
 
+cmd_reinstall() {
+  require_root
+  [ -x "${APP_DIR}/install.sh" ] \
+    || die "找不到安装器：${APP_DIR}/install.sh；请重新运行安装命令修复项目文件"
+  exec "${APP_DIR}/install.sh" --install --non-interactive "$@"
+}
+
+cmd_switch() {
+  local mode
+  [ "$#" -ge 1 ] \
+    || { cli_error "switch 缺少目标模式：wireguard 或 socks"; return 2; }
+  mode="$1"
+  shift
+  case "$mode" in
+    wireguard|socks) ;;
+    *) cli_error "switch 只接受 wireguard 或 socks"; return 2 ;;
+  esac
+  cmd_reinstall --mode "$mode" "$@"
+}
+
 main() {
   local cmd="${1:-}"
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
   case "$cmd" in
-    menu) cmd_menu ;;
-    status) cmd_status ;;
-    test) cmd_test ;;
-    unlock-check) cmd_unlock_check ;;
-    restart) run_with_runtime_lock wait cmd_restart ;;
-    update) run_with_runtime_lock wait cmd_update ;;
-    logs) cmd_logs ;;
-    heal) run_with_runtime_lock skip cmd_heal ;;
-    apply) require_root; apply_rules ;;
-    stop-rules) require_root; stop_rules ;;
-    configure-warp) cmd_configure_warp ;;
-    setup-wireguard) cmd_setup_wireguard ;;
-    preflight-wireguard) cmd_preflight_wireguard ;;
-    wait-wireguard) cmd_wait_wireguard ;;
-    install-systemd) install_systemd ;;
-    uninstall) run_with_runtime_lock wait cmd_uninstall "${@:2}" ;;
-    -h|--help|help) usage ;;
+    menu) [ "$#" -eq 0 ] || { cli_error "menu 不接受参数"; return 2; }; cmd_menu ;;
+    status) [ "$#" -eq 0 ] || { cli_error "status 不接受参数"; return 2; }; cmd_status ;;
+    test) [ "$#" -eq 0 ] || { cli_error "test 不接受参数"; return 2; }; cmd_test ;;
+    unlock-check) [ "$#" -eq 0 ] || { cli_error "unlock-check 不接受参数"; return 2; }; cmd_unlock_check ;;
+    restart) [ "$#" -eq 0 ] || { cli_error "restart 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_restart ;;
+    update) [ "$#" -eq 0 ] || { cli_error "update 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_update ;;
+    reinstall) cmd_reinstall "$@" ;;
+    switch) cmd_switch "$@" ;;
+    logs) [ "$#" -eq 0 ] || { cli_error "logs 不接受参数"; return 2; }; cmd_logs ;;
+    heal) [ "$#" -eq 0 ] || { cli_error "heal 不接受参数"; return 2; }; run_with_runtime_lock skip cmd_heal ;;
+    apply) [ "$#" -eq 0 ] || { cli_error "apply 不接受参数"; return 2; }; require_root; apply_rules ;;
+    stop-rules) [ "$#" -eq 0 ] || { cli_error "stop-rules 不接受参数"; return 2; }; require_root; stop_rules ;;
+    configure-warp) [ "$#" -eq 0 ] || { cli_error "configure-warp 不接受参数"; return 2; }; cmd_configure_warp ;;
+    setup-wireguard) [ "$#" -eq 0 ] || { cli_error "setup-wireguard 不接受参数"; return 2; }; cmd_setup_wireguard ;;
+    preflight-wireguard) [ "$#" -eq 0 ] || { cli_error "preflight-wireguard 不接受参数"; return 2; }; cmd_preflight_wireguard ;;
+    wait-wireguard) [ "$#" -eq 0 ] || { cli_error "wait-wireguard 不接受参数"; return 2; }; cmd_wait_wireguard ;;
+    install-systemd) [ "$#" -eq 0 ] || { cli_error "install-systemd 不接受参数"; return 2; }; install_systemd ;;
+    uninstall) run_with_runtime_lock wait cmd_uninstall "$@" ;;
+    -h|--help|help) [ "$#" -eq 0 ] || { cli_error "help 不接受参数"; return 2; }; usage ;;
     '')
       if interactive_terminal_available; then
         cmd_menu
       else
-        usage
+        cli_error "当前没有交互终端；请指定 status、test、restart、update、reinstall、switch、logs 或 uninstall"
+        return 2
       fi
       ;;
-    *) usage; exit 2 ;;
+    *) cli_error "未知命令：${cmd}" ;;
   esac
 }
 
