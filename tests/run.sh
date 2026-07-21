@@ -4532,8 +4532,14 @@ test_main_executes_bidirectional_mode_switches() {
   read_input() { fail 'the noninteractive main transaction must not read input'; }
   prompt_install_mode() { fail 'the noninteractive main transaction must not prompt for a mode'; }
   collect_swap_choice() { :; }
-  read_project_warp_port() { return 1; }
-  read_project_redsocks_port() { return 1; }
+  read_project_warp_port() {
+    [ "$previous_mode" = socks ] || return 1
+    printf '24000\n'
+  }
+  read_project_redsocks_port() {
+    [ "$previous_mode" = socks ] || return 1
+    printf '24001\n'
+  }
   prompt_warp_port() { fail 'the noninteractive main transaction must not prompt for a port'; }
   find_free_port() {
     if [ -n "${1:-}" ]; then printf '25001\n'; else printf '25000\n'; fi

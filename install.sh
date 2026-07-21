@@ -2004,9 +2004,11 @@ main() {
     return 2
   fi
   collect_swap_choice
-  if [ "$selected_mode" = "socks" ]; then
+  if [ "$prompted_mode" = "socks" ]; then
     reusable_warp_port="$(read_project_warp_port || true)"
     reusable_redsocks_port="$(read_project_redsocks_port || true)"
+  fi
+  if [ "$selected_mode" = "socks" ]; then
     if [ "$INSTALL_NONINTERACTIVE" -eq 1 ]; then
       warp_port="$(select_noninteractive_warp_port "$reusable_warp_port")"
     else
