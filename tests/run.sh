@@ -859,6 +859,28 @@ test_installer_systemd_query_errors_fail_closed() {
   fi
 }
 
+test_installer_absent_systemd_units_are_not_query_failures() {
+  source_without_main "$INSTALL_SCRIPT"
+  systemctl() {
+    case "$*" in
+      'list-unit-files --no-legend')
+        printf 'warp-svc.service enabled\nwg-quick@.service indirect\n'
+        return 0
+        ;;
+      *) return 64 ;;
+    esac
+  }
+
+  if unit_file_exists redsocks.service; then
+    fail 'an absent optional unit must be treated as absent instead of a systemd query failure'
+    return 1
+  fi
+  unit_file_exists warp-svc.service \
+    || fail 'a listed service unit must be reported as present' || return 1
+  unit_file_exists 'wg-quick@.service' \
+    || fail 'a listed template unit must be reported as present'
+}
+
 test_systemd_state_checks_support_old_key_value_output() {
   source_without_main "$INSTALL_SCRIPT"
   local mock_load_state=loaded mock_active_state=inactive mock_enabled_state=static enabled_calls=0
@@ -4721,6 +4743,7 @@ run_test 'failed installation stops only project runtime' test_failed_install_ar
 run_test 'installed services are reusable instead of blanket blockers' test_existing_services_are_reusable
 run_test 'installer records and respects service ownership' test_installer_captures_service_ownership
 run_test 'installer systemd query errors fail closed' test_installer_systemd_query_errors_fail_closed
+run_test 'absent optional systemd units do not block mode switches' test_installer_absent_systemd_units_are_not_query_failures
 run_test 'systemd state checks support old Key=Value output' test_systemd_state_checks_support_old_key_value_output
 run_test 'new packaged redsocks is stopped before WARP installation' test_redsocks_cleanup_precedes_warp_install
 run_test 'managed redsocks ownership requires marker and binary evidence' test_managed_redsocks_requires_two_ownership_signals

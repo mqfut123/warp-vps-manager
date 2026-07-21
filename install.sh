@@ -573,7 +573,7 @@ mode_dependencies_complete() {
 unit_file_exists() {
   local unit="$1"
   local units
-  units="$(systemctl list-unit-files "$unit" --no-legend 2>/dev/null)" \
+  units="$(systemctl list-unit-files --no-legend 2>/dev/null)" \
     || die "无法查询 systemd 服务文件：$unit"
   awk -v unit="$unit" '$1 == unit { found=1 } END { exit !found }' <<< "$units"
 }
