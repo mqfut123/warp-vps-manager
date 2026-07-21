@@ -1311,10 +1311,26 @@ current_socks_backend_local_ready() {
     _ "$PROJECT_STAGE_DIR/bin/warp-vps" "$warp_port"
 }
 
-current_redsocks_backend_local_ready() {
+current_socks_backend_owns_port() {
+  local warp_port="$1"
+  bash -c '. "$1"; service_owns_listening_port warp-svc.service "$2"' \
+    _ "$PROJECT_STAGE_DIR/bin/warp-vps" "$warp_port"
+}
+
+current_redsocks_backend_owns_port() {
   local redsocks_port="$1"
-  bash -c '. "$1"; REDSOCKS_PORT="$2"; redsocks_local_ready' \
+  bash -c '. "$1"; service_owns_listening_port warp-vps-redsocks.service "$2"' \
     _ "$PROJECT_STAGE_DIR/bin/warp-vps" "$redsocks_port"
+}
+
+project_port_conflicts() {
+  local port="$1"
+  local reusable_port="$2"
+  local ownership_check="$3"
+  port_in_use "$port" || return 1
+  [ "$port" = "$reusable_port" ] || return 0
+  "$ownership_check" "$port" && return 1
+  return 0
 }
 
 current_backend_reusable() {
@@ -2046,17 +2062,13 @@ main() {
   if [ "$selected_mode" = "socks" ]; then
     disable_new_packaged_redsocks_service
     preflight_nft_nat
-    if port_in_use "$warp_port"; then
-      if [ "$warp_port" != "$reusable_warp_port" ] \
-        || ! current_socks_backend_local_ready "$warp_port"; then
-        die "端口 $warp_port 已被其他进程占用，不能作为 WARP SOCKS 端口；请直接重跑安装器选择其他端口"
-      fi
+    if project_port_conflicts \
+      "$warp_port" "$reusable_warp_port" current_socks_backend_owns_port; then
+      die "端口 $warp_port 已被其他进程占用，不能作为 WARP SOCKS 端口；请直接重跑安装器选择其他端口"
     fi
-    if port_in_use "$redsocks_port"; then
-      if [ "$redsocks_port" != "$reusable_redsocks_port" ] \
-        || ! current_redsocks_backend_local_ready "$redsocks_port"; then
-        die "内部端口 $redsocks_port 已被其他进程占用，不能作为项目透明转发端口；请直接重跑安装器"
-      fi
+    if project_port_conflicts \
+      "$redsocks_port" "$reusable_redsocks_port" current_redsocks_backend_owns_port; then
+      die "内部端口 $redsocks_port 已被其他进程占用，不能作为项目透明转发端口；请直接重跑安装器"
     fi
     ensure_redsocks_user
     redsocks_uid="$(id -u "$REDSOCKS_USER")"

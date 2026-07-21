@@ -2285,7 +2285,8 @@ test_warp_command_errors_defer_to_real_readiness() {
 
 test_socks_local_readiness_rejects_unowned_or_invalid_listeners() {
   source_without_main "$MANAGER_SCRIPT"
-  local listener_pid="$$" python_rc=0 python_args='' python_body=''
+  local listener_pid="$$" python_rc=0 python_args='' python_body='' python3_path
+  python3_path="$(command -v python3)"
   systemctl() {
     case "$1" in
       is-active) return 0 ;;
@@ -2320,13 +2321,59 @@ test_socks_local_readiness_rejects_unowned_or_invalid_listeners() {
     return 1
   }
   assert_eq '- 24000' "$python_args" 'the greeting must target only the configured loopback port' || return 1
-  assert_contains "$python_body" 'response != b"\x05\x00"' \
+  assert_contains "$python_body" 'while len(response) < 2' \
+    'the local greeting must read a fragmented two-byte TCP response completely' || return 1
+  assert_contains "$python_body" 'bytes(response) != b"\x05\x00"' \
     'the local check must require a real SOCKS5 no-auth response' || return 1
   python_rc=1
   if socks5_greeting_ok 24000; then
     fail 'a non-SOCKS listener must not be accepted as WARP Local Proxy'
     return 1
   fi
+
+  python3() {
+    local client_code
+    client_code="$(command cat)"
+    WARP_TEST_CLIENT_CODE="$client_code" "$python3_path" - <<'PY'
+import os
+import socket
+import sys
+import threading
+import time
+
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+listen_port = server.getsockname()[1]
+
+def serve():
+    connection, _ = server.accept()
+    with connection:
+        request = bytearray()
+        while len(request) < 3:
+            chunk = connection.recv(3 - len(request))
+            if not chunk:
+                return
+            request.extend(chunk)
+        connection.sendall(b"\x05")
+        time.sleep(0.05)
+        connection.sendall(b"\x00")
+    server.close()
+
+thread = threading.Thread(target=serve, daemon=True)
+thread.start()
+sys.argv = ["-", str(listen_port)]
+try:
+    exec(compile(os.environ["WARP_TEST_CLIENT_CODE"], "<socks-client>", "exec"))
+finally:
+    thread.join(timeout=2)
+PY
+  }
+  socks5_greeting_ok 24000 || {
+    fail 'a valid SOCKS5 reply split across two TCP reads must still pass'
+    return 1
+  }
 
   WARP_SOCKS_PORT=24000
   service_owns_listening_port() { return 0; }
@@ -2370,6 +2417,16 @@ test_reused_socks_port_conflict_stops_before_runtime_mutation() {
   preflight_nft_nat() { :; }
   port_in_use() { [ "$1" = 24000 ]; }
   current_socks_backend_local_ready() { return 1; }
+  current_socks_backend_owns_port() { return 0; }
+  if project_port_conflicts 24000 24000 current_socks_backend_owns_port; then
+    fail 'an owned reusable port must remain repairable when its SOCKS greeting is temporarily invalid'
+    return 1
+  fi
+  current_socks_backend_owns_port() { return 1; }
+  project_port_conflicts 24000 24000 current_socks_backend_owns_port || {
+    fail 'an unowned listener on the reusable port must be treated as a real conflict'
+    return 1
+  }
   ensure_redsocks_user() { printf 'ensure-redsocks\n' >> "$event"; }
   quiesce_health_automation() { printf 'quiesce\n' >> "$event"; }
   log() { :; }
@@ -2380,6 +2437,36 @@ test_reused_socks_port_conflict_stops_before_runtime_mutation() {
     'the deterministic local conflict should have an actionable error' || return 1
   assert_eq '' "$(< "$event")" \
     'the port conflict must stop before user creation, old-runtime quiesce or rule changes'
+}
+
+test_socks_waits_use_wall_clock_deadlines() {
+  source_without_main "$MANAGER_SCRIPT"
+  local probes=0 sleeps=0 rc=0
+  WARP_SOCKS_PORT=24000
+  warp_proxy_local_ready() {
+    probes=$((probes + 1))
+    SECONDS=$((SECONDS + 2))
+    return 1
+  }
+  sleep() {
+    sleeps=$((sleeps + 1))
+    SECONDS=$((SECONDS + $1))
+  }
+
+  SECONDS=0
+  wait_for_socks_listen 8 || rc=$?
+  assert_eq '1' "$rc" 'an unavailable local proxy must fail at its deadline' || return 1
+  [ "$probes" -le 4 ] || {
+    fail "an 8-second deadline performed too many 2-second probes: $probes"
+    return 1
+  }
+  [ "$sleeps" -le 3 ] || {
+    fail "the wait loop exceeded its wall-clock sleep budget: $sleeps"
+    return 1
+  }
+  assert_contains "$(function_body "$MANAGER_SCRIPT" wait_for_redsocks_ready)" \
+    'deadline=$((SECONDS + max_wait))' \
+    'redsocks readiness must use the same wall-clock deadline boundary'
 }
 
 test_swap_failure_returns_to_selection() {
@@ -4701,6 +4788,11 @@ test_reinstall_reuses_healthy_backends_without_external_setup() {
     fail 'an existing same-port WARP SOCKS listener should be reusable'
     return 1
   }
+  current_socks_backend_local_ready() { return 1; }
+  if current_backend_reusable socks 24000 24000; then
+    fail 'an owned but protocol-invalid WARP SOCKS listener must enter the repair path'
+    return 1
+  fi
   if current_backend_reusable socks 25000 24000; then
     fail 'a requested SOCKS port change must not be mistaken for backend reuse'
     return 1
@@ -5011,8 +5103,8 @@ test_reused_socks_post_restart_failure_restores_old_redsocks() {
   disable_new_packaged_redsocks_service() { :; }
   preflight_nft_nat() { :; }
   port_in_use() { return 0; }
-  current_socks_backend_local_ready() { return 0; }
-  current_redsocks_backend_local_ready() { return 0; }
+  current_socks_backend_owns_port() { return 0; }
+  current_redsocks_backend_owns_port() { return 0; }
   ensure_redsocks_user() { :; }
   redsocks_path() { printf '/usr/sbin/redsocks\n'; }
   mark_managed_redsocks_if_current() { :; }
@@ -5252,7 +5344,7 @@ test_noninteractive_contract_is_documented_and_downloads_are_bounded() {
     'README must show the stdin-safe noninteractive installation entry' || return 1
   assert_file_matches "$README_FILE" 'warp-vps switch wireguard' \
     'README must document noninteractive mode switching' || return 1
-  assert_file_matches "$README_FILE" '退出码 `0`.*`1`.*`2`' \
+  assert_file_matches "$README_FILE" '退出码 `0`.*`2`.*其他非零值' \
     'README must document automation exit statuses' || return 1
   awk '
     /^```bash$/ { in_bash=1; has_pipefail=0; next }
@@ -5328,6 +5420,7 @@ run_test 'WARP registration distinguishes present missing and unknown' test_warp
 run_test 'WARP readiness wins over intermediate command exit codes' test_warp_command_errors_defer_to_real_readiness
 run_test 'Socks readiness rejects unowned and invalid listeners' test_socks_local_readiness_rejects_unowned_or_invalid_listeners
 run_test 'reused Socks port conflicts stop before runtime mutation' test_reused_socks_port_conflict_stops_before_runtime_mutation
+run_test 'Socks readiness waits use wall-clock deadlines' test_socks_waits_use_wall_clock_deadlines
 run_test 'failed Swap creation returns to selection' test_swap_failure_returns_to_selection
 run_test 'empty Swap choice defaults to 1G' test_swap_defaults_to_one_gig
 run_test 'no-Swap hosts default to 1G even with sufficient memory' test_no_swap_defaults_to_one_gig_even_with_sufficient_memory

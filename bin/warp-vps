@@ -1204,8 +1204,13 @@ port = int(sys.argv[1])
 with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
     client.settimeout(2)
     client.sendall(b"\x05\x01\x00")
-    response = client.recv(2)
-if response != b"\x05\x00":
+    response = bytearray()
+    while len(response) < 2:
+        chunk = client.recv(2 - len(response))
+        if not chunk:
+            break
+        response.extend(chunk)
+if bytes(response) != b"\x05\x00":
     raise SystemExit(1)
 PY
 }
@@ -1221,24 +1226,22 @@ redsocks_local_ready() {
 
 wait_for_redsocks_ready() {
   local max_wait="${1:-20}"
-  local waited=0
-  while [ "$waited" -lt "$max_wait" ]; do
+  local deadline=$((SECONDS + max_wait))
+  while true; do
     redsocks_local_ready && return 0
+    [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep 1
-    waited=$((waited + 1))
   done
-  redsocks_local_ready
 }
 
 wait_for_socks_listen() {
   local max_wait="${1:-20}"
-  local waited=0
-  while [ "$waited" -lt "$max_wait" ]; do
+  local deadline=$((SECONDS + max_wait))
+  while true; do
     warp_proxy_local_ready && return 0
+    [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep 1
-    waited=$((waited + 1))
   done
-  warp_proxy_local_ready
 }
 
 socks_trace() {
