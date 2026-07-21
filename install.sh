@@ -1036,9 +1036,14 @@ restore_project_file() {
   local mode="$4"
   if [ -f "$backup" ]; then
     install -m "$mode" "$backup" "$live" || return 1
-  elif [ -f "$PROJECT_BACKUP_DIR/missing/$label" ] && [ -e "$live" ]; then
-    mv "$live" "$PROJECT_BACKUP_DIR/failed-new/$label" || return 1
+  elif [ -f "$PROJECT_BACKUP_DIR/missing/$label" ]; then
+    if [ -e "$live" ]; then
+      mv "$live" "$PROJECT_BACKUP_DIR/failed-new/$label" || return 1
+    fi
+  else
+    return 1
   fi
+  return 0
 }
 
 project_unit_stopped() {

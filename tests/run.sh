@@ -356,6 +356,33 @@ test_installer_menu_maps_public_actions_and_recovers() {
     'successful, failed, and invalid ordinary actions should all return to the same menu'
 }
 
+test_restore_helpers_accept_already_absent_new_files() {
+  local rollback_root="${FIXTURE_DIR}/rollback"
+  local absent_live="${rollback_root}/live-does-not-exist"
+  local absent_backup="${rollback_root}/backup-does-not-exist"
+
+  source_without_main "$INSTALL_SCRIPT"
+  PROJECT_BACKUP_DIR="$rollback_root"
+  restore_project_file "$absent_live" "$absent_backup" target 0644 || {
+    fail 'install rollback treated an originally absent file that remains absent as a failure'
+    return 1
+  }
+  if restore_project_file "$absent_live" "$absent_backup" unrecorded 0644; then
+    fail 'install rollback accepted a file with neither backup nor missing marker'
+    return 1
+  fi
+
+  source_without_main "$MANAGER_SCRIPT"
+  restore_update_file "$absent_live" "$absent_backup" target 0644 "$rollback_root" || {
+    fail 'update rollback treated an originally absent file that remains absent as a failure'
+    return 1
+  }
+  if restore_update_file "$absent_live" "$absent_backup" unrecorded 0644 "$rollback_root"; then
+    fail 'update rollback accepted a file with neither backup nor missing marker'
+    return 1
+  fi
+}
+
 test_installer_menu_terminal_actions_do_not_run_stale_code() {
   source_without_main "$INSTALL_SCRIPT"
   require_root() { :; }
@@ -4680,6 +4707,7 @@ run_test 'SOCKS port checks ignore UDP-only listeners' test_port_checks_only_tcp
 run_test 'stdin execution works without BASH_SOURCE' test_stdin_execution_without_bash_source
 run_test 'installer routes fresh and installed entrypoints' test_installer_entrypoint_routes_fresh_and_installed_hosts
 run_test 'management menu maps public actions and recovers' test_installer_menu_maps_public_actions_and_recovers
+run_test 'rollback accepts originally absent files that remain absent' test_restore_helpers_accept_already_absent_new_files
 run_test 'terminal menu actions do not run stale code' test_installer_menu_terminal_actions_do_not_run_stale_code
 run_test 'manager menu entry preserves explicit CLI dispatch' test_manager_menu_entry_preserves_explicit_cli_dispatch
 run_test 'non-TTY no-argument manager invocation is immediate usage' test_manager_no_argument_non_tty_is_immediate_usage

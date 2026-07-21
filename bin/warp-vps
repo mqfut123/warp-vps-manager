@@ -2186,9 +2186,14 @@ restore_update_file() {
   local backup_root="$5"
   if [ -f "$backup_file" ]; then
     install -m "$mode" "$backup_file" "$live" || return 1
-  elif [ -f "${backup_root}/missing/$label" ] && [ -e "$live" ]; then
-    mv "$live" "${backup_root}/failed-new/$label" || return 1
+  elif [ -f "${backup_root}/missing/$label" ]; then
+    if [ -e "$live" ]; then
+      mv "$live" "${backup_root}/failed-new/$label" || return 1
+    fi
+  else
+    return 1
   fi
+  return 0
 }
 
 reload_runtime_after_update() {
