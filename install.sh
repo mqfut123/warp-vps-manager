@@ -1192,8 +1192,9 @@ current_backend_reusable() {
     command -v ip >/dev/null 2>&1 || return 1
     project_unit_active "wg-quick@${PREVIOUS_WG_IFACE}.service" || service_rc=$?
     project_wg_interface_present "$PREVIOUS_WG_IFACE" || interface_rc=$?
-    [ "$service_rc" -ne 2 ] && [ "$interface_rc" -ne 2 ] \
-      || die "无法确认当前 WireGuard 本地运行态；未执行重装"
+    if [ "$service_rc" -eq 2 ] || [ "$interface_rc" -eq 2 ]; then
+      die "无法确认当前 WireGuard 本地运行态；未执行重装"
+    fi
     if [ "$service_rc" -eq 0 ] && [ "$interface_rc" -eq 0 ]; then
       wg show "$PREVIOUS_WG_IFACE" >/dev/null 2>&1 || return 1
       target_wireguard_config_valid \
@@ -1609,9 +1610,10 @@ main() {
   if [ "$prompted_mode" = "socks" ]; then
     locked_warp_port="$(read_project_warp_port || true)"
     locked_redsocks_port="$(read_project_redsocks_port || true)"
-    [ "$locked_warp_port" = "$reusable_warp_port" ] \
-      && [ "$locked_redsocks_port" = "$reusable_redsocks_port" ] \
-      || die "等待输入期间 Socks5 配置已被其他管理操作修改，请重新运行安装器"
+    if [ "$locked_warp_port" != "$reusable_warp_port" ] \
+      || [ "$locked_redsocks_port" != "$reusable_redsocks_port" ]; then
+      die "等待输入期间 Socks5 配置已被其他管理操作修改，请重新运行安装器"
+    fi
   fi
   if [ "$SWAP_ACTION" = "create" ] && [ "$(swap_total_mb)" -gt 0 ]; then
     log "检测到系统现已有 Swap，不再重复创建"
