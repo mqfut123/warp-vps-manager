@@ -9,9 +9,12 @@ STATE_DIR="/var/lib/${APP_NAME}"
 BACKUP_ROOT="/var/backups/${APP_NAME}"
 BIN_PATH="/usr/local/bin/warp-vps"
 CONFIG_FILE="${ETC_DIR}/config.env"
+REDSOCKS_CONF="${ETC_DIR}/redsocks.conf"
+NFT_CONF="${ETC_DIR}/nftables.conf"
 REDSOCKS_USER="warp-vps-redsocks"
 WG_IFACE="warp-vps-wg"
 WGCF_BIN="${APP_DIR}/bin/wgcf"
+WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
 WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
 SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
@@ -35,6 +38,18 @@ PREVIOUS_WG_CONFIG="$WG_CONFIG"
 PREVIOUS_MODE=""
 PROJECT_STAGE_DIR=""
 PROJECT_BACKUP_DIR=""
+TARGET_CONFIG_FILE=""
+INSTALL_BACKEND_REUSED=0
+TARGET_CONFIG_PREPARED=0
+TARGET_BACKEND_PREPARED=0
+INSTALL_RUNTIME_TOUCHED=0
+TARGET_MODE=""
+HEALTH_AUTOMATION_PAUSED=0
+HEALTH_AUTOMATION_TOUCHED=0
+INSTALL_FILES_ACTIVATED=0
+TARGET_PREP_STARTED=0
+PREVIOUS_HEALTH_TIMER_ACTIVE=0
+OPERATION_LOCK_HELD=0
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -59,6 +74,22 @@ require_systemd() {
   [ -d /run/systemd/system ] || die "当前系统没有运行 systemd，不能安装本项目"
   systemctl list-unit-files --no-legend >/dev/null 2>&1 \
     || die "无法连接 systemd，不能安装本项目"
+}
+
+acquire_operation_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>/run/warp-vps-manager.operation.lock \
+    || die "无法建立管理操作锁，未修改当前运行态"
+  flock -n 9 \
+    || die "另一项 WARP VPS Manager 管理操作正在进行，请稍后重试"
+  OPERATION_LOCK_HELD=1
+}
+
+release_operation_lock() {
+  [ "$OPERATION_LOCK_HELD" -eq 1 ] || return 0
+  flock -u 9 >/dev/null 2>&1 || true
+  exec 9>&-
+  OPERATION_LOCK_HELD=0
 }
 
 load_os_release() {
@@ -113,7 +144,7 @@ create_swap_file() {
   fi
 
   log "正在创建 $(format_gb "$size_mb") Swap：$SWAP_FILE"
-  if ! dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=progress; then
+  if ! dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb"; then
     rollback_swap_file "写入 Swap 文件失败"
     return 1
   fi
@@ -195,19 +226,23 @@ prompt_swap_creation() {
   local max_mb selected choice custom_gb
   while true; do
     max_mb="$(max_creatable_swap_mb)"
-    printf '\n检测到当前可用内存只有 %s，且系统没有 Swap。\n' "$(format_gb "$mem_mb")"
-    printf '如果继续安装，Cloudflare WARP 或依赖安装可能因为内存不足失败。\n'
+    printf '\n检测到系统没有 Swap；当前可用内存为 %s。\n' "$(format_gb "$mem_mb")"
+    if [ "$mem_mb" -lt 1024 ]; then
+      printf '可用内存不足 1G，创建 Swap 可降低依赖安装或 WARP 启动失败的概率。\n'
+    else
+      printf '默认安装会创建 1G Swap；如不需要，可选择继续但不创建。\n'
+    fi
     printf '当前磁盘最多建议创建约 %s Swap。\n' "$(format_gb "$max_mb")"
     printf '\n请选择：\n'
-    printf '  1. 创建 1G Swap\n'
-    printf '  2. 创建 2G Swap（推荐）\n'
+    printf '  1. 创建 1G Swap（默认）\n'
+    printf '  2. 创建 2G Swap\n'
     printf '  3. 自定义 Swap 大小\n'
     printf '  4. 不创建 Swap，接受安装中途失败的风险继续\n'
     printf '  5. 退出安装\n'
-    printf '请输入选项：'
+    printf '请输入选项（直接回车默认 1）：'
     read_input choice || die "无法读取输入，已退出安装"
     case "$choice" in
-      1) selected=1024 ;;
+      ''|1) selected=1024 ;;
       2) selected=2048 ;;
       3)
         while true; do
@@ -264,12 +299,12 @@ collect_swap_choice() {
   swap_free="$(swap_free_mb)"
   total_available=$((mem_mb + swap_free))
 
-  [ "$mem_mb" -ge 1024 ] && return 0
-
   if [ "$swap_total" -eq 0 ]; then
     prompt_swap_creation "$mem_mb"
     return 0
   fi
+
+  [ "$mem_mb" -ge 1024 ] && return 0
 
   if [ "$total_available" -lt 1024 ]; then
     printf '\n检测到当前可用内存 %s，Swap 总量 %s，Swap 可用 %s。\n' \
@@ -478,6 +513,10 @@ pkg_install_rpm() {
 install_dependencies() {
   local mode="$1"
   local manager
+  if mode_dependencies_complete "$mode"; then
+    log "目标模式所需依赖已齐全，直接复用现有安装"
+    return 0
+  fi
   load_os_release
   if command -v apt-get >/dev/null 2>&1; then
     pkg_install_apt "$mode"
@@ -493,23 +532,49 @@ install_dependencies() {
 
   command -v curl >/dev/null 2>&1 || die "依赖安装后仍找不到 curl"
   command -v ip >/dev/null 2>&1 || die "依赖安装后仍找不到 ip"
-  command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
-  command -v timeout >/dev/null 2>&1 || die "依赖安装后仍找不到 timeout"
   command -v python3 >/dev/null 2>&1 || die "依赖安装后仍找不到 python3"
   if [ "$mode" = "wireguard" ]; then
     command -v wg >/dev/null 2>&1 || die "依赖安装后仍找不到 wg"
     command -v wg-quick >/dev/null 2>&1 || die "依赖安装后仍找不到 wg-quick"
+    unit_file_exists 'wg-quick@.service' || die "wireguard-tools 已安装但找不到 wg-quick@.service"
   else
+    command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
+    command -v timeout >/dev/null 2>&1 || die "依赖安装后仍找不到 timeout"
     command -v nft >/dev/null 2>&1 || die "依赖安装后仍找不到 nftables"
-    command -v warp-cli >/dev/null 2>&1 || die "cloudflare-warp 已安装但找不到 warp-cli"
+    warp_client_complete || die "cloudflare-warp 安装不完整，找不到 warp-cli 或 warp-svc.service"
     redsocks_path >/dev/null 2>&1 || die "依赖安装后仍找不到 redsocks"
   fi
 }
 
+mode_dependencies_complete() {
+  local mode="$1"
+  command -v curl >/dev/null 2>&1 \
+    && command -v ip >/dev/null 2>&1 \
+    && command -v python3 >/dev/null 2>&1 \
+    || return 1
+  case "$mode" in
+    wireguard)
+      command -v wg >/dev/null 2>&1 \
+        && command -v wg-quick >/dev/null 2>&1 \
+        && unit_file_exists 'wg-quick@.service'
+      ;;
+    socks)
+      command -v ss >/dev/null 2>&1 \
+        && command -v timeout >/dev/null 2>&1 \
+        && command -v nft >/dev/null 2>&1 \
+        && warp_client_complete \
+        && redsocks_path >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 unit_file_exists() {
   local unit="$1"
-  systemctl list-unit-files "$unit" --no-legend 2>/dev/null \
-    | awk -v unit="$unit" '$1 == unit { found=1 } END { exit !found }'
+  local units
+  units="$(systemctl list-unit-files "$unit" --no-legend 2>/dev/null)" \
+    || die "无法查询 systemd 服务文件：$unit"
+  awk -v unit="$unit" '$1 == unit { found=1 } END { exit !found }' <<< "$units"
 }
 
 warp_client_complete() {
@@ -540,7 +605,8 @@ capture_service_ownership() {
 disable_new_packaged_redsocks_service() {
   [ "$REDSOCKS_UNIT_PREEXISTED" -eq 0 ] || return 0
   unit_file_exists redsocks.service || return 0
-  systemctl disable --now redsocks.service >/dev/null 2>&1 || true
+  systemctl stop redsocks.service >/dev/null 2>&1 || true
+  systemctl disable redsocks.service >/dev/null 2>&1 || true
   if systemctl is-active --quiet redsocks.service; then
     log "新安装的 redsocks.service 未能停止；项目仍会使用独立服务和配置"
   fi
@@ -609,7 +675,11 @@ read_project_mode() {
 
 prompt_install_mode() {
   local recommended choice current_mode
-  current_mode="$(read_project_mode || true)"
+  if [ "$#" -gt 0 ]; then
+    current_mode="$1"
+  else
+    current_mode="$(read_project_mode || true)"
+  fi
   recommended="${current_mode:-wireguard}"
 
   printf '\n请选择 WARP 分流方案：\n' >&2
@@ -664,10 +734,18 @@ prompt_warp_port() {
   fi
 
   while true; do
-    printf '请输入 WARP SOCKS 端口（直接回车随机选择空闲端口）：' >&2
+    if [ -n "$reusable_port" ]; then
+      printf '当前 WARP SOCKS 端口：%s；直接回车保持不变：' "$reusable_port" >&2
+    else
+      printf '请输入 WARP SOCKS 端口（直接回车随机选择空闲端口）：' >&2
+    fi
     read_input input || die "无法读取输入，已退出安装"
     if [ -z "$input" ]; then
-      find_free_port
+      if [ -n "$reusable_port" ]; then
+        printf '%s\n' "$reusable_port"
+      else
+        find_free_port
+      fi
       return 0
     fi
     if ! valid_port "$input"; then
@@ -690,6 +768,20 @@ read_project_warp_port() {
     case "$line" in
       WARP_MODE=*) mode="${line#*=}" ;;
       WARP_SOCKS_PORT=*) port="${line#*=}" ;;
+    esac
+  done < "$CONFIG_FILE"
+  [ "$mode" = "socks" ] || return 1
+  valid_port "$port" || return 1
+  printf '%s\n' "$port"
+}
+
+read_project_redsocks_port() {
+  [ -r "$CONFIG_FILE" ] || return 1
+  local line mode="" port=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      WARP_MODE=*) mode="${line#*=}" ;;
+      REDSOCKS_PORT=*) port="${line#*=}" ;;
     esac
   done < "$CONFIG_FILE"
   [ "$mode" = "socks" ] || return 1
@@ -795,6 +887,57 @@ fetch_asset() {
   chmod "$mode" "$dest"
 }
 
+validate_staged_rules() {
+  local stage="$1"
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$stage" <<'PY'
+import ipaddress
+import json
+import pathlib
+import sys
+
+stage = pathlib.Path(sys.argv[1])
+counts = {}
+for family, version in (("ipv4", 4), ("ipv6", 6)):
+    path = stage / "rules" / f"google_{family}.txt"
+    count = 0
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line != raw or any(ch.isspace() for ch in line):
+            raise SystemExit(f"{path}:{lineno}: 存在非法空格")
+        network = ipaddress.ip_network(line, strict=True)
+        if network.version != version:
+            raise SystemExit(f"{path}:{lineno}: IP 版本不匹配")
+        count += 1
+    if count == 0:
+        raise SystemExit(f"{path}: 规则为空")
+    counts[family] = count
+
+meta_path = stage / "rules" / "rules.meta.json"
+meta = json.loads(meta_path.read_text(encoding="utf-8"))
+if not isinstance(meta, dict):
+    raise SystemExit(f"{meta_path}: 元数据必须是 JSON 对象")
+for family in ("ipv4", "ipv6"):
+    key = f"{family}_count"
+    value = meta.get(key)
+    if type(value) is not int or value != counts[family]:
+        raise SystemExit(
+            f"{meta_path}: {key}={value!r}，规则实际数量={counts[family]}"
+        )
+PY
+}
+
+validate_existing_config() {
+  [ -e "$CONFIG_FILE" ] || return 0
+  [ -r "$CONFIG_FILE" ] || die "现有配置无法读取，未修改当前运行态：$CONFIG_FILE"
+  WARP_VPS_CONFIG_FILE="$CONFIG_FILE" \
+    WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
+    bash -c '. "$1"; load_config' _ "$PROJECT_STAGE_DIR/bin/warp-vps" \
+    || die "现有配置损坏，未修改当前运行态：$CONFIG_FILE"
+}
+
 stage_project_files() {
   PROJECT_STAGE_DIR="${STATE_DIR}/install-stage-$$"
   install -d -m 0755 "$PROJECT_STAGE_DIR" "$PROJECT_STAGE_DIR/bin" "$PROJECT_STAGE_DIR/rules"
@@ -807,18 +950,34 @@ stage_project_files() {
   bash -n "$PROJECT_STAGE_DIR/bin/warp-vps" || die "下载的 warp-vps 语法无效"
   grep -Eq '^[^#[:space:]]' "$PROJECT_STAGE_DIR/rules/google_ipv4.txt" || die "下载的 IPv4 规则为空"
   grep -Eq '^[^#[:space:]]' "$PROJECT_STAGE_DIR/rules/google_ipv6.txt" || die "下载的 IPv6 规则为空"
+  validate_staged_rules "$PROJECT_STAGE_DIR" || die "下载的规则快照校验失败"
 }
 
 backup_project_files() {
   PROJECT_BACKUP_DIR="${STATE_DIR}/install-rollback/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   install -d -m 0755 "$PROJECT_BACKUP_DIR/app/bin" "$PROJECT_BACKUP_DIR/app/rules" \
-    "$PROJECT_BACKUP_DIR/missing" || return 1
+    "$PROJECT_BACKUP_DIR/etc" "$PROJECT_BACKUP_DIR/systemd" \
+    "$PROJECT_BACKUP_DIR/state/wgcf" "$PROJECT_BACKUP_DIR/missing" || return 1
   backup_project_file "${APP_DIR}/install.sh" "$PROJECT_BACKUP_DIR/app/install.sh" app-install 0755 || return 1
   backup_project_file "${APP_DIR}/bin/warp-vps" "$PROJECT_BACKUP_DIR/app/bin/warp-vps" app-manager 0755 || return 1
+  backup_project_file "$WGCF_BIN" "$PROJECT_BACKUP_DIR/app/bin/wgcf" wgcf-binary 0755 || return 1
   backup_project_file "${APP_DIR}/rules/google_ipv4.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv4.txt" rules-ipv4 0644 || return 1
   backup_project_file "${APP_DIR}/rules/google_ipv6.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv6.txt" rules-ipv6 0644 || return 1
   backup_project_file "${APP_DIR}/rules/rules.meta.json" "$PROJECT_BACKUP_DIR/app/rules/rules.meta.json" rules-meta 0644 || return 1
   backup_project_file "$BIN_PATH" "$PROJECT_BACKUP_DIR/warp-vps" command 0755 || return 1
+  backup_project_file "$CONFIG_FILE" "$PROJECT_BACKUP_DIR/config.env" config 0600 || return 1
+  backup_project_file "$WG_CONFIG" "$PROJECT_BACKUP_DIR/wireguard.conf" wireguard-config 0600 || return 1
+  backup_project_file "$WGCF_ACCOUNT" "$PROJECT_BACKUP_DIR/state/wgcf/wgcf-account.toml" wgcf-account 0600 || return 1
+  backup_project_file "$REDSOCKS_CONF" "$PROJECT_BACKUP_DIR/etc/redsocks.conf" redsocks-config 0644 || return 1
+  backup_project_file "$NFT_CONF" "$PROJECT_BACKUP_DIR/etc/nftables.conf" nftables-config 0644 || return 1
+  backup_project_file /etc/systemd/system/warp-vps-redsocks.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-redsocks.service" unit-redsocks 0644 || return 1
+  backup_project_file /etc/systemd/system/warp-vps.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps.service" unit-routing 0644 || return 1
+  backup_project_file /etc/systemd/system/warp-vps-health.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.service" unit-health 0644 || return 1
+  backup_project_file /etc/systemd/system/warp-vps-health.timer \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.timer" unit-health-timer 0644 || return 1
 }
 
 backup_project_file() {
@@ -849,10 +1008,24 @@ restore_project_files() {
   install -d -m 0755 "$PROJECT_BACKUP_DIR/failed-new" || return 1
   restore_project_file "$APP_DIR/install.sh" "$PROJECT_BACKUP_DIR/app/install.sh" app-install 0755 || return 1
   restore_project_file "$APP_DIR/bin/warp-vps" "$PROJECT_BACKUP_DIR/app/bin/warp-vps" app-manager 0755 || return 1
+  restore_project_file "$WGCF_BIN" "$PROJECT_BACKUP_DIR/app/bin/wgcf" wgcf-binary 0755 || return 1
   restore_project_file "$APP_DIR/rules/google_ipv4.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv4.txt" rules-ipv4 0644 || return 1
   restore_project_file "$APP_DIR/rules/google_ipv6.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv6.txt" rules-ipv6 0644 || return 1
   restore_project_file "$APP_DIR/rules/rules.meta.json" "$PROJECT_BACKUP_DIR/app/rules/rules.meta.json" rules-meta 0644 || return 1
   restore_project_file "$BIN_PATH" "$PROJECT_BACKUP_DIR/warp-vps" command 0755 || return 1
+  restore_project_file "$CONFIG_FILE" "$PROJECT_BACKUP_DIR/config.env" config 0600 || return 1
+  restore_project_file "$WG_CONFIG" "$PROJECT_BACKUP_DIR/wireguard.conf" wireguard-config 0600 || return 1
+  restore_project_file "$WGCF_ACCOUNT" "$PROJECT_BACKUP_DIR/state/wgcf/wgcf-account.toml" wgcf-account 0600 || return 1
+  restore_project_file "$REDSOCKS_CONF" "$PROJECT_BACKUP_DIR/etc/redsocks.conf" redsocks-config 0644 || return 1
+  restore_project_file "$NFT_CONF" "$PROJECT_BACKUP_DIR/etc/nftables.conf" nftables-config 0644 || return 1
+  restore_project_file /etc/systemd/system/warp-vps-redsocks.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-redsocks.service" unit-redsocks 0644 || return 1
+  restore_project_file /etc/systemd/system/warp-vps.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps.service" unit-routing 0644 || return 1
+  restore_project_file /etc/systemd/system/warp-vps-health.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.service" unit-health 0644 || return 1
+  restore_project_file /etc/systemd/system/warp-vps-health.timer \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.timer" unit-health-timer 0644 || return 1
 }
 
 restore_project_file() {
@@ -868,7 +1041,52 @@ restore_project_file() {
 }
 
 project_unit_stopped() {
-  ! systemctl is-active --quiet "$1"
+  local unit="$1"
+  local state_output load_state active_state
+  state_output="$(systemctl show "$unit" -p LoadState -p ActiveState --no-pager 2>/dev/null)" || {
+    log "无法查询 systemd 服务状态：${unit}"
+    return 1
+  }
+  load_state="$(awk -F= '$1 == "LoadState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
+  [ "$load_state" = "not-found" ] && return 0
+  [ -n "$load_state" ] || {
+    log "systemd 没有返回服务加载状态：${unit}"
+    return 1
+  }
+  active_state="$(awk -F= '$1 == "ActiveState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
+  case "$active_state" in
+    inactive|failed) return 0 ;;
+    active|activating|deactivating|reloading) return 1 ;;
+    *)
+      log "无法确认 systemd 服务是否已停止：${unit}（状态：${active_state:-无}）"
+      return 1
+      ;;
+  esac
+}
+
+project_unit_disabled() {
+  local unit="$1"
+  local state_output load_state unit_state rc
+  state_output="$(systemctl show "$unit" -p LoadState --no-pager 2>/dev/null)" || {
+    log "无法查询 systemd 服务加载状态：${unit}"
+    return 1
+  }
+  load_state="$(awk -F= '$1 == "LoadState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
+  [ "$load_state" = "not-found" ] && return 0
+  [ -n "$load_state" ] || {
+    log "systemd 没有返回服务加载状态：${unit}"
+    return 1
+  }
+  rc=0
+  unit_state="$(systemctl is-enabled "$unit" 2>/dev/null)" || rc=$?
+  case "$unit_state" in
+    enabled|enabled-runtime) return 1 ;;
+    disabled|masked|masked-runtime|not-found|linked|linked-runtime|alias|static|indirect|generated|transient) return 0 ;;
+    *)
+      log "无法确认 systemd 服务是否已禁用：${unit}（状态：${unit_state:-无}，退出码：${rc}）"
+      return 1
+      ;;
+  esac
 }
 
 project_nft_table_absent() {
@@ -890,14 +1108,16 @@ project_wg_interface_absent() {
   ' <<< "$links"
 }
 
-write_config() {
+write_config_file() {
+  local destination="$1"
+  shift
   local mode="$1"
   local warp_port="$2"
   local redsocks_port="$3"
   local redsocks_uid="$4"
   local redsocks_group="$5"
   local redsocks_bin="$6"
-  local config_tmp="${CONFIG_FILE}.new.$$"
+  local config_tmp="${destination}.new.$$"
   cat > "$config_tmp" <<EOF || die "无法写入临时配置文件：$config_tmp"
 REPO_RAW_BASE=${REPO_RAW_BASE}
 WARP_MODE=${mode}
@@ -914,17 +1134,182 @@ MANAGED_WARP_SVC=${MANAGED_WARP_SVC_VALUE}
 MANAGED_REDSOCKS_BIN=${MANAGED_REDSOCKS_BIN:-0}
 EOF
   chmod 0600 "$config_tmp" || die "无法设置配置文件权限：$config_tmp"
-  mv "$config_tmp" "$CONFIG_FILE" || die "无法激活配置文件：$CONFIG_FILE"
+  mv "$config_tmp" "$destination" || die "无法激活配置文件：$destination"
+}
+
+write_config() {
+  write_config_file "$CONFIG_FILE" "$@"
+}
+
+project_unit_active() {
+  local unit="$1"
+  local state_output load_state active_state
+  state_output="$(systemctl show "$unit" -p LoadState -p ActiveState --no-pager 2>/dev/null)" || return 2
+  load_state="$(awk -F= '$1 == "LoadState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
+  [ "$load_state" != "not-found" ] || return 1
+  [ -n "$load_state" ] || return 2
+  active_state="$(awk -F= '$1 == "ActiveState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
+  case "$active_state" in
+    active) return 0 ;;
+    inactive|failed) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+project_wg_interface_present() {
+  local links rc
+  links="$(ip -o link show 2>/dev/null)" || return 2
+  rc=0
+  awk -F ': ' -v iface="$1" '
+    {
+      name=$2
+      sub(/@.*/, "", name)
+      if (name == iface) found=1
+    }
+    END { exit !found }
+  ' <<< "$links" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+target_wireguard_config_valid() {
+  WARP_VPS_CONFIG_FILE="$TARGET_CONFIG_FILE" \
+    WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
+    bash -c '. "$1"; load_config; wg_config_valid "$WG_CONFIG"' \
+      _ "$PROJECT_STAGE_DIR/bin/warp-vps"
+}
+
+current_backend_reusable() {
+  local selected_mode="$1"
+  local warp_port="$2"
+  local reusable_warp_port="$3"
+  [ "$PREVIOUS_MODE" = "$selected_mode" ] || return 1
+  if [ "$selected_mode" = "wireguard" ]; then
+    local service_rc=0 interface_rc=0
+    command -v ip >/dev/null 2>&1 || return 1
+    project_unit_active "wg-quick@${PREVIOUS_WG_IFACE}.service" || service_rc=$?
+    project_wg_interface_present "$PREVIOUS_WG_IFACE" || interface_rc=$?
+    [ "$service_rc" -ne 2 ] && [ "$interface_rc" -ne 2 ] \
+      || die "无法确认当前 WireGuard 本地运行态；未执行重装"
+    if [ "$service_rc" -eq 0 ] && [ "$interface_rc" -eq 0 ]; then
+      wg show "$PREVIOUS_WG_IFACE" >/dev/null 2>&1 || return 1
+      target_wireguard_config_valid \
+        || die "当前 WireGuard 正在运行，但磁盘配置无法用于安全重建；已保持当前流量不变"
+      return 0
+    fi
+    return 1
+  fi
+  [ -n "$reusable_warp_port" ] && [ "$warp_port" = "$reusable_warp_port" ] || return 1
+  local service_rc=0
+  project_unit_active warp-svc.service || service_rc=$?
+  [ "$service_rc" -ne 2 ] || die "无法确认当前 WARP SOCKS 服务状态；未执行重装"
+  [ "$service_rc" -eq 0 ] && port_in_use "$warp_port"
+}
+
+quiesce_health_automation() {
+  local timer_rc=0
+  [ "$HEALTH_AUTOMATION_PAUSED" -eq 0 ] || return 0
+  project_unit_active warp-vps-health.timer || timer_rc=$?
+  [ "$timer_rc" -ne 2 ] || {
+    log "无法确认自动健康检查当前状态，未改动当前分流"
+    return 1
+  }
+  [ "$timer_rc" -ne 0 ] || PREVIOUS_HEALTH_TIMER_ACTIVE=1
+  HEALTH_AUTOMATION_TOUCHED=1
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  if ! project_unit_stopped warp-vps-health.timer || ! project_unit_stopped warp-vps-health.service; then
+    log "自动健康检查仍在运行，未改动当前分流"
+    return 1
+  fi
+  HEALTH_AUTOMATION_PAUSED=1
+}
+
+previous_wg_routes_absent() {
+  local cidr routes
+  [ -r "${APP_DIR}/rules/google_ipv4.txt" ] || return 1
+  [ -r "${APP_DIR}/rules/google_ipv6.txt" ] || return 1
+  while IFS= read -r cidr; do
+    routes="$(ip -4 route show exact "$cidr" dev "$PREVIOUS_WG_IFACE" 2>/dev/null)" || return 1
+    [ -z "$routes" ] || return 1
+  done < <(awk 'NF && $1 !~ /^#/ { print $1 }' "${APP_DIR}/rules/google_ipv4.txt")
+  while IFS= read -r cidr; do
+    routes="$(ip -6 route show exact "$cidr" dev "$PREVIOUS_WG_IFACE" 2>/dev/null)" || return 1
+    [ -z "$routes" ] || return 1
+  done < <(awk 'NF && $1 !~ /^#/ { print $1 }' "${APP_DIR}/rules/google_ipv6.txt")
+}
+
+pause_project_routing() {
+  quiesce_health_automation || return 1
+  INSTALL_RUNTIME_TOUCHED=1
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  systemctl disable warp-vps.service >/dev/null 2>&1 || true
+  if [ -x "$BIN_PATH" ] && [ -r "$CONFIG_FILE" ]; then
+    "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
+  fi
+  project_unit_stopped warp-vps.service || return 1
+  if [ "$PREVIOUS_MODE" = "wireguard" ]; then
+    previous_wg_routes_absent || {
+      log "旧版 Google WireGuard 路由未能完整清除"
+      return 1
+    }
+  elif [ "$PREVIOUS_MODE" = "socks" ] && ! project_nft_table_absent; then
+    log "旧版 Socks5 nftables 分流规则未能清除"
+    return 1
+  fi
+}
+
+prepare_target_backend() {
+  local selected_mode="$1"
+  [ "$INSTALL_BACKEND_REUSED" -eq 0 ] || return 0
+  if [ "$selected_mode" = "wireguard" ]; then
+    if [ "$PREVIOUS_MODE" = "wireguard" ] && [ "$INSTALL_RUNTIME_TOUCHED" -eq 0 ]; then
+      log "现有 WireGuard 需要重建；配置和预检将在失败恢复保护下执行"
+      return 0
+    fi
+    if [ "$TARGET_CONFIG_PREPARED" -eq 0 ]; then
+      log "正在准备 WireGuard WARP 配置；当前分流尚未停止"
+      TARGET_PREP_STARTED=1
+      WARP_VPS_CONFIG_FILE="$TARGET_CONFIG_FILE" \
+        WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
+        "$PROJECT_STAGE_DIR/bin/warp-vps" setup-wireguard || return 1
+      TARGET_CONFIG_PREPARED=1
+    fi
+    if [ "$INSTALL_RUNTIME_TOUCHED" -eq 0 ]; then
+      log "WireGuard 配置已准备完成；将在旧分流暂停后执行本地路由预检"
+      return 0
+    fi
+    log "正在预检 WireGuard 网卡和本地路由"
+    WARP_VPS_CONFIG_FILE="$TARGET_CONFIG_FILE" \
+      WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
+      "$PROJECT_STAGE_DIR/bin/warp-vps" preflight-wireguard || return 1
+    TARGET_BACKEND_PREPARED=1
+    return 0
+  fi
+  if [ "$PREVIOUS_MODE" = "socks" ]; then
+    log "Socks5 端口变更将在旧规则停止后应用"
+    return 0
+  fi
+  log "正在准备 Cloudflare WARP SOCKS；当前分流尚未停止"
+  TARGET_PREP_STARTED=1
+  WARP_VPS_CONFIG_FILE="$TARGET_CONFIG_FILE" \
+    WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
+    "$PROJECT_STAGE_DIR/bin/warp-vps" configure-warp || return 1
+  TARGET_BACKEND_PREPARED=1
 }
 
 stop_project_runtime() {
   local runtime_iface="${1:-$WG_IFACE}"
   local runtime_config="${2:-$WG_CONFIG}"
+  local preserve_warp_service="${3:-0}"
   local unit
   systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
-  systemctl disable warp-vps-health.timer >/dev/null 2>&1 || true
   if ! project_unit_stopped warp-vps-health.timer; then
     log "健康检查定时器仍在运行：warp-vps-health.timer"
     return 1
@@ -940,7 +1325,7 @@ stop_project_runtime() {
     systemctl stop "$unit" >/dev/null 2>&1 || true
     systemctl disable "$unit" >/dev/null 2>&1 || true
   done
-  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ]; then
+  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ] && [ "$preserve_warp_service" -eq 0 ]; then
     systemctl stop warp-svc.service >/dev/null 2>&1 || true
     systemctl disable warp-svc.service >/dev/null 2>&1 || true
   fi
@@ -982,17 +1367,17 @@ stop_project_runtime() {
       log "旧模式服务仍在运行：$unit"
       return 1
     fi
-    if systemctl is-enabled --quiet "$unit"; then
+    if ! project_unit_disabled "$unit"; then
       log "旧模式服务仍保持启用：$unit"
       return 1
     fi
   done
-  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ]; then
+  if [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ] && [ "$preserve_warp_service" -eq 0 ]; then
     if ! project_unit_stopped warp-svc.service; then
       log "本项目管理的 WARP 服务仍在运行：warp-svc.service"
       return 1
     fi
-    if systemctl is-enabled --quiet warp-svc.service; then
+    if ! project_unit_disabled warp-svc.service; then
       log "本项目管理的 WARP 服务仍保持启用：warp-svc.service"
       return 1
     fi
@@ -1012,26 +1397,173 @@ cleanup_failed_install() {
   trap - EXIT
   if [ "$INSTALL_CLEANUP_ARMED" -eq 1 ] && [ "$INSTALL_COMPLETE" -eq 0 ]; then
     set +e
-    log "安装未完成，正在停止本项目运行态；已有 CLI、配置和日志会保留"
-    stop_project_runtime
+    log "安装未完成，正在恢复安装前的项目文件和运行态"
+    if restore_previous_runtime; then
+      log "已恢复安装前的项目运行态；本次错误仍保留在上方输出"
+    else
+      log "未能完整恢复安装前运行态；配置、回滚文件和日志已保留：$PROJECT_BACKUP_DIR"
+    fi
   fi
   exit "$rc"
 }
 
+restore_previous_runtime() {
+  local failed=0
+
+  if [ "$INSTALL_RUNTIME_TOUCHED" -eq 0 ]; then
+    if [ "$TARGET_PREP_STARTED" -eq 0 ] && [ "$INSTALL_FILES_ACTIVATED" -eq 0 ]; then
+      restore_health_automation \
+        || log "自动健康检查未能恢复；旧分流运行态未受影响"
+      return 0
+    fi
+    cleanup_prepared_target "$TARGET_MODE" || failed=1
+    restore_prepared_target_files || return 1
+    restore_health_automation \
+      || log "自动健康检查未能恢复；旧分流运行态未受影响"
+    [ "$failed" -eq 0 ]
+    return
+  fi
+
+  if [ "$INSTALL_FILES_ACTIVATED" -eq 1 ]; then
+    if [ "$INSTALL_BACKEND_REUSED" -eq 1 ]; then
+      stop_reused_target_routing || failed=1
+    else
+      stop_project_runtime "$WG_IFACE" "$WG_CONFIG" || failed=1
+    fi
+  fi
+  cleanup_prepared_target "$TARGET_MODE" || failed=1
+  restore_project_files || return 1
+  systemctl daemon-reload >/dev/null 2>&1 || failed=1
+
+  if [ -f "$PROJECT_BACKUP_DIR/config.env" ]; then
+    start_previous_runtime || failed=1
+  else
+    restore_health_automation \
+      || log "自动健康检查未能恢复；不影响已清理的目标分流"
+  fi
+  [ "$failed" -eq 0 ]
+}
+
+cleanup_prepared_target() {
+  local selected_mode="$1"
+  local interface_rc=1 failed=0
+  [ "$TARGET_PREP_STARTED" -eq 1 ] || return 0
+
+  if [ "$selected_mode" = "wireguard" ]; then
+    systemctl stop "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
+    if [ -x "$PROJECT_STAGE_DIR/bin/warp-vps" ] && [ -r "$TARGET_CONFIG_FILE" ]; then
+      WARP_VPS_CONFIG_FILE="$TARGET_CONFIG_FILE" \
+        WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
+        "$PROJECT_STAGE_DIR/bin/warp-vps" stop-rules >/dev/null 2>&1 || true
+    fi
+    project_wg_interface_present "$WG_IFACE" || interface_rc=$?
+    [ "$interface_rc" -ne 2 ] || return 1
+    if [ "$interface_rc" -eq 0 ]; then
+      if command -v wg-quick >/dev/null 2>&1; then
+        wg-quick down "$WG_CONFIG" >/dev/null 2>&1 \
+          || wg-quick down "$WG_IFACE" >/dev/null 2>&1 \
+          || true
+      fi
+      project_wg_interface_present "$WG_IFACE" || interface_rc=$?
+      if [ "$interface_rc" -eq 0 ]; then
+        ip link delete dev "$WG_IFACE" >/dev/null 2>&1 || failed=1
+      elif [ "$interface_rc" -eq 2 ]; then
+        failed=1
+      fi
+    fi
+    interface_rc=1
+    project_wg_interface_present "$WG_IFACE" || interface_rc=$?
+    [ "$interface_rc" -eq 1 ] || failed=1
+  elif [ "$selected_mode" = "socks" ] && [ "$PREVIOUS_MODE" != "socks" ] \
+    && [ "$MANAGED_WARP_SVC_VALUE" -eq 1 ]; then
+    systemctl stop warp-svc.service >/dev/null 2>&1 || true
+    systemctl disable warp-svc.service >/dev/null 2>&1 || true
+    project_unit_stopped warp-svc.service || failed=1
+    project_unit_disabled warp-svc.service || failed=1
+  fi
+  [ "$failed" -eq 0 ]
+}
+
+restore_prepared_target_files() {
+  [ -n "$PROJECT_BACKUP_DIR" ] || return 1
+  install -d -m 0755 "$PROJECT_BACKUP_DIR/failed-new" || return 1
+  [ "$TARGET_MODE" = "wireguard" ] || return 0
+  restore_project_file "$WG_CONFIG" "$PROJECT_BACKUP_DIR/wireguard.conf" wireguard-config 0600 || return 1
+  restore_project_file "$WGCF_ACCOUNT" "$PROJECT_BACKUP_DIR/state/wgcf/wgcf-account.toml" wgcf-account 0600 || return 1
+  restore_project_file "$WGCF_BIN" "$PROJECT_BACKUP_DIR/app/bin/wgcf" wgcf-binary 0755 || return 1
+}
+
+stop_reused_target_routing() {
+  local failed=0
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  if [ -x "$BIN_PATH" ] && [ -r "$CONFIG_FILE" ]; then
+    "$BIN_PATH" stop-rules >/dev/null 2>&1 || failed=1
+  fi
+  project_unit_stopped warp-vps.service || failed=1
+  if [ "$TARGET_MODE" = "wireguard" ]; then
+    previous_wg_routes_absent || failed=1
+  elif [ "$TARGET_MODE" = "socks" ]; then
+    systemctl stop warp-vps-redsocks.service >/dev/null 2>&1 || true
+    project_unit_stopped warp-vps-redsocks.service || failed=1
+    project_nft_table_absent || failed=1
+  fi
+  [ "$failed" -eq 0 ]
+}
+
+restore_health_automation() {
+  [ "$HEALTH_AUTOMATION_TOUCHED" -eq 1 ] || return 0
+  if [ "$PREVIOUS_HEALTH_TIMER_ACTIVE" -eq 1 ]; then
+    systemctl start warp-vps-health.timer >/dev/null 2>&1 || return 1
+  else
+    systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  fi
+}
+
+start_previous_runtime() {
+  local old_warp_port=""
+  "$BIN_PATH" install-systemd || return 1
+  systemctl daemon-reload || return 1
+  if [ "$PREVIOUS_MODE" = "wireguard" ]; then
+    enable_and_start_unit "wg-quick@${PREVIOUS_WG_IFACE}.service" || return 1
+  elif [ "$PREVIOUS_MODE" = "socks" ]; then
+    enable_and_start_unit warp-svc.service || return 1
+    old_warp_port="$(awk -F= '$1 == "WARP_SOCKS_PORT" { print $2; exit }' "$CONFIG_FILE")"
+    if ! valid_port "$old_warp_port" || ! port_in_use "$old_warp_port"; then
+      "$BIN_PATH" configure-warp || return 1
+    fi
+    enable_and_start_unit warp-vps-redsocks.service || return 1
+  else
+    return 1
+  fi
+  enable_and_start_unit warp-vps.service || return 1
+  restore_health_automation || log "原自动健康检查状态未能恢复；不影响已恢复的分流运行"
+  "$BIN_PATH" status
+}
+
 enable_project_unit() {
   local unit="$1"
-  systemctl enable --now "$unit" || die "无法启动系统服务：$unit"
+  enable_and_start_unit "$unit" || die "无法启动系统服务：$unit"
+}
+
+enable_and_start_unit() {
+  local unit="$1"
+  systemctl enable "$unit" || return 1
+  systemctl start "$unit"
+}
+
+enable_health_timer() {
+  if systemctl enable warp-vps-health.timer >/dev/null 2>&1 \
+    && systemctl start warp-vps-health.timer >/dev/null 2>&1; then
+    return 0
+  fi
+  log "自动健康检查定时器未能启用；不影响当前分流运行"
+  return 0
 }
 
 run_final_self_check() {
-  if "$BIN_PATH" status; then
-    return 0
-  fi
-  log "最终自检失败，正在停止本项目服务和分流规则"
-  if stop_project_runtime; then
-    INSTALL_CLEANUP_ARMED=0
-  fi
-  die "最终自检失败；已停止本项目运行态，CLI、配置和日志已保留。请运行 warp-vps logs 排查，修复后可直接重跑安装器"
+  "$BIN_PATH" status
 }
 
 main() {
@@ -1041,41 +1573,68 @@ main() {
 
   local selected_mode warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
   local reusable_warp_port=""
-  selected_mode="$(prompt_install_mode)"
+  local reusable_redsocks_port=""
+  local prompted_mode locked_mode locked_warp_port locked_redsocks_port
+  local preserve_warp_service=0
+  if [ -e "$CONFIG_FILE" ]; then
+    [ -r "$CONFIG_FILE" ] || die "现有配置无法读取，未修改当前运行态：$CONFIG_FILE"
+    prompted_mode="$(read_project_mode)" \
+      || die "现有配置缺少有效的 WARP_MODE，未修改当前运行态：$CONFIG_FILE"
+  else
+    prompted_mode=""
+  fi
+  selected_mode="$(prompt_install_mode "$prompted_mode")"
+  TARGET_MODE="$selected_mode"
   collect_swap_choice
   if [ "$selected_mode" = "socks" ]; then
     reusable_warp_port="$(read_project_warp_port || true)"
+    reusable_redsocks_port="$(read_project_redsocks_port || true)"
     warp_port="$(prompt_warp_port "$reusable_warp_port")"
     valid_port "$warp_port" || die "内部错误：选择的 WARP SOCKS 端口无效"
-    redsocks_port="$(find_free_port "$warp_port")"
+    if [ "$warp_port" = "$reusable_warp_port" ] && [ -n "$reusable_redsocks_port" ]; then
+      redsocks_port="$reusable_redsocks_port"
+    else
+      redsocks_port="$(find_free_port "$warp_port")"
+    fi
     valid_port "$redsocks_port" || die "内部错误：选择的 redsocks 端口无效"
   else
     warp_port=0
     redsocks_port=0
   fi
 
+  acquire_operation_lock
+  locked_mode="$(read_project_mode || true)"
+  [ "$locked_mode" = "$prompted_mode" ] \
+    || die "等待输入期间安装模式已被其他管理操作修改，请重新运行安装器"
+  if [ "$prompted_mode" = "socks" ]; then
+    locked_warp_port="$(read_project_warp_port || true)"
+    locked_redsocks_port="$(read_project_redsocks_port || true)"
+    [ "$locked_warp_port" = "$reusable_warp_port" ] \
+      && [ "$locked_redsocks_port" = "$reusable_redsocks_port" ] \
+      || die "等待输入期间 Socks5 配置已被其他管理操作修改，请重新运行安装器"
+  fi
+  if [ "$SWAP_ACTION" = "create" ] && [ "$(swap_total_mb)" -gt 0 ]; then
+    log "检测到系统现已有 Swap，不再重复创建"
+    SWAP_ACTION="none"
+    SWAP_SIZE_MB=0
+  fi
   capture_service_ownership "$selected_mode"
   read_previous_wireguard_runtime
+  if [ "$selected_mode" = "wireguard" ] && [ "$PREVIOUS_MODE" = "wireguard" ]; then
+    WG_IFACE="$PREVIOUS_WG_IFACE"
+    WG_CONFIG="$PREVIOUS_WG_CONFIG"
+  fi
 
   log "正在下载并检查项目文件"
   stage_project_files
+  validate_existing_config
   backup_project_files || die "无法备份当前项目文件，安装未修改现有运行态"
-
-  INSTALL_CLEANUP_ARMED=1
-  trap cleanup_failed_install EXIT
-  stop_project_runtime "$PREVIOUS_WG_IFACE" "$PREVIOUS_WG_CONFIG" \
-    || die "无法停止上次安装留下的项目运行态"
-  log "正在安装项目文件和管理命令"
-  if ! activate_project_files; then
-    restore_project_files || die "项目文件写入失败，且无法恢复安装前文件"
-    die "项目文件写入失败，已恢复安装前文件；可以直接重跑安装器"
-  fi
-  write_config "$selected_mode" "$warp_port" "$redsocks_port" 0 root /usr/sbin/redsocks
 
   apply_swap_choice
 
   log "正在安装依赖"
   install_dependencies "$selected_mode"
+  validate_staged_rules "$PROJECT_STAGE_DIR" || die "下载的规则快照校验失败"
 
   if [ "$selected_mode" = "socks" ]; then
     disable_new_packaged_redsocks_service
@@ -1083,7 +1642,9 @@ main() {
     if [ "$warp_port" != "$reusable_warp_port" ] && port_in_use "$warp_port"; then
       die "安装依赖期间端口 $warp_port 被占用，请直接重跑安装器选择其他端口"
     fi
-    port_in_use "$redsocks_port" && die "安装依赖期间内部端口 $redsocks_port 被占用，请直接重跑安装器"
+    if [ "$redsocks_port" != "$reusable_redsocks_port" ] && port_in_use "$redsocks_port"; then
+      die "安装依赖期间内部端口 $redsocks_port 被占用，请直接重跑安装器"
+    fi
     ensure_redsocks_user
     redsocks_uid="$(id -u "$REDSOCKS_USER")"
     redsocks_group="$(id -gn "$REDSOCKS_USER")"
@@ -1095,33 +1656,71 @@ main() {
     redsocks_bin=/usr/sbin/redsocks
   fi
 
-  write_config "$selected_mode" "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
+  TARGET_CONFIG_FILE="$PROJECT_STAGE_DIR/config.env"
+  write_config_file "$TARGET_CONFIG_FILE" "$selected_mode" "$warp_port" "$redsocks_port" \
+    "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
+  if current_backend_reusable "$selected_mode" "$warp_port" "$reusable_warp_port"; then
+    INSTALL_BACKEND_REUSED=1
+    log "当前 ${selected_mode} 后端本地运行正常，重装期间保持运行"
+  fi
 
-  if [ "$selected_mode" = "socks" ]; then
-    log "正在配置 Cloudflare WARP SOCKS，端口：$warp_port"
-    "$BIN_PATH" configure-warp
+  INSTALL_CLEANUP_ARMED=1
+  trap cleanup_failed_install EXIT
+  quiesce_health_automation || die "无法暂停自动健康检查；当前分流保持不变"
+  if ! prepare_target_backend "$selected_mode"; then
+    die "目标模式未能准备完成；旧模式未停止，可处理上方错误后直接重跑安装器"
+  fi
+
+  if [ "$INSTALL_BACKEND_REUSED" -eq 1 ]; then
+    pause_project_routing || die "无法暂停旧分流规则；当前后端保持运行"
   else
-    log "正在配置 WireGuard WARP 高级模式"
-    "$BIN_PATH" setup-wireguard
-    "$BIN_PATH" preflight-wireguard
+    [ "$selected_mode" = "socks" ] && preserve_warp_service=1
+    INSTALL_RUNTIME_TOUCHED=1
+    stop_project_runtime "$PREVIOUS_WG_IFACE" "$PREVIOUS_WG_CONFIG" "$preserve_warp_service" \
+      || die "无法停止上次安装留下的项目运行态"
+  fi
+  if [ "$selected_mode" = "wireguard" ] && [ "$INSTALL_BACKEND_REUSED" -eq 0 ] \
+    && [ "$TARGET_BACKEND_PREPARED" -eq 0 ]; then
+    prepare_target_backend "$selected_mode" \
+      || die "WireGuard 目标模式预检失败；正在恢复安装前运行态"
+  fi
+  log "正在安装项目文件和管理命令"
+  INSTALL_FILES_ACTIVATED=1
+  activate_project_files || die "项目文件写入失败"
+  write_config "$selected_mode" "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
+  if [ "$selected_mode" = "socks" ] && [ "$INSTALL_BACKEND_REUSED" -eq 0 ] \
+    && [ "$TARGET_BACKEND_PREPARED" -eq 0 ]; then
+    log "正在应用新的 Cloudflare WARP SOCKS 端口：$warp_port"
+    TARGET_PREP_STARTED=1
+    "$BIN_PATH" configure-warp || die "Cloudflare WARP SOCKS 本地代理未就绪"
+    TARGET_BACKEND_PREPARED=1
   fi
 
   log "正在安装系统服务和分流规则"
   "$BIN_PATH" install-systemd || die "无法写入 systemd 服务"
   systemctl daemon-reload || die "systemd 重新加载失败"
   if [ "$selected_mode" = "socks" ]; then
-    enable_project_unit warp-vps-redsocks.service
+    enable_project_unit warp-svc.service
+    if [ "$INSTALL_BACKEND_REUSED" -eq 1 ]; then
+      systemctl enable warp-vps-redsocks.service \
+        || die "无法启用系统服务：warp-vps-redsocks.service"
+      systemctl restart warp-vps-redsocks.service \
+        || die "无法重新加载本地透明转发服务"
+    else
+      enable_project_unit warp-vps-redsocks.service
+    fi
   else
     enable_project_unit "wg-quick@${WG_IFACE}.service"
   fi
   enable_project_unit warp-vps.service
-  enable_project_unit warp-vps-health.timer
+  enable_health_timer
 
   log "正在运行最终自检"
-  run_final_self_check
+  run_final_self_check || die "最终本地自检失败"
   INSTALL_COMPLETE=1
   INSTALL_CLEANUP_ARMED=0
   trap - EXIT
+  release_operation_lock
 
   printf '\nWARP VPS Manager 安装完成。\n'
   if [ "$selected_mode" = "socks" ]; then

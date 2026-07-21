@@ -6,16 +6,18 @@ APP_DIR="/opt/${APP_NAME}"
 ETC_DIR="/etc/${APP_NAME}"
 STATE_DIR="/var/lib/${APP_NAME}"
 BACKUP_ROOT="/var/backups/${APP_NAME}"
-CONFIG_FILE="${ETC_DIR}/config.env"
+SELF_PATH="${BASH_SOURCE[0]:-$0}"
+CONFIG_FILE="${WARP_VPS_CONFIG_FILE:-${ETC_DIR}/config.env}"
 REDSOCKS_CONF="${ETC_DIR}/redsocks.conf"
 NFT_CONF="${ETC_DIR}/nftables.conf"
-RULES_DIR="${APP_DIR}/rules"
+RULES_DIR="${WARP_VPS_RULES_DIR:-${APP_DIR}/rules}"
 BIN_PATH="/usr/local/bin/warp-vps"
 DEFAULT_WG_IFACE="warp-vps-wg"
 DEFAULT_WGCF_BIN="${APP_DIR}/bin/wgcf"
 DEFAULT_WG_CONFIG="/etc/wireguard/${DEFAULT_WG_IFACE}.conf"
 DEFAULT_WGCF_VERSION="v2.2.31"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
+RUNTIME_LOCK_FILE="/run/${APP_NAME}.operation.lock"
 MANAGED_SWAP_FILE="/swapfile-warp-vps-manager"
 REDSOCKS_FALLBACK_BIN="/usr/local/sbin/redsocks"
 REDSOCKS_SOURCE_COMMIT="27b17889a43e32b0c1162514d00967e6967d41bb"
@@ -30,6 +32,8 @@ UNINSTALL_REMOVE_DEPENDENCIES=0
 UNINSTALL_WG_CONFIG_EXPLICIT=0
 UNINSTALL_WIREGUARD_PRESENT=0
 UNINSTALL_RUNTIME_IDENTIFIED=0
+HEALTH_MAINTENANCE_ARMED=0
+HEALTH_TIMER_WAS_ACTIVE=0
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -84,6 +88,48 @@ warn_line() {
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || die "请使用 root 用户运行"
+}
+
+run_with_runtime_lock() {
+  local policy="$1" rc
+  shift
+  require_root
+
+  if ! command -v flock >/dev/null 2>&1; then
+    "$@"
+    return
+  fi
+
+  if ! exec 9>"$RUNTIME_LOCK_FILE"; then
+    if [ "$policy" = "skip" ]; then
+      log "无法建立管理操作锁，本次健康检查跳过"
+      return 0
+    fi
+    die "无法建立管理操作锁，未修改当前运行态"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
+    return 1
+  fi
+
+  if [ "$policy" = "skip" ]; then
+    if ! flock -n 9; then
+      exec 9>&-
+      log "另一项管理操作正在进行，本次健康检查跳过"
+      return 0
+    fi
+  elif ! flock -w 10 9; then
+    exec 9>&-
+    die "另一项 WARP VPS Manager 管理操作正在进行，请稍后重试"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
+    return 1
+  fi
+
+  "$@"
+  rc=$?
+  flock -u 9 >/dev/null 2>&1 || true
+  exec 9>&-
+  return "$rc"
 }
 
 load_config() {
@@ -317,17 +363,26 @@ wg_interface_exists() {
   ip link show "$WG_IFACE" >/dev/null 2>&1
 }
 
+wg_interface_is_wireguard() {
+  wg show "$WG_IFACE" >/dev/null 2>&1
+}
+
 wg_interface_absent() {
-  local links
-  links="$(ip -o link show 2>/dev/null)" || return 1
-  ! awk -F ': ' -v iface="$WG_IFACE" '
+  local links state
+  links="$(ip -o link show 2>/dev/null)" || return 2
+  state="$(awk -F ': ' -v iface="$WG_IFACE" '
     {
       name=$2
       sub(/@.*/, "", name)
       if (name == iface) found=1
     }
-    END { exit !found }
-  ' <<< "$links"
+    END { print found ? "present" : "absent" }
+  ' <<< "$links")" || return 2
+  case "$state" in
+    absent) return 0 ;;
+    present) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 ssh_peer_ip() {
@@ -644,21 +699,24 @@ wireguard_routes_local_ok() {
   probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" || return 1
   route_uses_wg4 "$probe4" || return 1
   route_uses_wg6 "$probe6" || return 1
-  wg_default_routes_absent || return 1
-  socks_table_absent
+  wg_default_routes_absent
 }
 
 apply_wg_routes() {
-  local cidr
+  local cidr cleanup_message
   load_config
   validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4
   validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
-  wg_interface_exists || die "WireGuard 网卡不存在：$WG_IFACE"
+  wg_interface_is_wireguard || die "同名网卡不存在或不是 WireGuard：$WG_IFACE"
   protect_ssh_peer_route
   while IFS= read -r cidr; do
     if ! ip -4 route replace "$cidr" dev "$WG_IFACE"; then
-      stop_wg_routes
-      die "Google IPv4 路由写入失败，已清除本项目路由：$cidr"
+      if stop_wg_routes_strict; then
+        cleanup_message="已清除本项目路由"
+      else
+        cleanup_message="无法确认本项目路由已完整清除"
+      fi
+      die "Google IPv4 路由写入失败，${cleanup_message}：$cidr"
       # Tests replace die() to inspect this failure path.
       # shellcheck disable=SC2317
       return 1
@@ -666,16 +724,24 @@ apply_wg_routes() {
   done < <(route_file_lines "${RULES_DIR}/google_ipv4.txt")
   while IFS= read -r cidr; do
     if ! ip -6 route replace "$cidr" dev "$WG_IFACE"; then
-      stop_wg_routes
-      die "Google IPv6 路由写入失败，已清除本项目路由：$cidr"
+      if stop_wg_routes_strict; then
+        cleanup_message="已清除本项目路由"
+      else
+        cleanup_message="无法确认本项目路由已完整清除"
+      fi
+      die "Google IPv6 路由写入失败，${cleanup_message}：$cidr"
       # Tests replace die() to inspect this failure path.
       # shellcheck disable=SC2317
       return 1
     fi
   done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
   if ! wireguard_routes_local_ok; then
-    stop_wg_routes
-    die "WireGuard 本地路由边界检查失败，已清除本项目路由"
+    if stop_wg_routes_strict; then
+      cleanup_message="已清除本项目路由"
+    else
+      cleanup_message="无法确认本项目路由已完整清除"
+    fi
+    die "WireGuard 本地路由边界检查失败，${cleanup_message}"
     # Tests replace die() to inspect this failure path.
     # shellcheck disable=SC2317
     return 1
@@ -684,15 +750,96 @@ apply_wg_routes() {
 
 stop_wg_routes() {
   local cidr
-  [ -r "${RULES_DIR}/google_ipv4.txt" ] || return 0
-  while IFS= read -r cidr; do
-    ip -4 route del "$cidr" dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" 2>/dev/null || true
-  done < <(route_file_lines "${RULES_DIR}/google_ipv4.txt")
+  if [ -r "${RULES_DIR}/google_ipv4.txt" ]; then
+    while IFS= read -r cidr; do
+      ip -4 route del "$cidr" dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" 2>/dev/null || true
+    done < <(route_file_lines "${RULES_DIR}/google_ipv4.txt")
+  fi
   if [ -r "${RULES_DIR}/google_ipv6.txt" ]; then
     while IFS= read -r cidr; do
       ip -6 route del "$cidr" dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" 2>/dev/null || true
     done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
   fi
+}
+
+stop_wg_routes_strict() {
+  local cidr routes interface_rc cidrs4 cidrs6
+  local failed=0
+  local iface="${WG_IFACE:-$DEFAULT_WG_IFACE}"
+
+  interface_rc=0
+  wg_interface_absent || interface_rc=$?
+  case "$interface_rc" in
+    0) return 0 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  if ! wg_interface_exists; then
+    wg_interface_absent && return 0
+    return 1
+  fi
+
+  [ -r "${RULES_DIR}/google_ipv4.txt" ] || return 1
+  [ -r "${RULES_DIR}/google_ipv6.txt" ] || return 1
+  validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4 || return 1
+  validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6 || return 1
+  cidrs4="$(route_file_lines "${RULES_DIR}/google_ipv4.txt")" || return 1
+  cidrs6="$(route_file_lines "${RULES_DIR}/google_ipv6.txt")" || return 1
+
+  while IFS= read -r cidr; do
+    routes=""
+    if ! routes="$(ip -4 route show exact "$cidr" dev "$iface" 2>/dev/null)"; then
+      failed=1
+      continue
+    fi
+    if [ -n "$routes" ] && ! ip -4 route del "$cidr" dev "$iface"; then
+      failed=1
+    fi
+  done <<< "$cidrs4"
+  while IFS= read -r cidr; do
+    routes=""
+    if ! routes="$(ip -6 route show exact "$cidr" dev "$iface" 2>/dev/null)"; then
+      failed=1
+      continue
+    fi
+    if [ -n "$routes" ] && ! ip -6 route del "$cidr" dev "$iface"; then
+      failed=1
+    fi
+  done <<< "$cidrs6"
+
+  while IFS= read -r cidr; do
+    routes=""
+    if ! routes="$(ip -4 route show exact "$cidr" dev "$iface" 2>/dev/null)"; then
+      failed=1
+    elif [ -n "$routes" ]; then
+      failed=1
+    fi
+  done <<< "$cidrs4"
+  while IFS= read -r cidr; do
+    routes=""
+    if ! routes="$(ip -6 route show exact "$cidr" dev "$iface" 2>/dev/null)"; then
+      failed=1
+    elif [ -n "$routes" ]; then
+      failed=1
+    fi
+  done <<< "$cidrs6"
+  [ "$failed" -eq 0 ]
+}
+
+remove_wireguard_interface() {
+  local iface="${WG_IFACE:-$DEFAULT_WG_IFACE}"
+  local config="${WG_CONFIG:-/etc/wireguard/${iface}.conf}"
+  stop_wg_routes
+  if wg_interface_absent; then
+    return 0
+  fi
+  wg-quick down "$config" >/dev/null 2>&1 \
+    || wg-quick down "$iface" >/dev/null 2>&1 \
+    || true
+  if ! wg_interface_absent; then
+    ip link delete dev "$iface" >/dev/null 2>&1 || true
+  fi
+  wg_interface_absent
 }
 
 table_exists() {
@@ -701,9 +848,29 @@ table_exists() {
 
 socks_table_absent() {
   command -v nft >/dev/null 2>&1 || return 0
-  local tables
+  local tables rc
   tables="$(nft list tables 2>/dev/null)" || return 1
-  ! grep -Fxq 'table inet warp_vps' <<< "$tables"
+  rc=0
+  grep -Fxq 'table inet warp_vps' <<< "$tables" || rc=$?
+  case "$rc" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
+clear_socks_table_for_wireguard() {
+  command -v nft >/dev/null 2>&1 || return 0
+  local tables rc
+  tables="$(nft list tables 2>/dev/null)" || return 1
+  rc=0
+  grep -Fxq 'table inet warp_vps' <<< "$tables" || rc=$?
+  case "$rc" in
+    0) nft delete table inet warp_vps || return 1 ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
+  socks_table_absent
 }
 
 apply_rules() {
@@ -711,6 +878,7 @@ apply_rules() {
   validate_repo_raw_base "$REPO_RAW_BASE"
   install -d -m 0755 "$ETC_DIR"
   if [ "$WARP_MODE" = "wireguard" ]; then
+    clear_socks_table_for_wireguard || die "无法清除旧 Socks5 分流规则"
     apply_wg_routes
     return
   fi
@@ -975,15 +1143,20 @@ port_listening() {
   ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .
 }
 
-wait_for_socks_listen() {
-  local max_wait="${1:-20}"
+wait_for_port_listen() {
+  local port="$1"
+  local max_wait="${2:-20}"
   local waited=0
   while [ "$waited" -lt "$max_wait" ]; do
-    port_listening "$WARP_SOCKS_PORT" && return 0
+    port_listening "$port" && return 0
     sleep 1
     waited=$((waited + 1))
   done
-  port_listening "$WARP_SOCKS_PORT"
+  port_listening "$port"
+}
+
+wait_for_socks_listen() {
+  wait_for_port_listen "$WARP_SOCKS_PORT" "${1:-20}"
 }
 
 socks_trace() {
@@ -1008,7 +1181,7 @@ wait_for_wg_ready() {
   local timeout="${1:-20}"
   local end=$((SECONDS + timeout))
   while [ "$SECONDS" -le "$end" ]; do
-    if wg_interface_exists && wireguard_routes_local_ok; then
+    if wg_interface_is_wireguard && wireguard_routes_local_ok; then
       return 0
     fi
     sleep 2
@@ -1017,17 +1190,63 @@ wait_for_wg_ready() {
 }
 
 restart_wireguard_runtime() {
-  systemctl restart "wg-quick@${WG_IFACE}.service" || return 1
+  systemctl stop "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
+  remove_wireguard_interface || return 1
+  systemctl reset-failed "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
+  systemctl start "wg-quick@${WG_IFACE}.service" || return 1
   apply_rules || return 1
   wait_for_wg_ready 20
 }
 
 route_uses_wg4() {
-  ip -4 route get "$1" 2>/dev/null | grep -Fq "dev ${WG_IFACE}"
+  ip -4 route get "$1" 2>/dev/null | route_output_uses_interface "$WG_IFACE"
 }
 
 route_uses_wg6() {
-  ip -6 route get "$1" 2>/dev/null | grep -Fq "dev ${WG_IFACE}"
+  ip -6 route get "$1" 2>/dev/null | route_output_uses_interface "$WG_IFACE"
+}
+
+route_output_uses_interface() {
+  local iface="$1"
+  awk -v iface="$iface" '
+    {
+      for (i = 1; i < NF; i++) {
+        if ($i == "dev" && $(i + 1) == iface) found = 1
+      }
+    }
+    END { exit !found }
+  '
+}
+
+socks_wireguard_routes_absent() {
+  local probe4 route4 defaults4 defaults6
+  probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" || return 1
+  route4="$(ip -4 route get "$probe4" 2>/dev/null)" || return 1
+  if route_output_uses_interface "$WG_IFACE" <<< "$route4"; then
+    return 1
+  fi
+  defaults4="$(ip -4 route show default 2>/dev/null)" || return 1
+  defaults6="$(ip -6 route show default 2>/dev/null)" || return 1
+  if route_output_uses_interface "$WG_IFACE" <<< "$defaults4"; then
+    return 1
+  fi
+  ! route_output_uses_interface "$WG_IFACE" <<< "$defaults6"
+}
+
+clear_socks_wireguard_routes() {
+  local family defaults previous
+  stop_wg_routes
+  for family in 4 6; do
+    while true; do
+      defaults="$(ip -"$family" route show default 2>/dev/null)" || return 1
+      route_output_uses_interface "$WG_IFACE" <<< "$defaults" || break
+      previous="$defaults"
+      ip -"$family" route del default dev "$WG_IFACE" >/dev/null 2>&1 || break
+      defaults="$(ip -"$family" route show default 2>/dev/null)" || return 1
+      [ "$defaults" != "$previous" ] || return 1
+    done
+  done
+  socks_wireguard_routes_absent
 }
 
 google_counter() {
@@ -1043,6 +1262,54 @@ service_enabled() {
   systemctl is-enabled --quiet "$1"
 }
 
+ensure_health_timer() {
+  local failed=0
+  systemctl enable warp-vps-health.timer >/dev/null 2>&1 || failed=1
+  systemctl start warp-vps-health.timer >/dev/null 2>&1 || failed=1
+  if [ "$failed" -eq 1 ]; then
+    warn "自动健康检查定时器未能启用；不影响当前分流运行"
+  fi
+  return 0
+}
+
+restore_health_timer_on_exit() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  if [ "$HEALTH_MAINTENANCE_ARMED" -eq 1 ] && [ "$HEALTH_TIMER_WAS_ACTIVE" -eq 1 ]; then
+    systemctl start warp-vps-health.timer >/dev/null 2>&1 \
+      || warn "维护操作结束后无法恢复健康检查定时器"
+  fi
+  exit "$rc"
+}
+
+begin_runtime_maintenance() {
+  if [ "$HEALTH_MAINTENANCE_ARMED" -eq 0 ]; then
+    HEALTH_TIMER_WAS_ACTIVE=0
+    if uninstall_unit_is_active warp-vps-health.timer; then
+      HEALTH_TIMER_WAS_ACTIVE=1
+    fi
+    HEALTH_MAINTENANCE_ARMED=1
+    trap restore_health_timer_on_exit EXIT
+  fi
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
+  systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
+  if uninstall_unit_is_active warp-vps-health.timer; then
+    return 1
+  fi
+  if uninstall_unit_is_active warp-vps-health.service; then
+    return 1
+  fi
+}
+
+finish_runtime_maintenance() {
+  ensure_health_timer
+  HEALTH_MAINTENANCE_ARMED=0
+  HEALTH_TIMER_WAS_ACTIVE=0
+  trap - EXIT
+}
+
 unit_ready() {
   service_active "$1" && service_enabled "$1"
 }
@@ -1050,14 +1317,12 @@ unit_ready() {
 required_runtime_units_ready() {
   if [ "$WARP_MODE" = "wireguard" ]; then
     unit_ready "wg-quick@${WG_IFACE}.service" \
-      && unit_ready warp-vps.service \
-      && unit_ready warp-vps-health.timer
+      && unit_ready warp-vps.service
     return
   fi
   unit_ready warp-svc.service \
     && unit_ready warp-vps-redsocks.service \
-    && unit_ready warp-vps.service \
-    && unit_ready warp-vps-health.timer
+    && unit_ready warp-vps.service
 }
 
 warp_cli() {
@@ -1166,7 +1431,11 @@ configure_warp_runtime() {
     warn "找不到 warp-cli"
     return 1
   }
-  systemctl enable --now warp-svc.service >/dev/null 2>&1 || {
+  systemctl enable warp-svc.service >/dev/null 2>&1 || {
+    warn "无法启用 warp-svc.service"
+    return 1
+  }
+  systemctl start warp-svc.service >/dev/null 2>&1 || {
     warn "无法启动 warp-svc.service"
     return 1
   }
@@ -1216,16 +1485,16 @@ socks_nft_rules_local_ok() {
 test_quiet() {
   load_config
   if [ "$WARP_MODE" = "wireguard" ]; then
-    wg_interface_exists || return 1
-    wireguard_routes_local_ok
+    wg_interface_is_wireguard || return 1
+    wireguard_routes_local_ok && socks_table_absent
     return
   fi
   wait_for_socks_listen 8 || return 1
   port_listening "$REDSOCKS_PORT" || return 1
   service_active warp-vps-redsocks.service || return 1
-  wg_interface_absent || return 1
   table_exists || return 1
-  socks_nft_rules_local_ok
+  socks_nft_rules_local_ok || return 1
+  socks_wireguard_routes_absent
 }
 
 print_rule_summary() {
@@ -1507,7 +1776,7 @@ run_external_diagnostics() {
     if wg_handshake_recent; then
       ok_line "WireGuard 最近有握手"
     else
-      warn_line "WireGuard 暂无近期握手；不影响本地运行状态"
+      info_line "WireGuard 握手暂时无法确认"
     fi
     return 0
   fi
@@ -1560,16 +1829,15 @@ run_self_check() {
     fi
 
     if unit_ready warp-vps-health.timer; then
-      ok_line "健康检查定时器正常"
+      ok_line "自动健康检查已启用"
     else
-      fail_line "健康检查定时器异常"
-      failed=1
+      info_line "自动健康检查未启用；不影响当前分流"
     fi
 
-    if wg_interface_exists; then
-      ok_line "WireGuard 网卡已启动"
+    if wg_interface_is_wireguard; then
+      ok_line "WireGuard 网卡身份和本地状态正常"
     else
-      fail_line "WireGuard 网卡未启动"
+      fail_line "项目同名网卡不存在或不是 WireGuard"
       failed=1
     fi
 
@@ -1601,12 +1869,6 @@ run_self_check() {
     else
       fail_line "旧 Socks5 nftables 分流规则仍在生效，或状态无法读取"
       failed=1
-    fi
-
-    if wg_handshake_recent; then
-      ok_line "WireGuard 最近有握手"
-    else
-      warn_line "WireGuard 暂无近期握手；这不代表本地配置失败"
     fi
 
     section "结论"
@@ -1645,10 +1907,9 @@ run_self_check() {
   fi
 
   if unit_ready warp-vps-health.timer; then
-    ok_line "健康检查定时器正常"
+    ok_line "自动健康检查已启用"
   else
-    fail_line "健康检查定时器异常"
-    failed=1
+    info_line "自动健康检查未启用；不影响当前分流"
   fi
 
   if wait_for_socks_listen 8; then
@@ -1679,13 +1940,6 @@ run_self_check() {
     failed=1
   fi
 
-  if wg_interface_absent; then
-    ok_line "未发现旧 WireGuard 项目网卡"
-  else
-    fail_line "旧 WireGuard 项目网卡仍在运行，或状态无法读取"
-    failed=1
-  fi
-
   nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null || true)"
   if grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules"; then
     ok_line "Google IPv4 TCP 重定向规则已加载"
@@ -1706,6 +1960,13 @@ run_self_check() {
     ok_line "已阻断 Google 目标 IPv6，防止 IPv6 泄漏"
   else
     fail_line "未找到 Google IPv6 防泄漏规则"
+    failed=1
+  fi
+
+  if socks_wireguard_routes_absent; then
+    ok_line "未发现旧 WireGuard Google 路由或默认路由接管"
+  else
+    fail_line "旧 WireGuard Google 路由、默认路由仍在生效，或无法读取本地路由状态"
     failed=1
   fi
 
@@ -1761,26 +2022,30 @@ cmd_restart() {
   require_root
   load_config
   section "正在重启"
+  begin_runtime_maintenance || die "无法暂停健康检查，未执行重启"
   if [ "$WARP_MODE" = "wireguard" ]; then
-    info_line "正在重启 WireGuard WARP 网卡和分流路由，请稍等"
-    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null \
+    info_line "正在检查 WireGuard WARP 网卡并重新加载分流路由，请稍等"
+    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service >/dev/null \
       || die "无法启用 WireGuard 项目服务"
-    restart_wireguard_runtime || die "重启后 WireGuard 本地运行态未就绪"
+    if ! service_active "wg-quick@${WG_IFACE}.service" || ! wg_interface_is_wireguard; then
+      restart_wireguard_runtime || die "重启后 WireGuard 本地运行态未就绪"
+    fi
     systemctl restart warp-vps.service || die "无法重启分流规则服务"
-    systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
     run_self_check
+    finish_runtime_maintenance
     return
   fi
 
   info_line "正在重启 WARP 和本地分流服务，请稍等"
-  systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null \
+  systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service >/dev/null \
     || die "无法启用 Socks5 项目服务"
-  configure_warp_runtime || die "重启后 Cloudflare WARP SOCKS 本地代理未就绪"
+  if ! service_active warp-svc.service || ! port_listening "$WARP_SOCKS_PORT"; then
+    configure_warp_runtime || die "重启后 Cloudflare WARP SOCKS 本地代理未就绪"
+  fi
   systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
-  apply_rules || die "无法重新加载分流规则"
   systemctl restart warp-vps.service || die "无法重启分流规则服务"
-  systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
   run_self_check
+  finish_runtime_maintenance
 }
 
 cmd_setup_wireguard() {
@@ -1799,16 +2064,10 @@ cmd_preflight_wireguard() {
   [ "$WARP_MODE" = "wireguard" ] || die "当前不是 WireGuard 模式"
   [ -r "$WG_CONFIG" ] || die "找不到 WireGuard 配置：$WG_CONFIG"
   command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick，请先安装 wireguard-tools"
-  if wg_interface_exists; then
+  if ! wg_interface_absent; then
     info_line "正在停止上次安装留下的 WireGuard 网卡：$WG_IFACE"
-    stop_wg_routes || true
-    wg-quick down "$WG_CONFIG" >/dev/null 2>&1 \
-      || wg-quick down "$WG_IFACE" >/dev/null 2>&1 \
-      || true
-    if wg_interface_exists; then
-      ip link delete dev "$WG_IFACE" >/dev/null 2>&1 \
-        || die "无法停止本项目 WireGuard 网卡：$WG_IFACE"
-    fi
+    remove_wireguard_interface \
+      || die "无法停止本项目 WireGuard 网卡：$WG_IFACE"
   fi
 
   local failed
@@ -1818,17 +2077,13 @@ cmd_preflight_wireguard() {
     failed=1
   fi
   if [ "$failed" -eq 0 ]; then
-    if ! "$BIN_PATH" apply; then
+    if ! "$SELF_PATH" apply; then
       failed=1
-    elif ! test_quiet; then
+    elif ! wireguard_routes_local_ok; then
       failed=1
     fi
   fi
-  if ! stop_wg_routes; then
-    failed=1
-  fi
-  wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
-  if wg_interface_exists; then
+  if ! remove_wireguard_interface; then
     failed=1
   fi
   [ "$failed" -eq 0 ] || die "WireGuard 预检失败，未写入开机服务"
@@ -1845,33 +2100,60 @@ download_update_asset() {
 
 validate_update_stage() {
   local stage="$1"
-  bash -n "${stage}/install.sh"
-  bash -n "${stage}/bin/warp-vps"
-  validate_rules_file "${stage}/rules/google_ipv4.txt" 4
-  validate_rules_file "${stage}/rules/google_ipv6.txt" 6
-  python3 -m json.tool "${stage}/rules/rules.meta.json" >/dev/null
+  bash -n "${stage}/install.sh" || return 1
+  bash -n "${stage}/bin/warp-vps" || return 1
+  validate_rules_file "${stage}/rules/google_ipv4.txt" 4 || return 1
+  validate_rules_file "${stage}/rules/google_ipv6.txt" 6 || return 1
+  python3 - "$stage" <<'PY' || return 1
+import json
+import pathlib
+import sys
+
+stage = pathlib.Path(sys.argv[1])
+counts = {}
+for family in ("ipv4", "ipv6"):
+    path = stage / "rules" / f"google_{family}.txt"
+    counts[family] = sum(
+        1
+        for raw in path.read_text(encoding="utf-8").splitlines()
+        if raw.strip() and not raw.strip().startswith("#")
+    )
+meta_path = stage / "rules" / "rules.meta.json"
+meta = json.loads(meta_path.read_text(encoding="utf-8"))
+if not isinstance(meta, dict):
+    raise SystemExit(f"{meta_path}: metadata must be a JSON object")
+for family in ("ipv4", "ipv6"):
+    key = f"{family}_count"
+    value = meta.get(key)
+    if type(value) is not int or value != counts[family]:
+        raise SystemExit(
+            f"{meta_path}: {key}={value!r}, actual={counts[family]}"
+        )
+PY
+  return 0
 }
 
 backup_current_installation() {
   local backup="$1"
-  install -d -m 0755 "${backup}/bin" "${backup}/rules"
-  if [ -f "${APP_DIR}/install.sh" ]; then
-    install -m 0755 "${APP_DIR}/install.sh" "${backup}/install.sh" || return 1
-  fi
-  if [ -f "${APP_DIR}/bin/warp-vps" ]; then
-    install -m 0755 "${APP_DIR}/bin/warp-vps" "${backup}/bin/warp-vps" || return 1
-  fi
-  if [ -f "${RULES_DIR}/google_ipv4.txt" ]; then
-    install -m 0644 "${RULES_DIR}/google_ipv4.txt" "${backup}/rules/google_ipv4.txt" || return 1
-  fi
-  if [ -f "${RULES_DIR}/google_ipv6.txt" ]; then
-    install -m 0644 "${RULES_DIR}/google_ipv6.txt" "${backup}/rules/google_ipv6.txt" || return 1
-  fi
-  if [ -f "${RULES_DIR}/rules.meta.json" ]; then
-    install -m 0644 "${RULES_DIR}/rules.meta.json" "${backup}/rules/rules.meta.json" || return 1
-  fi
-  if [ -f "$BIN_PATH" ]; then
-    install -m 0755 "$BIN_PATH" "${backup}/warp-vps" || return 1
+  install -d -m 0755 "${backup}/bin" "${backup}/rules" "${backup}/missing"
+  backup_update_file "${APP_DIR}/install.sh" "${backup}/install.sh" app-install 0755 "$backup" || return 1
+  backup_update_file "${APP_DIR}/bin/warp-vps" "${backup}/bin/warp-vps" app-manager 0755 "$backup" || return 1
+  backup_update_file "${RULES_DIR}/google_ipv4.txt" "${backup}/rules/google_ipv4.txt" rules-ipv4 0644 "$backup" || return 1
+  backup_update_file "${RULES_DIR}/google_ipv6.txt" "${backup}/rules/google_ipv6.txt" rules-ipv6 0644 "$backup" || return 1
+  backup_update_file "${RULES_DIR}/rules.meta.json" "${backup}/rules/rules.meta.json" rules-meta 0644 "$backup" || return 1
+  backup_update_file "$BIN_PATH" "${backup}/warp-vps" command 0755 "$backup" || return 1
+}
+
+backup_update_file() {
+  local source="$1"
+  local backup="$2"
+  local label="$3"
+  local mode="$4"
+  local backup_root="$5"
+  if [ -f "$source" ]; then
+    install -m "$mode" "$source" "$backup" || return 1
+  else
+    : > "${backup_root}/missing/$label" || return 1
   fi
 }
 
@@ -1887,23 +2169,25 @@ activate_update_stage() {
 
 restore_update_backup() {
   local backup="$1"
-  if [ -f "${backup}/install.sh" ]; then
-    install -m 0755 "${backup}/install.sh" "${APP_DIR}/install.sh" || return 1
-  fi
-  if [ -f "${backup}/bin/warp-vps" ]; then
-    install -m 0755 "${backup}/bin/warp-vps" "${APP_DIR}/bin/warp-vps" || return 1
-  fi
-  if [ -f "${backup}/rules/google_ipv4.txt" ]; then
-    install -m 0644 "${backup}/rules/google_ipv4.txt" "${RULES_DIR}/google_ipv4.txt" || return 1
-  fi
-  if [ -f "${backup}/rules/google_ipv6.txt" ]; then
-    install -m 0644 "${backup}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt" || return 1
-  fi
-  if [ -f "${backup}/rules/rules.meta.json" ]; then
-    install -m 0644 "${backup}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json" || return 1
-  fi
-  if [ -f "${backup}/warp-vps" ]; then
-    install -m 0755 "${backup}/warp-vps" "$BIN_PATH" || return 1
+  install -d -m 0755 "${backup}/failed-new" || return 1
+  restore_update_file "${APP_DIR}/install.sh" "${backup}/install.sh" app-install 0755 "$backup" || return 1
+  restore_update_file "${APP_DIR}/bin/warp-vps" "${backup}/bin/warp-vps" app-manager 0755 "$backup" || return 1
+  restore_update_file "${RULES_DIR}/google_ipv4.txt" "${backup}/rules/google_ipv4.txt" rules-ipv4 0644 "$backup" || return 1
+  restore_update_file "${RULES_DIR}/google_ipv6.txt" "${backup}/rules/google_ipv6.txt" rules-ipv6 0644 "$backup" || return 1
+  restore_update_file "${RULES_DIR}/rules.meta.json" "${backup}/rules/rules.meta.json" rules-meta 0644 "$backup" || return 1
+  restore_update_file "$BIN_PATH" "${backup}/warp-vps" command 0755 "$backup" || return 1
+}
+
+restore_update_file() {
+  local live="$1"
+  local backup_file="$2"
+  local label="$3"
+  local mode="$4"
+  local backup_root="$5"
+  if [ -f "$backup_file" ]; then
+    install -m "$mode" "$backup_file" "$live" || return 1
+  elif [ -f "${backup_root}/missing/$label" ] && [ -e "$live" ]; then
+    mv "$live" "${backup_root}/failed-new/$label" || return 1
   fi
 }
 
@@ -1911,17 +2195,18 @@ reload_runtime_after_update() {
   "$BIN_PATH" install-systemd || return 1
   systemctl daemon-reload || return 1
   if [ "$WARP_MODE" = "wireguard" ]; then
-    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null || return 1
-    restart_wireguard_runtime || return 1
-    systemctl restart warp-vps.service || return 1
-    systemctl start warp-vps-health.timer || return 1
+    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service >/dev/null || return 1
+    if ! service_active "wg-quick@${WG_IFACE}.service" || ! wg_interface_is_wireguard; then
+      restart_wireguard_runtime || return 1
+    fi
+    systemctl start warp-vps.service || return 1
   else
-    systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null || return 1
-    configure_warp_runtime || return 1
+    systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service >/dev/null || return 1
+    if ! service_active warp-svc.service || ! port_listening "$WARP_SOCKS_PORT"; then
+      configure_warp_runtime || return 1
+    fi
     systemctl restart warp-vps-redsocks.service || return 1
-    "$BIN_PATH" apply || return 1
-    systemctl restart warp-vps.service || return 1
-    systemctl start warp-vps-health.timer || return 1
+    systemctl start warp-vps.service || return 1
   fi
   "$BIN_PATH" status || return 1
 }
@@ -1929,9 +2214,9 @@ reload_runtime_after_update() {
 cmd_update() {
   require_root
   load_config
-  local stage backup
-  stage="${STATE_DIR}/downloads/$(date -u +%Y%m%dT%H%M%SZ)"
-  backup="${STATE_DIR}/rollback/$(date -u +%Y%m%dT%H%M%SZ)"
+  local stage backup pause_failed=0 recovery_message recovery_ok=0
+  stage="${STATE_DIR}/downloads/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  backup="${STATE_DIR}/rollback/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   section "正在更新"
   info_line "正在从 GitHub 同步脚本和固定规则快照"
   install -d -m 0755 "${stage}/bin" "${stage}/rules"
@@ -1942,21 +2227,64 @@ cmd_update() {
   download_update_asset "rules/rules.meta.json" "${stage}/rules/rules.meta.json"
   validate_update_stage "$stage"
   backup_current_installation "$backup" || die "无法备份当前安装，更新已中止"
+  begin_runtime_maintenance || die "无法暂停健康检查，更新未修改运行态"
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
+  if service_active warp-vps.service; then
+    pause_failed=1
+  fi
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    stop_wg_routes_strict || pause_failed=1
+  elif ! socks_table_absent; then
+    pause_failed=1
+  fi
+  if [ "$pause_failed" -eq 1 ]; then
+    if systemctl restart warp-vps.service >/dev/null 2>&1 \
+      || systemctl start warp-vps.service >/dev/null 2>&1; then
+      if [ "$WARP_MODE" = "wireguard" ]; then
+        if service_active warp-vps.service \
+          && wireguard_routes_local_ok && socks_table_absent; then
+          recovery_ok=1
+        fi
+      elif service_active warp-vps.service \
+        && table_exists && socks_nft_rules_local_ok; then
+        recovery_ok=1
+      fi
+    fi
+    if [ "$recovery_ok" -eq 1 ]; then
+      recovery_message="旧分流规则已恢复"
+    else
+      recovery_message="旧分流规则运行态也未能确认恢复"
+    fi
+    die "无法确认旧分流规则已暂停，更新未替换项目文件；${recovery_message}"
+  fi
   if ! activate_update_stage "$stage"; then
     warn_line "更新文件激活失败，正在恢复旧文件"
     restore_update_backup "$backup" || die "更新文件激活失败，且无法恢复旧文件"
-    die "更新失败，已恢复旧文件"
+    if reload_runtime_after_update; then
+      finish_runtime_maintenance
+      die "更新失败，已恢复旧文件和原运行态"
+    fi
+    die "更新文件激活失败，旧文件已恢复，但原运行态未能恢复"
   fi
-  ok_line "更新完成，正在运行本地自检"
+  ok_line "更新文件已写入，正在运行本地自检"
   if reload_runtime_after_update; then
+    finish_runtime_maintenance
     ok_line "更新后的本地运行态自检通过"
     return 0
   fi
 
   warn_line "更新后本地自检失败，正在恢复旧版本"
+  begin_runtime_maintenance || die "更新后本地自检失败，且无法暂停健康检查以恢复旧版本"
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
+  if [ "$WARP_MODE" = "wireguard" ] && ! stop_wg_routes_strict; then
+    die "更新后本地自检失败，且无法确认新版 Google 路由已完整清除；未恢复旧文件"
+  fi
   restore_update_backup "$backup" || die "更新后本地自检失败，且无法恢复旧文件"
   if reload_runtime_after_update; then
-    die "更新失败，已恢复旧版本"
+    finish_runtime_maintenance
+    die "更新失败，已恢复旧版本和原运行态"
   fi
   die "更新失败，且恢复旧版本后自检仍失败，请运行 warp-vps logs 查看日志"
 }
@@ -1964,17 +2292,28 @@ cmd_update() {
 cmd_heal() {
   require_root
   load_config
+  local repair_rules=0
+  local repair_redsocks=0
   if required_runtime_units_ready && test_quiet; then
     log "健康检查正常"
     return 0
   fi
   warn "健康检查失败，正在尝试自动修复"
   if [ "$WARP_MODE" = "wireguard" ]; then
-    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service warp-vps-health.timer >/dev/null \
+    systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service >/dev/null \
       || die "无法启用 WireGuard 项目服务"
-    restart_wireguard_runtime || true
-    systemctl restart warp-vps.service >/dev/null 2>&1 || true
-    systemctl start warp-vps-health.timer >/dev/null 2>&1 || true
+    if ! socks_table_absent; then
+      repair_rules=1
+    fi
+    if ! service_active "wg-quick@${WG_IFACE}.service" || ! wg_interface_is_wireguard; then
+      restart_wireguard_runtime || true
+    fi
+    if ! service_active warp-vps.service || ! wireguard_routes_local_ok; then
+      repair_rules=1
+    fi
+    if [ "$repair_rules" -eq 1 ]; then
+      systemctl restart warp-vps.service >/dev/null 2>&1 || true
+    fi
     if required_runtime_units_ready && test_quiet; then
       log "自动修复成功"
     else
@@ -1982,13 +2321,29 @@ cmd_heal() {
     fi
     return 0
   fi
-  systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service warp-vps-health.timer >/dev/null \
+  if ! socks_wireguard_routes_absent; then
+    clear_socks_wireguard_routes || true
+  fi
+  systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service >/dev/null \
     || die "无法启用 Socks5 项目服务"
-  configure_warp_runtime || die "自动修复后 Cloudflare WARP SOCKS 仍不可用"
-  systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
-  apply_rules || die "无法重新加载分流规则"
-  systemctl restart warp-vps.service || die "无法重启分流规则服务"
-  systemctl start warp-vps-health.timer || die "无法启动健康检查定时器"
+  if ! service_active warp-svc.service || ! port_listening "$WARP_SOCKS_PORT"; then
+    configure_warp_runtime || die "自动修复后 Cloudflare WARP SOCKS 仍不可用"
+  fi
+  if ! service_active warp-vps.service || ! table_exists || ! socks_nft_rules_local_ok; then
+    repair_rules=1
+  fi
+  if ! service_active warp-vps-redsocks.service || ! port_listening "$REDSOCKS_PORT"; then
+    repair_redsocks=1
+  fi
+  if [ "$repair_redsocks" -eq 1 ]; then
+    render_redsocks_conf
+    systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
+    wait_for_port_listen "$REDSOCKS_PORT" 8 \
+      || die "本地透明转发服务重启后没有监听，未重新加载分流规则"
+  fi
+  if [ "$repair_rules" -eq 1 ]; then
+    systemctl restart warp-vps.service || die "无法重启分流规则服务"
+  fi
   if required_runtime_units_ready && test_quiet; then
     log "自动修复成功"
   else
@@ -2122,13 +2477,13 @@ resolve_uninstall_scope() {
 
 uninstall_unit_is_active() {
   local unit="$1"
-  local load_state active_state
-  load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" \
-    || die "无法查询 systemd 服务加载状态：$unit"
+  local state_output load_state active_state
+  state_output="$(systemctl show "$unit" -p LoadState -p ActiveState --no-pager 2>/dev/null)" \
+    || die "无法查询 systemd 服务状态：$unit"
+  load_state="$(awk -F= '$1 == "LoadState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
   [ "$load_state" != "not-found" ] || return 1
   [ -n "$load_state" ] || die "systemd 没有返回服务加载状态：$unit"
-  active_state="$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null)" \
-    || die "无法查询 systemd 服务运行状态：$unit"
+  active_state="$(awk -F= '$1 == "ActiveState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
   case "$active_state" in
     inactive|failed) return 1 ;;
     active|activating|deactivating|reloading) return 0 ;;
@@ -2138,16 +2493,17 @@ uninstall_unit_is_active() {
 
 uninstall_unit_is_enabled() {
   local unit="$1"
-  local load_state unit_state rc
-  load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)" \
+  local state_output load_state unit_state rc
+  state_output="$(systemctl show "$unit" -p LoadState --no-pager 2>/dev/null)" \
     || die "无法查询 systemd 服务加载状态：$unit"
+  load_state="$(awk -F= '$1 == "LoadState" { print substr($0, index($0, "=") + 1); exit }' <<< "$state_output")"
   [ "$load_state" != "not-found" ] || return 1
   [ -n "$load_state" ] || die "systemd 没有返回服务加载状态：$unit"
   rc=0
   unit_state="$(systemctl is-enabled "$unit" 2>/dev/null)" || rc=$?
   case "$unit_state" in
-    disabled|masked|masked-runtime|not-found) return 1 ;;
-    enabled|enabled-runtime|linked|linked-runtime|alias|static|indirect|generated|transient) return 0 ;;
+    enabled|enabled-runtime) return 0 ;;
+    disabled|masked|masked-runtime|not-found|linked|linked-runtime|alias|static|indirect|generated|transient) return 1 ;;
     *) die "无法确认 systemd 服务是否已禁用：${unit}（状态：${unit_state:-无}，退出码：${rc}）" ;;
   esac
 }
@@ -2245,6 +2601,9 @@ deactivate_runtime_for_uninstall() {
   verify_project_units_for_uninstall
   if [ "${MANAGED_WARP_SVC:-0}" = "1" ] && uninstall_unit_is_active warp-svc.service; then
     die "Cloudflare WARP 官方客户端服务仍在运行，卸载已中止"
+  fi
+  if [ "${MANAGED_WARP_SVC:-0}" = "1" ] && uninstall_unit_is_enabled warp-svc.service; then
+    die "Cloudflare WARP 官方客户端服务仍会开机启动，卸载已中止"
   fi
   if [ "$UNINSTALL_RUNTIME_IDENTIFIED" -eq 0 ]; then
     die "找不到有效的项目配置或分流服务定义，无法排除未知的自定义 WireGuard 网卡；已停止可识别的规则，卸载未继续"
@@ -2456,10 +2815,10 @@ main() {
     status) cmd_status ;;
     test) cmd_test ;;
     unlock-check) cmd_unlock_check ;;
-    restart) cmd_restart ;;
-    update) cmd_update ;;
+    restart) run_with_runtime_lock wait cmd_restart ;;
+    update) run_with_runtime_lock wait cmd_update ;;
     logs) cmd_logs ;;
-    heal) cmd_heal ;;
+    heal) run_with_runtime_lock skip cmd_heal ;;
     apply) require_root; apply_rules ;;
     stop-rules) require_root; stop_rules ;;
     configure-warp) cmd_configure_warp ;;
@@ -2467,7 +2826,7 @@ main() {
     preflight-wireguard) cmd_preflight_wireguard ;;
     wait-wireguard) cmd_wait_wireguard ;;
     install-systemd) install_systemd ;;
-    uninstall) cmd_uninstall "${@:2}" ;;
+    uninstall) run_with_runtime_lock wait cmd_uninstall "${@:2}" ;;
     -h|--help|help|'') usage ;;
     *) usage; exit 2 ;;
   esac
