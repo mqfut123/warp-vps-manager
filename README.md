@@ -12,7 +12,7 @@
 curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash
 ```
 
-全新安装的默认组合是 **WireGuard + 1G Swap**：模式选择直接回车使用 WireGuard；系统没有 Swap 时，下一步直接回车创建 1G。已有安装会显示当前模式，直接回车保持不变；已有 Swap 时不会重复创建。首次选择 Socks5 时，端口直接回车会随机选择空闲端口；同模式重装时直接回车会保留当前端口。输错内容会重新询问，不需要重跑脚本。
+全新安装的默认组合是 **WireGuard + 1G Swap**：模式选择直接回车使用 WireGuard；系统没有 Swap 时，下一步直接回车创建 1G。检测到已有项目安装时，再运行上面的安装命令会进入全局管理菜单，不会立即重装；在菜单中选择“重装或切换模式”后，直接回车保持当前模式，也可选择另一模式。已有 Swap 时不会重复创建。首次选择 Socks5 时，端口直接回车会随机选择空闲端口；同模式重装时直接回车会保留当前端口。输错内容会重新询问，不需要重跑脚本。
 
 重装或切换模式时，目标模式所需依赖已经齐全就直接复用，不会重复运行系统包管理器；确实缺少依赖时才会安装，并在停用旧分流前完成。健康的同模式 WireGuard 或 WARP SOCKS 后端会保持运行，只重新加载本项目规则；切换目标会先准备配置，暂停旧分流后再检查接口、端口、规则和代表性路由，不等待 Google/Cloudflare HTTP 响应或 WireGuard 握手。后续本地安装失败时会尝试恢复原模式。
 
@@ -31,13 +31,13 @@ Socks5 无法通过本地代理转发 UDP，因此同一 Google 会话可能同�
 
 ## 切换模式
 
-重新运行安装命令即可切换模式，不需要先卸载：
+直接运行 `warp-vps`，选择“重装或切换模式”，不需要先卸载。也可以重新运行安装命令进入同一个管理菜单：
 
 ```bash
 curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh | bash
 ```
 
-安装器会显示当前模式。直接回车保持当前模式；输入 `2` 可从 Socks5 切换到 WireGuard，输入 `1` 可从 WireGuard 切换到 Socks5。切换时会先准备并校验目标模式所需依赖和配置，再停用旧模式服务和分流规则并启用新规则；不会主动删除另一模式已经安装的系统依赖。
+进入重装或切换流程后会显示当前模式。直接回车保持当前模式；输入 `2` 可从 Socks5 切换到 WireGuard，输入 `1` 可从 WireGuard 切换到 Socks5。切换时会先准备并校验目标模式所需依赖和配置，再停用旧模式服务和分流规则并启用新规则；不会主动删除另一模式已经安装的系统依赖。
 
 ## 和其他方案的区别
 
@@ -53,8 +53,11 @@ curl https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh
 
 ## 管理命令
 
+安装完成后，直接运行 `warp-vps` 或 `warp-vps menu` 会打开交互式管理菜单，可查看状态、诊断、检测解锁、重启、更新、重装或切换模式、查看日志和卸载。更新、重装或卸载成功后菜单会结束；再次运行 `warp-vps` 即可继续管理。显式命令保持不变，仍适合脚本或直接排障：
+
 | 命令 | 用途 |
 |---|---|
+| `warp-vps` / `warp-vps menu` | 打开交互式管理菜单 |
 | `warp-vps status` | 查看本地服务、接口、端口和分流规则状态，不依赖外部站点 |
 | `warp-vps test` | 运行分流和外部连通性诊断；外部探测失败只会提示，不改变运行状态 |
 | `warp-vps unlock-check` | 检测当前 IPv4 出口的 Gemini 和 YouTube Premium；安装完成后自动运行，也可手动运行 |

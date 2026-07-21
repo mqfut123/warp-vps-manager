@@ -263,11 +263,17 @@ test_port_checks_only_tcp() {
 }
 
 test_stdin_execution_without_bash_source() {
-  local file guard output body
+  local file guard output body dispatcher
   for file in "$INSTALL_SCRIPT" "$MANAGER_SCRIPT"; do
     guard="$(tail -n 3 "$file")"
-    output="$(printf 'set -u\nmain() { printf called; }\n%s\n' "$guard" | bash)"
-    assert_eq 'called' "$output" "stdin execution should call main without BASH_SOURCE: $file" || return 1
+    if [ "$file" = "$INSTALL_SCRIPT" ]; then
+      dispatcher='dispatch_installer'
+    else
+      dispatcher='main'
+    fi
+    output="$(printf 'set -u\n%s() { printf called; }\n%s\n' "$dispatcher" "$guard" | bash)"
+    assert_eq 'called' "$output" \
+      "stdin execution should call its public dispatcher without BASH_SOURCE: $file" || return 1
   done
 
   body="$(function_body "$INSTALL_SCRIPT" fetch_asset)"
@@ -283,6 +289,217 @@ test_stdin_execution_without_bash_source() {
     | bash)"
   assert_contains "$output" 'https://example.invalid/project/main/bin/warp-vps' \
     'stdin execution should download assets when no script path exists'
+}
+
+test_installer_entrypoint_routes_fresh_and_installed_hosts() {
+  source_without_main "$INSTALL_SCRIPT"
+  local installed=0 calls=''
+  project_installation_present() { [ "$installed" -eq 1 ]; }
+  installer_menu() { calls="${calls}menu "; }
+  main() { calls="${calls}install "; }
+
+  dispatch_installer
+  assert_eq 'install ' "$calls" 'fresh no-argument installer entry should start installation' || return 1
+
+  calls=''
+  installed=1
+  dispatch_installer
+  assert_eq 'menu ' "$calls" 'installed no-argument installer entry should open the menu' || return 1
+
+  calls=''
+  installed=0
+  dispatch_installer --menu
+  assert_eq 'install ' "$calls" 'a menu request on a fresh host should start installation' || return 1
+
+  calls=''
+  installed=1
+  dispatch_installer --menu
+  assert_eq 'menu ' "$calls" 'a menu request on an installed host should open the menu' || return 1
+
+  calls=''
+  dispatch_installer --install
+  assert_eq 'install ' "$calls" 'the internal install entry should bypass installed-host menu routing' || return 1
+
+  local rc=0
+  calls=''
+  dispatch_installer --unknown >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'unknown installer options should fail before running an action' || return 1
+  assert_eq '' "$calls" 'an unknown installer option must not run an action' || return 1
+  rc=0
+  calls=''
+  dispatch_installer --menu extra >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" 'extra installer options should fail before running an action' || return 1
+  assert_eq '' "$calls" 'extra installer options must not run an action'
+}
+
+test_installer_menu_maps_public_actions_and_recovers() {
+  source_without_main "$INSTALL_SCRIPT"
+  local answer_index=0 calls='' renders=0
+  local answers=('1' '' '2' '' '3' '' '4' '' '7' '' '9' '0')
+  require_root() { :; }
+  print_installer_menu() { renders=$((renders + 1)); }
+  read_input() {
+    [ "$answer_index" -lt "${#answers[@]}" ] || return 1
+    printf -v "$1" '%s' "${answers[$answer_index]}"
+    answer_index=$((answer_index + 1))
+  }
+  BIN_PATH=menu_manager
+  menu_manager() {
+    calls="${calls}$1 "
+    [ "$1" != 'logs' ] || return 42
+  }
+
+  installer_menu >/dev/null 2>&1
+  assert_eq 'status test unlock-check restart logs ' "$calls" \
+    'menu choices must map to the existing public manager commands' || return 1
+  assert_eq '7' "$renders" \
+    'successful, failed, and invalid ordinary actions should all return to the same menu'
+}
+
+test_installer_menu_terminal_actions_do_not_run_stale_code() {
+  source_without_main "$INSTALL_SCRIPT"
+  require_root() { :; }
+  local render_count=0
+  print_installer_menu() { render_count=$((render_count + 1)); printf 'MENU\n'; }
+  BIN_PATH=menu_manager
+
+  local answer_index=0 manager_rc=0 calls=''
+  local answers=('5')
+  read_input() {
+    [ "$answer_index" -lt "${#answers[@]}" ] || return 1
+    printf -v "$1" '%s' "${answers[$answer_index]}"
+    answer_index=$((answer_index + 1))
+  }
+  menu_manager() { calls="${calls}$1 "; return "$manager_rc"; }
+  installer_menu >/dev/null 2>&1
+  assert_eq 'update ' "$calls" 'successful update should run exactly once' || return 1
+  assert_eq '1' "$render_count" 'successful update should exit the old menu after one render' || return 1
+
+  answer_index=0
+  manager_rc=28
+  calls=''
+  render_count=0
+  answers=('5' '' '0')
+  installer_menu >/dev/null 2>&1
+  assert_eq 'update ' "$calls" 'failed update should not run another manager action' || return 1
+  assert_eq '2' "$render_count" 'failed update should return to the menu' || return 1
+
+  answer_index=0
+  manager_rc=0
+  calls=''
+  render_count=0
+  answers=('8')
+  installer_menu >/dev/null 2>&1
+  assert_eq 'uninstall ' "$calls" 'successful uninstall should terminate the menu immediately' || return 1
+  assert_eq '1' "$render_count" 'successful uninstall should exit the old menu after one render' || return 1
+
+  answer_index=0
+  manager_rc=17
+  calls=''
+  render_count=0
+  answers=('8' '' '0')
+  installer_menu >/dev/null 2>&1
+  assert_eq 'uninstall ' "$calls" 'failed uninstall should return without dispatching another action' || return 1
+  assert_eq '2' "$render_count" 'failed uninstall should return to the menu' || return 1
+
+  answer_index=0
+  answers=('6' '' '0')
+  main() {
+    printf 'INSTALL-BEGIN\n'
+    false
+    printf 'INSTALL-AFTER-FAILURE\n'
+  }
+  local output menu_count
+  output="$(installer_menu 2>&1)"
+  assert_contains "$output" 'INSTALL-BEGIN' 'reinstall should call the existing install transaction' || return 1
+  assert_not_contains "$output" 'INSTALL-AFTER-FAILURE' \
+    'reinstall must preserve install transaction fail-fast semantics' || return 1
+  menu_count="$(grep -o 'MENU' <<< "$output" | wc -l | tr -d ' ')"
+  assert_eq '2' "$menu_count" 'a failed reinstall should return to a fresh menu iteration' || return 1
+
+  answer_index=0
+  answers=('6')
+  main() { printf 'INSTALL-SUCCESS\n'; }
+  output="$(installer_menu 2>&1)"
+  assert_contains "$output" 'INSTALL-SUCCESS' \
+    'successful reinstall should execute the existing install transaction' || return 1
+  menu_count="$(grep -o 'MENU' <<< "$output" | wc -l | tr -d ' ')"
+  assert_eq '1' "$menu_count" 'a successful reinstall must not continue in the old menu process'
+}
+
+test_manager_menu_entry_preserves_explicit_cli_dispatch() {
+  source_without_main "$MANAGER_SCRIPT"
+  local calls='' interactive=1
+  cmd_menu() { calls="${calls}menu "; }
+  usage() { calls="${calls}usage "; }
+  interactive_terminal_available() { [ "$interactive" -eq 1 ]; }
+
+  main menu
+  main
+  main help
+  interactive=0
+  main
+  assert_eq 'menu menu usage usage ' "$calls" \
+    'menu, interactive no-argument, help, and noninteractive no-argument dispatch must stay distinct' || return 1
+
+  calls=''
+  cmd_status() { calls="${calls}status "; }
+  cmd_test() { calls="${calls}test "; }
+  cmd_unlock_check() { calls="${calls}unlock-check "; }
+  cmd_restart() { calls="${calls}restart "; }
+  cmd_update() { calls="${calls}update "; }
+  cmd_logs() { calls="${calls}logs "; }
+  cmd_uninstall() { calls="${calls}uninstall:$* "; }
+  run_with_runtime_lock() {
+    local policy="$1"
+    shift
+    calls="${calls}lock:${policy} "
+    "$@"
+  }
+  main status
+  main test
+  main unlock-check
+  main restart
+  main update
+  main logs
+  main uninstall --yes
+  assert_eq 'status test unlock-check lock:wait restart lock:wait update logs lock:wait uninstall:--yes ' \
+    "$calls" 'all existing public CLI commands must retain their dispatcher and arguments' || return 1
+
+  local menu_body main_body
+  menu_body="$(function_body "$MANAGER_SCRIPT" cmd_menu)"
+  main_body="$(function_body "$MANAGER_SCRIPT" main)"
+  assert_contains "$menu_body" 'exec "${APP_DIR}/install.sh" --menu' \
+    'manager menu entry should delegate once to the installed canonical menu' || return 1
+  assert_not_contains "$menu_body" 'run_with_runtime_lock' \
+    'opening the menu must not hold the shared mutation lock' || return 1
+  assert_contains "$main_body" 'uninstall) run_with_runtime_lock wait cmd_uninstall "${@:2}"' \
+    'existing uninstall arguments must keep their original dispatcher'
+}
+
+test_manager_no_argument_non_tty_is_immediate_usage() {
+  local output rc=0
+  output="$(bash "$MANAGER_SCRIPT" </dev/null)" || rc=$?
+  assert_eq '0' "$rc" 'noninteractive no-argument manager invocation should return success' || return 1
+  assert_contains "$output" '用法：warp-vps [命令]' \
+    'noninteractive no-argument manager invocation should show usage' || return 1
+  assert_not_contains "$output" 'WARP VPS Manager 管理菜单' \
+    'noninteractive no-argument manager invocation must not wait in the menu'
+}
+
+test_menu_contract_is_documented_without_a_second_switch_path() {
+  local menu_body
+  menu_body="$(function_body "$INSTALL_SCRIPT" installer_menu)"
+  assert_contains "$menu_body" 'main' \
+    'reinstall and mode switching must reuse the existing install transaction' || return 1
+  assert_not_contains "$menu_body" 'acquire_operation_lock' \
+    'the menu must not hold the install transaction lock' || return 1
+  assert_not_contains "$menu_body" 'run_with_runtime_lock' \
+    'the menu must not add a second manager lock' || return 1
+  assert_file_matches "$README_FILE" 'warp-vps` 或 `warp-vps menu`' \
+    'README should document both interactive menu entries' || return 1
+  assert_file_matches "$README_FILE" '检测到已有项目安装时.*进入全局管理菜单' \
+    'README should distinguish fresh installation from the installed curl entry'
 }
 
 test_inputs_precede_side_effects() {
@@ -4461,6 +4678,12 @@ run_test 'SOCKS port retries after a stray backslash' test_warp_port_reprompts
 run_test 'reinstall can reuse its current SOCKS port' test_existing_project_port_is_reusable
 run_test 'SOCKS port checks ignore UDP-only listeners' test_port_checks_only_tcp
 run_test 'stdin execution works without BASH_SOURCE' test_stdin_execution_without_bash_source
+run_test 'installer routes fresh and installed entrypoints' test_installer_entrypoint_routes_fresh_and_installed_hosts
+run_test 'management menu maps public actions and recovers' test_installer_menu_maps_public_actions_and_recovers
+run_test 'terminal menu actions do not run stale code' test_installer_menu_terminal_actions_do_not_run_stale_code
+run_test 'manager menu entry preserves explicit CLI dispatch' test_manager_menu_entry_preserves_explicit_cli_dispatch
+run_test 'non-TTY no-argument manager invocation is immediate usage' test_manager_no_argument_non_tty_is_immediate_usage
+run_test 'menu contract reuses switching and is documented' test_menu_contract_is_documented_without_a_second_switch_path
 run_test 'all interactive input precedes installation side effects' test_inputs_precede_side_effects
 run_test 'installer operation lock bounds live mutation' test_installer_operation_lock_bounds_live_mutation
 run_test 'manager operation lock policies preserve availability and status' test_manager_operation_lock_policies

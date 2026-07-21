@@ -2784,9 +2784,10 @@ cmd_uninstall() {
 
 usage() {
   cat <<'EOF'
-用法：warp-vps <命令>
+用法：warp-vps [命令]
 
 常用命令：
+  menu            打开交互式管理菜单；直接运行 warp-vps 效果相同
   status          快速检查本地运行态
   test            检查本地运行态并运行非阻塞外部诊断
   restart         重启 WARP 分流链路
@@ -2809,9 +2810,21 @@ usage() {
 EOF
 }
 
+interactive_terminal_available() {
+  [ -t 0 ] || [ -t 1 ] || [ -t 2 ]
+}
+
+cmd_menu() {
+  require_root
+  [ -x "${APP_DIR}/install.sh" ] \
+    || die "找不到管理菜单：${APP_DIR}/install.sh；请重新运行安装命令修复项目文件"
+  exec "${APP_DIR}/install.sh" --menu
+}
+
 main() {
   local cmd="${1:-}"
   case "$cmd" in
+    menu) cmd_menu ;;
     status) cmd_status ;;
     test) cmd_test ;;
     unlock-check) cmd_unlock_check ;;
@@ -2827,7 +2840,14 @@ main() {
     wait-wireguard) cmd_wait_wireguard ;;
     install-systemd) install_systemd ;;
     uninstall) run_with_runtime_lock wait cmd_uninstall "${@:2}" ;;
-    -h|--help|help|'') usage ;;
+    -h|--help|help) usage ;;
+    '')
+      if interactive_terminal_available; then
+        cmd_menu
+      else
+        usage
+      fi
+      ;;
     *) usage; exit 2 ;;
   esac
 }

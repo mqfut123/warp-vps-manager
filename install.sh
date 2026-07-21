@@ -50,6 +50,7 @@ INSTALL_FILES_ACTIVATED=0
 TARGET_PREP_STARTED=0
 PREVIOUS_HEALTH_TIMER_ACTIVE=0
 OPERATION_LOCK_HELD=0
+MENU_ACTION_RC=0
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -1567,6 +1568,170 @@ run_final_self_check() {
   "$BIN_PATH" status
 }
 
+project_installation_present() {
+  [ -x "$BIN_PATH" ] && [ -e "$CONFIG_FILE" ]
+}
+
+menu_mode_label() {
+  local mode
+  mode="$(read_project_mode 2>/dev/null || true)"
+  case "$mode" in
+    wireguard) printf 'WireGuard\n' ;;
+    socks) printf 'Socks5\n' ;;
+    *) printf '配置需要检查\n' ;;
+  esac
+}
+
+print_installer_menu() {
+  printf '\nWARP VPS Manager 管理菜单\n'
+  printf '当前模式：%s\n' "$(menu_mode_label)"
+  printf '  1. 查看本地运行状态\n'
+  printf '  2. 运行完整诊断\n'
+  printf '  3. 检测 Gemini / YouTube Premium 解锁\n'
+  printf '  4. 重启分流链路\n'
+  printf '  5. 更新脚本和 Google IP 规则\n'
+  printf '  6. 重装或切换 Socks5 / WireGuard 模式\n'
+  printf '  7. 查看最近日志\n'
+  printf '  8. 卸载\n'
+  printf '  0. 退出\n'
+}
+
+run_menu_manager_action() {
+  set +e
+  "$BIN_PATH" "$@"
+  MENU_ACTION_RC=$?
+  set -e
+}
+
+wait_for_menu_return() {
+  local ignored
+  printf '\n按回车返回主菜单：'
+  read_input ignored || return 1
+  : "$ignored"
+}
+
+finish_menu_action() {
+  local label="$1"
+  if [ "$MENU_ACTION_RC" -eq 0 ]; then
+    printf '\n[warp-vps] %s已完成。\n' "$label"
+  else
+    printf '\n[warp-vps] %s未完成（退出码：%s），请查看上方错误；已返回主菜单。\n' \
+      "$label" "$MENU_ACTION_RC" >&2
+  fi
+  wait_for_menu_return || return 1
+}
+
+installer_menu() {
+  require_root
+  local choice
+  while true; do
+    print_installer_menu
+    printf '请输入选项：'
+    if ! read_input choice; then
+      printf '\n未读取到输入，已退出管理菜单。\n'
+      return 0
+    fi
+    case "$choice" in
+      1)
+        run_menu_manager_action status
+        finish_menu_action "状态检查" || return 0
+        ;;
+      2)
+        run_menu_manager_action test
+        finish_menu_action "完整诊断" || return 0
+        ;;
+      3)
+        run_menu_manager_action unlock-check
+        finish_menu_action "解锁检测" || return 0
+        ;;
+      4)
+        run_menu_manager_action restart
+        finish_menu_action "重启" || return 0
+        ;;
+      5)
+        run_menu_manager_action update
+        if [ "$MENU_ACTION_RC" -eq 0 ]; then
+          printf '\n[warp-vps] 更新完成。请重新运行 warp-vps 使用新版本管理菜单。\n'
+          return 0
+        fi
+        finish_menu_action "更新" || return 0
+        ;;
+      6)
+        printf '\n即将进入现有安装事务；直接回车保持当前模式，也可选择另一模式。\n'
+        set +e
+        (
+          set -Eeuo pipefail
+          main
+        )
+        MENU_ACTION_RC=$?
+        set -e
+        if [ "$MENU_ACTION_RC" -eq 0 ]; then
+          printf '\n[warp-vps] 重装或模式切换已完成。请重新运行 warp-vps。\n'
+          return 0
+        fi
+        finish_menu_action "重装或模式切换" || return 0
+        ;;
+      7)
+        run_menu_manager_action logs
+        finish_menu_action "日志查询" || return 0
+        ;;
+      8)
+        run_menu_manager_action uninstall
+        if [ "$MENU_ACTION_RC" -eq 0 ]; then
+          return 0
+        fi
+        finish_menu_action "卸载" || return 0
+        ;;
+      0)
+        printf '已退出管理菜单。\n'
+        return 0
+        ;;
+      *)
+        printf '输入无效，请输入 0-8。\n' >&2
+        ;;
+    esac
+  done
+}
+
+installer_usage() {
+  cat <<'EOF'
+用法：install.sh [--menu|--install]
+
+  无参数     未安装时开始安装；检测到已有项目安装时进入管理菜单
+  --menu    进入管理菜单；未安装时开始安装
+  --install 强制进入安装、重装或模式切换流程
+EOF
+}
+
+dispatch_installer() {
+  if [ "$#" -eq 0 ]; then
+    if project_installation_present; then
+      installer_menu
+    else
+      main
+    fi
+    return
+  fi
+
+  if [ "$#" -ne 1 ]; then
+    installer_usage >&2
+    return 2
+  fi
+
+  case "$1" in
+    --menu)
+      if project_installation_present; then
+        installer_menu
+      else
+        main
+      fi
+      ;;
+    --install) main ;;
+    -h|--help|help) installer_usage ;;
+    *) installer_usage >&2; return 2 ;;
+  esac
+}
+
 main() {
   require_root
   require_systemd
@@ -1733,7 +1898,8 @@ main() {
   if [ "$selected_mode" = "socks" ]; then
     printf 'WARP SOCKS 端口：%s\n' "$warp_port"
   fi
-  printf '管理命令：warp-vps {status|test|restart|unlock-check|update|logs|uninstall}\n'
+  printf '交互菜单：warp-vps\n'
+  printf '显式命令：warp-vps {status|test|restart|unlock-check|update|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ]; then
     printf 'Google IPv4 UDP/QUIC 使用 VPS 原生出口；Google 目标 IPv6 继续拒绝。\n'
   else
@@ -1745,5 +1911,5 @@ main() {
 }
 
 if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
-  main "$@"
+  dispatch_installer "$@"
 fi
