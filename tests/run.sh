@@ -852,8 +852,8 @@ test_installer_operation_lock_bounds_live_mutation() {
     'the lock should remain optional on hosts without flock' || return 1
   assert_contains "$lock_body" '/run/warp-vps-manager.operation.lock' \
     'concurrent installers should share one host-level operation lock' || return 1
-  assert_contains "$lock_body" 'flock -n 9' \
-    'a busy operation lock must fail immediately instead of waiting indefinitely' || return 1
+  assert_contains "$lock_body" 'flock -w 10 9' \
+    'a busy operation lock must wait briefly for a health check without waiting indefinitely' || return 1
 
   source_without_main "$INSTALL_SCRIPT"
   require_root() { :; }

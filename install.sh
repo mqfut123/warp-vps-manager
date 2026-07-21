@@ -91,7 +91,7 @@ acquire_operation_lock() {
   command -v flock >/dev/null 2>&1 || return 0
   exec 9>/run/warp-vps-manager.operation.lock \
     || die "无法建立管理操作锁，未修改当前运行态"
-  flock -n 9 \
+  flock -w 10 9 \
     || die "另一项 WARP VPS Manager 管理操作正在进行，请稍后重试"
   OPERATION_LOCK_HELD=1
 }
