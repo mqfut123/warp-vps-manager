@@ -357,6 +357,7 @@ add rule inet warp_vps output_nat ip daddr @google4 meta l4proto tcp counter red
 add chain inet warp_vps output_filter { type filter hook output priority filter; policy accept; }
 add rule inet warp_vps output_filter meta skuid ${REDSOCKS_UID} return
 add rule inet warp_vps output_filter oifname "lo" return
+add rule inet warp_vps output_filter ip daddr @google4 udp dport 443 counter reject with icmpx type admin-prohibited
 add rule inet warp_vps output_filter ip6 daddr @google6 counter reject with icmpx type admin-prohibited
 EOF
   chmod 0644 "$NFT_CONF"
@@ -1555,8 +1556,8 @@ socks_nft_rules_local_ok() {
   nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null)" || return 1
   filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null)" || return 1
   grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" || return 1
-  grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules" || return 1
-  ! grep -Eq 'udp dport 443.*(drop|reject)' <<< "$filter_rules"
+  grep -Eq 'ip daddr @google4[[:space:]].*udp dport 443[[:space:]].*reject with icmpx type admin-prohibited' <<< "$filter_rules" || return 1
+  grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"
 }
 
 test_quiet() {
@@ -2018,11 +2019,11 @@ run_self_check() {
   fi
 
   filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null || true)"
-  if grep -Eq 'udp dport 443.*(drop|reject)' <<< "$filter_rules"; then
-    fail_line "仍存在 Google IPv4 UDP/443 阻断规则"
-    failed=1
+  if grep -Eq 'ip daddr @google4[[:space:]].*udp dport 443[[:space:]].*reject with icmpx type admin-prohibited' <<< "$filter_rules"; then
+    ok_line "已阻断 Google IPv4 UDP/443（QUIC），防止从 VPS 原生出口直连"
   else
-    ok_line "Google IPv4 UDP/QUIC 未被项目阻断，将使用 VPS 原生出口"
+    fail_line "未找到 Google IPv4 UDP/443（QUIC）阻断规则"
+    failed=1
   fi
 
   if grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"; then
@@ -2041,7 +2042,7 @@ run_self_check() {
 
   section "结论"
   if [ "$failed" -eq 0 ]; then
-    ok_line "本地运行态正常。Google IPv4 TCP 走 WARP，IPv4 UDP/QUIC 使用 VPS 原生出口，Google IPv6 继续拒绝。"
+    ok_line "本地运行态正常。Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）被拒绝，Google IPv6 继续拒绝。"
     return 0
   fi
 
@@ -2067,7 +2068,7 @@ cmd_status() {
     info_line "工作模式：WireGuard 默认模式，Google IPv4、IPv6、TCP、UDP 和 QUIC 走 WARP"
     info_line "WireGuard 网卡：${WG_IFACE}"
   else
-    info_line "工作模式：Socks5 兼容模式，Google IPv4 TCP 走 WARP，IPv4 UDP/QUIC 使用 VPS 原生出口，Google IPv6 拒绝"
+    info_line "工作模式：Socks5 兼容模式，Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝"
     info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
     info_line "本地转发端口：${REDSOCKS_PORT}"
   fi

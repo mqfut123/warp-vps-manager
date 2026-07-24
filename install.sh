@@ -747,7 +747,7 @@ prompt_install_mode() {
   recommended="${current_mode:-wireguard}"
 
   printf '\n请选择 WARP 分流方案：\n' >&2
-  printf '  1. Socks5 方案：Google IPv4 TCP 走 WARP，IPv4 UDP/QUIC 使用 VPS 原生出口，Google IPv6 拒绝。\n' >&2
+  printf '  1. Socks5 方案：Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝。\n' >&2
   printf '  2. WireGuard 方案：Google IPv4、IPv6、TCP、UDP 和 QUIC 都按 Google CIDR 走 WARP。\n' >&2
   printf '  3. 退出安装\n' >&2
   printf '普通用户推荐 WireGuard；只需要兼容本地代理模式时再选 Socks5。\n' >&2
@@ -2161,7 +2161,7 @@ main() {
   printf '交互菜单：warp-vps\n'
   printf '显式命令：warp-vps {status|test|restart|unlock-check|update|reinstall|switch|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ]; then
-    printf 'Google IPv4 UDP/QUIC 使用 VPS 原生出口；Google 目标 IPv6 继续拒绝。\n'
+    printf 'Google IPv4 UDP/443（QUIC）已拒绝，支持回落的客户端会改用经 WARP 的 TCP；Google 目标 IPv6 继续拒绝。\n'
   else
     printf 'WireGuard 模式会把命中 Google CIDR 的 IPv4、IPv6、TCP、UDP 和 QUIC 流量路由到 WARP。\n'
   fi

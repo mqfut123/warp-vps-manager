@@ -40,11 +40,11 @@ bash -o pipefail -c \
 | 模式 | 适合谁 | 效果 |
 |---|---|---|
 | WireGuard | 大多数用户，直接回车使用 | 命中 Google IP 规则的 IPv4、IPv6、TCP、UDP 和 QUIC 都走 WARP |
-| Socks5 | 只需要兼容代理模式的用户 | Google IPv4 TCP 走 WARP，IPv4 UDP 和 QUIC 使用 VPS 原生出口，Google IPv6 继续拒绝 |
+| Socks5 | 只需要兼容代理模式的用户 | Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝 |
 
 Socks5 对现有网络改动较少。WireGuard 会增加网卡和路由，如果 VPS 已经有 WireGuard 或复杂路由，请先确认不会冲突。
 
-Socks5 无法通过本地代理转发 UDP，因此同一 Google 会话可能同时出现 WARP 和 VPS 原生出口，增加触发 Google 异常流量检查的概率。需要 Google IPv4、IPv6、TCP、UDP 和 QUIC 使用同一 WARP 出口时，请选择 WireGuard。
+Socks5 无法通过本地代理转发 UDP，因此会拒绝命中 Google IPv4 规则的 UDP/443（QUIC），让支持回落的客户端改用经 WARP 的 TCP；其他 Google IPv4 UDP 端口和非 Google 目标 UDP 不受影响，Google IPv6 继续拒绝。需要 Google IPv4、IPv6、TCP、UDP 和 QUIC 使用同一 WARP 出口时，请选择 WireGuard。
 
 ## 切换模式
 
@@ -123,7 +123,7 @@ warp-vps logs
 ## 使用前需要知道
 
 - 这是 IP 分流，不是域名识别。Google 调整 IP 后，请运行 `warp-vps update` 获取新规则。
-- Socks5 模式不能通过 WARP 本地代理转发 UDP。Google IPv4 UDP 和 QUIC 会使用 VPS 原生出口，Google IPv6 仍会被拒绝；如果需要双栈和 UDP 都走 WARP，请使用 WireGuard。
+- Socks5 模式不能通过 WARP 本地代理转发 UDP。项目只拒绝命中 Google IPv4 规则的 UDP/443（QUIC）以及 Google IPv6；无法回落到 TCP 的请求会失败。如果需要双栈和全部 UDP 都走 WARP，请使用 WireGuard。
 - 如果系统已经安装 Cloudflare WARP 客户端，Socks5 模式会复用它并切换到本地代理模式。保留依赖卸载不会恢复客户端原来的模式；`all` 会直接卸载该客户端。
 - 卸载时项目文件和脚本创建的 Swap 会移到 `/var/backups/warp-vps-manager/`，不会永久删除。
 

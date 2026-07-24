@@ -2010,7 +2010,7 @@ test_wireguard_local_route_boundary_is_fail_closed() {
   fi
 }
 
-test_socks_nft_render_keeps_only_ipv6_block() {
+test_socks_nft_render_blocks_google_quic_only() {
   source_without_main "$MANAGER_SCRIPT"
   RULES_DIR=/unused
   NFT_CONF=/dev/stdout
@@ -2026,16 +2026,63 @@ test_socks_nft_render_keeps_only_ipv6_block() {
   table_exists() { return 1; }
   chmod() { :; }
 
-  local rendered
+  local rendered udp_reject_rules
   rendered="$(render_nft_conf)"
   assert_contains "$rendered" 'ip daddr @google4 meta l4proto tcp counter redirect to :23456' \
     'Socks must keep the Google IPv4 TCP redirect' || return 1
+  assert_contains "$rendered" \
+    'ip daddr @google4 udp dport 443 counter reject with icmpx type admin-prohibited' \
+    'Socks must reject Google IPv4 UDP/443' || return 1
   assert_contains "$rendered" 'ip6 daddr @google6 counter reject' \
     'Socks must keep the Google IPv6 reject' || return 1
-  assert_not_contains "$rendered" 'udp dport 443' \
-    'Socks must not block Google IPv4 UDP/443' || return 1
-  assert_not_contains "$rendered" 'ip daddr @google4 meta l4proto udp' \
-    'Socks must not add a replacement IPv4 UDP drop or redirect'
+  udp_reject_rules="$(grep -E 'add rule inet warp_vps output_filter .*udp.*(drop|reject)' <<< "$rendered")"
+  assert_eq \
+    'add rule inet warp_vps output_filter ip daddr @google4 udp dport 443 counter reject with icmpx type admin-prohibited' \
+    "$udp_reject_rules" \
+    'Socks must reject only Google IPv4 UDP/443'
+}
+
+test_socks_nft_runtime_requires_scoped_quic_reject() {
+  source_without_main "$MANAGER_SCRIPT"
+  local mock_nat_rules mock_filter_rules
+  mock_nat_rules='ip daddr @google4 meta l4proto tcp counter packets 0 bytes 0 redirect to :23456'
+  mock_filter_rules=$'ip daddr @google4 udp dport 443 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\nip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+  nft() {
+    case "$*" in
+      'list chain inet warp_vps output_nat') printf '%s\n' "$mock_nat_rules" ;;
+      'list chain inet warp_vps output_filter') printf '%s\n' "$mock_filter_rules" ;;
+      *) return 1 ;;
+    esac
+  }
+
+  socks_nft_rules_local_ok || {
+    fail 'the intended Google IPv4 QUIC reject should pass the Socks runtime check'
+    return 1
+  }
+
+  mock_filter_rules='ip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+  if socks_nft_rules_local_ok; then
+    fail 'a missing Google IPv4 QUIC reject must fail the Socks runtime check'
+    return 1
+  fi
+
+  mock_filter_rules=$'ip daddr @google40 udp dport 443 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\nip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+  if socks_nft_rules_local_ok; then
+    fail 'a reject for a similarly named but wrong set must fail the Socks runtime check'
+    return 1
+  fi
+
+  mock_filter_rules=$'ip daddr @google4 udp dport 4430 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\nip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+  if socks_nft_rules_local_ok; then
+    fail 'a reject on the wrong UDP port must fail the Socks runtime check'
+    return 1
+  fi
+
+  mock_filter_rules=$'ip daddr @google4 udp dport 443 counter packets 0 bytes 0 drop\nip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+  if socks_nft_rules_local_ok; then
+    fail 'a non-reject verdict must fail the Socks runtime check'
+    return 1
+  fi
 }
 
 test_wireguard_apply_clears_stale_socks_table() {
@@ -5352,6 +5399,12 @@ test_noninteractive_contract_is_documented_and_downloads_are_bounded() {
     'README must document noninteractive mode switching' || return 1
   assert_file_matches "$README_FILE" '退出码 `0`.*`2`.*其他非零值' \
     'README must document automation exit statuses' || return 1
+  assert_file_matches "$README_FILE" 'Google IPv4 UDP/443（QUIC）.*拒绝' \
+    'README must document the scoped Google QUIC reject' || return 1
+  assert_file_matches "$README_FILE" '其他 Google IPv4 UDP 端口和非 Google 目标 UDP 不受影响' \
+    'README must not imply that Socks blocks every UDP packet' || return 1
+  assert_file_not_matches "$README_FILE" 'IPv4 UDP( 和 QUIC|/QUIC) 使用 VPS 原生出口' \
+    'README must not describe Google QUIC as using the native VPS exit' || return 1
   awk '
     /^```bash$/ { in_bash=1; has_pipefail=0; next }
     /^```$/ { in_bash=0; next }
@@ -5417,7 +5470,8 @@ run_test 'WireGuard routes do not require native IPv6' test_wireguard_routes_wor
 run_test 'WireGuard route cleanup handles each IP family independently' test_wireguard_route_cleanup_is_dual_stack_independent
 run_test 'WireGuard strict cleanup verifies actual dual-stack route state' test_wireguard_strict_cleanup_checks_actual_route_state
 run_test 'WireGuard local route boundaries fail closed' test_wireguard_local_route_boundary_is_fail_closed
-run_test 'Socks nft output keeps only the IPv6 block' test_socks_nft_render_keeps_only_ipv6_block
+run_test 'Socks nft output blocks only Google QUIC' test_socks_nft_render_blocks_google_quic_only
+run_test 'Socks nft runtime requires the scoped QUIC reject' test_socks_nft_runtime_requires_scoped_quic_reject
 run_test 'WireGuard apply clears stale Socks nft state' test_wireguard_apply_clears_stale_socks_table
 run_test 'mode switches reject a live opposite backend' test_mode_switch_rejects_live_opposite_backend
 run_test 'SSH peer protection preserves the rule-check status' test_ssh_peer_route_uses_rule_check_status
