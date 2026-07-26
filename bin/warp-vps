@@ -5,7 +5,6 @@ APP_NAME="warp-vps-manager"
 APP_DIR="/opt/${APP_NAME}"
 ETC_DIR="/etc/${APP_NAME}"
 STATE_DIR="/var/lib/${APP_NAME}"
-BACKUP_ROOT="/var/backups/${APP_NAME}"
 SELF_PATH="${BASH_SOURCE[0]:-$0}"
 CONFIG_FILE="${WARP_VPS_CONFIG_FILE:-${ETC_DIR}/config.env}"
 REDSOCKS_CONF="${ETC_DIR}/redsocks.conf"
@@ -15,6 +14,7 @@ BIN_PATH="/usr/local/bin/warp-vps"
 DEFAULT_WG_IFACE="warp-vps-wg"
 DEFAULT_WGCF_BIN="${APP_DIR}/bin/wgcf"
 DEFAULT_WG_CONFIG="/etc/wireguard/${DEFAULT_WG_IFACE}.conf"
+WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
 DEFAULT_WGCF_VERSION="v2.2.31"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 RUNTIME_LOCK_FILE="/run/${APP_NAME}.operation.lock"
@@ -2442,43 +2442,78 @@ cmd_logs() {
   journalctl -u warp-svc -u "wg-quick@${WG_IFACE}.service" -u warp-vps-redsocks.service -u warp-vps.service -u warp-vps-health.service --no-pager -n 200
 }
 
-safe_move_if_exists() {
+remove_file_if_exists() {
   local path="$1"
-  local backup_dir="$2"
-  local label="$3"
-  local dest="${backup_dir}/${label}"
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then
     return 0
   fi
-  if [ -e "$dest" ] || [ -L "$dest" ]; then
-    die "备份目标已存在：$dest"
+  rm -f -- "$path" || die "无法永久删除文件：$path"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    die "无法永久删除文件：$path"
   fi
-  mv "$path" "$dest"
 }
 
-print_move_target_if_exists() {
+remove_tree_if_exists() {
   local path="$1"
-  local backup_dir="$2"
-  local label="$3"
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then
     return 0
   fi
-  info_line "$path -> ${backup_dir}/${label}"
+  rm -rf -- "$path" || die "无法永久删除目录：$path"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    die "无法永久删除目录：$path"
+  fi
+}
+
+print_remove_target_if_exists() {
+  local path="$1"
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+  info_line "$path"
+}
+
+managed_swap_listed_in() {
+  local state_file="$1"
+  local rc=0
+  [ -r "$state_file" ] || die "无法读取 Swap 状态文件：$state_file"
+  awk -v swap_file="$MANAGED_SWAP_FILE" '
+    $1 == swap_file { found=1 }
+    END { exit !found }
+  ' "$state_file" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) die "无法解析 Swap 状态文件：$state_file" ;;
+  esac
 }
 
 uninstall_managed_swap() {
-  local backup_dir="$1"
-  if grep -qF "$MANAGED_SWAP_FILE" /proc/swaps 2>/dev/null; then
+  local fstab_tmp
+  if managed_swap_listed_in /proc/swaps; then
     info_line "正在停用本脚本创建的 Swap：$MANAGED_SWAP_FILE"
-    swapoff "$MANAGED_SWAP_FILE"
+    swapoff "$MANAGED_SWAP_FILE" || die "无法停用本脚本创建的 Swap：$MANAGED_SWAP_FILE"
+    if managed_swap_listed_in /proc/swaps; then
+      die "本脚本创建的 Swap 仍在使用，拒绝永久删除：$MANAGED_SWAP_FILE"
+    fi
   fi
-  if grep -qF "$MANAGED_SWAP_FILE" /etc/fstab 2>/dev/null; then
-    info_line "正在从 /etc/fstab 移除本脚本创建的 Swap 记录，原文件会备份"
-    install -m 0644 /etc/fstab "${backup_dir}/fstab.before-warp-vps"
-    awk -v swap_file="$MANAGED_SWAP_FILE" '$1 != swap_file { print }' /etc/fstab > "${backup_dir}/fstab.cleaned"
-    install -m 0644 "${backup_dir}/fstab.cleaned" /etc/fstab
+  if managed_swap_listed_in /etc/fstab; then
+    info_line "正在从 /etc/fstab 移除本脚本创建的 Swap 记录"
+    fstab_tmp="$(mktemp /run/warp-vps-fstab.XXXXXX)" \
+      || die "无法创建 /etc/fstab 临时文件"
+    if ! awk -v swap_file="$MANAGED_SWAP_FILE" '$1 != swap_file { print }' /etc/fstab > "$fstab_tmp"; then
+      rm -f -- "$fstab_tmp" || die "无法删除 /etc/fstab 临时文件：$fstab_tmp"
+      die "无法生成新的 /etc/fstab"
+    fi
+    if ! install -m 0644 "$fstab_tmp" /etc/fstab; then
+      rm -f -- "$fstab_tmp" || die "无法删除 /etc/fstab 临时文件：$fstab_tmp"
+      die "无法更新 /etc/fstab"
+    fi
+    rm -f -- "$fstab_tmp" || die "无法删除 /etc/fstab 临时文件：$fstab_tmp"
+    if managed_swap_listed_in /etc/fstab; then
+      die "/etc/fstab 仍包含本脚本创建的 Swap 记录，拒绝永久删除：$MANAGED_SWAP_FILE"
+    fi
   fi
-  safe_move_if_exists "$MANAGED_SWAP_FILE" "$backup_dir" "swapfile-warp-vps-manager"
+  remove_file_if_exists "$MANAGED_SWAP_FILE"
 }
 
 disable_managed_warp_service() {
@@ -2514,10 +2549,67 @@ managed_redsocks_fallback_exists() {
   grep -aFq "$REDSOCKS_MANAGED_VERSION" "$REDSOCKS_FALLBACK_BIN" 2>/dev/null
 }
 
+managed_wireguard_config_owned() {
+  [ -f "$WG_CONFIG" ] || return 1
+  [ -r "$WG_CONFIG" ] || return 1
+  [ -f "$WGCF_ACCOUNT" ] || return 1
+  [ -r "$WGCF_ACCOUNT" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$WGCF_ACCOUNT" "$WG_CONFIG" <<'PY'
+import hmac
+import pathlib
+import re
+import sys
+
+try:
+    account = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+    profile = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+
+account_matches = re.findall(
+    r"""(?m)^[ \t]*private_key[ \t]*=[ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)')[ \t]*(?:#.*)?$""",
+    account,
+)
+profile_matches = re.findall(
+    r"(?mi)^[ \t]*PrivateKey[ \t]*=[ \t]*([^# \t\r\n]+)[ \t]*(?:#.*)?$",
+    profile,
+)
+if len(account_matches) != 1 or len(profile_matches) != 1:
+    raise SystemExit(1)
+
+account_key = account_matches[0][0] or account_matches[0][1]
+raise SystemExit(0 if hmac.compare_digest(account_key, profile_matches[0]) else 1)
+PY
+}
+
+wireguard_config_in_project_tree() {
+  command -v python3 >/dev/null 2>&1 || return 2
+  python3 - "$WG_CONFIG" "$ETC_DIR" "$APP_DIR" "$STATE_DIR" <<'PY'
+import os
+import sys
+
+try:
+    path = os.path.abspath(sys.argv[1])
+    real_path = os.path.realpath(path)
+    for raw_root in sys.argv[2:]:
+        root = os.path.abspath(raw_root)
+        real_root = os.path.realpath(root)
+        if (
+            os.path.commonpath((path, root)) == root
+            or os.path.commonpath((real_path, real_root)) == real_root
+        ):
+            raise SystemExit(0)
+except (OSError, ValueError):
+    raise SystemExit(2)
+raise SystemExit(1)
+PY
+}
+
 prompt_uninstall_scope() {
   local choice
   while true; do
-    printf '\n卸载时是否一并卸载相关运行依赖？\n' >&2
+    printf '\n卸载会永久删除项目文件。是否一并卸载相关运行依赖？\n' >&2
     printf '  1. 保留依赖，只卸载 WARP VPS Manager（默认）\n' >&2
     printf '  2. 一并卸载 Cloudflare WARP、redsocks 和 wireguard-tools\n' >&2
     printf '请输入选项 [1]：' >&2
@@ -2707,7 +2799,7 @@ uninstall_apt_dependencies() {
     -o DPkg::Lock::Timeout=1200 \
     -o APT::Get::AutomaticRemove=false \
     purge -y "${packages[@]}" \
-    || die "APT 卸载专用运行依赖失败；项目文件尚未移动，可以修复后重试"
+    || die "APT 卸载专用运行依赖失败；项目文件尚未删除，可以修复后重试"
   # shellcheck disable=SC2016
   inventory="$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n')" \
     || die "APT 已执行，但无法复核 dpkg 软件包状态"
@@ -2747,10 +2839,10 @@ uninstall_rpm_dependencies() {
   fi
   if [ "$manager" = "dnf" ]; then
     dnf -y --setopt=clean_requirements_on_remove=False remove "${packages[@]}" \
-      || die "DNF 卸载专用运行依赖失败；项目文件尚未移动，可以修复后重试"
+      || die "DNF 卸载专用运行依赖失败；项目文件尚未删除，可以修复后重试"
   else
     yum --setopt=clean_requirements_on_remove=0 remove -y "${packages[@]}" \
-      || die "YUM 卸载专用运行依赖失败；项目文件尚未移动，可以修复后重试"
+      || die "YUM 卸载专用运行依赖失败；项目文件尚未删除，可以修复后重试"
   fi
   inventory="$(rpm -qa --qf '%{NAME}\n')" \
     || die "RPM 卸载已执行，但无法复核软件包状态"
@@ -2790,69 +2882,82 @@ cmd_uninstall() {
   require_root
   resolve_uninstall_scope "$@" || return $?
 
-  local backup_dir move_managed_redsocks
+  local remove_managed_redsocks remove_wg_config wg_tree_rc
   load_uninstall_config
   recover_uninstall_runtime_from_unit
-  move_managed_redsocks=0
+  remove_managed_redsocks=0
+  remove_wg_config=0
   if [ "$UNINSTALL_REMOVE_DEPENDENCIES" -eq 1 ] && managed_redsocks_fallback_exists; then
-    move_managed_redsocks=1
+    remove_managed_redsocks=1
+  fi
+  if [ "$UNINSTALL_WIREGUARD_PRESENT" -eq 1 ] && managed_wireguard_config_owned; then
+    remove_wg_config=1
+  fi
+  if [ "$UNINSTALL_WIREGUARD_PRESENT" -eq 1 ] && [ "$remove_wg_config" -eq 0 ] \
+    && { [ -e "$WG_CONFIG" ] || [ -L "$WG_CONFIG" ]; }; then
+    wg_tree_rc=0
+    wireguard_config_in_project_tree || wg_tree_rc=$?
+    case "$wg_tree_rc" in
+      0)
+        die "无法确认 WireGuard 配置由本项目创建，且该路径位于将被永久删除的项目目录；请先将文件移到项目目录外并更新 WG_CONFIG：$WG_CONFIG"
+        ;;
+      1) ;;
+      *) die "无法确认 WireGuard 配置是否位于将被永久删除的项目目录：$WG_CONFIG" ;;
+    esac
   fi
   deactivate_runtime_for_uninstall || die "无法确认分流规则已经失效，卸载已中止"
 
-  backup_dir="${BACKUP_ROOT}/uninstall-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  if [ -e "$backup_dir" ] || [ -L "$backup_dir" ]; then
-    die "卸载备份目录已存在，拒绝复用：$backup_dir"
+  section "永久删除清单"
+  info_line "以下项目自有文件会永久删除"
+  print_remove_target_if_exists /etc/systemd/system/warp-vps-redsocks.service
+  print_remove_target_if_exists /etc/systemd/system/warp-vps.service
+  print_remove_target_if_exists /etc/systemd/system/warp-vps-health.service
+  print_remove_target_if_exists /etc/systemd/system/warp-vps-health.timer
+  print_remove_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service
+  print_remove_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service
+  print_remove_target_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer
+  print_remove_target_if_exists "/etc/systemd/system/multi-user.target.wants/wg-quick@${WG_IFACE}.service"
+  if [ "$remove_wg_config" -eq 1 ]; then
+    print_remove_target_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}"
+  elif [ "$UNINSTALL_WIREGUARD_PRESENT" -eq 1 ] \
+    && { [ -e "$WG_CONFIG" ] || [ -L "$WG_CONFIG" ]; }; then
+    info_line "保留无法确认由本项目创建的 WireGuard 配置：$WG_CONFIG"
   fi
-  install -d -m 0755 "$backup_dir" || die "无法创建卸载备份目录：$backup_dir"
-
-  section "卸载移动清单"
-  info_line "以下项目文件会移动到备份目录，不会永久删除"
-  print_move_target_if_exists /etc/systemd/system/warp-vps-redsocks.service "$backup_dir" "systemd-warp-vps-redsocks.service"
-  print_move_target_if_exists /etc/systemd/system/warp-vps.service "$backup_dir" "systemd-warp-vps.service"
-  print_move_target_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir" "systemd-warp-vps-health.service"
-  print_move_target_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir" "systemd-warp-vps-health.timer"
-  print_move_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service "$backup_dir" "systemd-wants-warp-vps-redsocks.service"
-  print_move_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service "$backup_dir" "systemd-wants-warp-vps.service"
-  print_move_target_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer "$backup_dir" "systemd-wants-warp-vps-health.timer"
-  print_move_target_if_exists "/etc/systemd/system/multi-user.target.wants/wg-quick@${WG_IFACE}.service" "$backup_dir" "systemd-wants-wg-quick@${WG_IFACE}.service"
-  if [ "$UNINSTALL_WIREGUARD_PRESENT" -eq 1 ]; then
-    print_move_target_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
+  print_remove_target_if_exists "$ETC_DIR"
+  print_remove_target_if_exists "$APP_DIR"
+  print_remove_target_if_exists "$STATE_DIR"
+  print_remove_target_if_exists "$BIN_PATH"
+  if [ "$remove_managed_redsocks" -eq 1 ]; then
+    print_remove_target_if_exists "$REDSOCKS_FALLBACK_BIN"
   fi
-  print_move_target_if_exists "$ETC_DIR" "$backup_dir" "etc-warp-vps-manager"
-  print_move_target_if_exists "$APP_DIR" "$backup_dir" "opt-warp-vps-manager"
-  print_move_target_if_exists "$STATE_DIR" "$backup_dir" "var-lib-warp-vps-manager"
-  print_move_target_if_exists "$BIN_PATH" "$backup_dir" "usr-local-bin-warp-vps"
-  if [ "$move_managed_redsocks" -eq 1 ]; then
-    print_move_target_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
-  fi
-  print_move_target_if_exists "$MANAGED_SWAP_FILE" "$backup_dir" "swapfile-warp-vps-manager"
+  print_remove_target_if_exists "$MANAGED_SWAP_FILE"
 
   if [ "$UNINSTALL_REMOVE_DEPENDENCIES" -eq 1 ]; then
     uninstall_project_dependencies \
-      || die "专用运行依赖卸载失败；分流已停止，项目文件尚未移动，可以修复后重试"
-    if [ "$move_managed_redsocks" -eq 1 ]; then
-      safe_move_if_exists "$REDSOCKS_FALLBACK_BIN" "$backup_dir" "usr-local-sbin-redsocks"
+      || die "专用运行依赖卸载失败；分流已停止，项目文件尚未删除，可以修复后重试"
+    if [ "$remove_managed_redsocks" -eq 1 ]; then
+      remove_file_if_exists "$REDSOCKS_FALLBACK_BIN"
     fi
   fi
 
-  uninstall_managed_swap "$backup_dir"
-  safe_move_if_exists /etc/systemd/system/warp-vps-redsocks.service "$backup_dir" "systemd-warp-vps-redsocks.service"
-  safe_move_if_exists /etc/systemd/system/warp-vps.service "$backup_dir" "systemd-warp-vps.service"
-  safe_move_if_exists /etc/systemd/system/warp-vps-health.service "$backup_dir" "systemd-warp-vps-health.service"
-  safe_move_if_exists /etc/systemd/system/warp-vps-health.timer "$backup_dir" "systemd-warp-vps-health.timer"
-  safe_move_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service "$backup_dir" "systemd-wants-warp-vps-redsocks.service"
-  safe_move_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service "$backup_dir" "systemd-wants-warp-vps.service"
-  safe_move_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer "$backup_dir" "systemd-wants-warp-vps-health.timer"
-  safe_move_if_exists "/etc/systemd/system/multi-user.target.wants/wg-quick@${WG_IFACE}.service" "$backup_dir" "systemd-wants-wg-quick@${WG_IFACE}.service"
-  if [ "$UNINSTALL_WIREGUARD_PRESENT" -eq 1 ]; then
-    safe_move_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}" "$backup_dir" "wireguard-${WG_IFACE:-$DEFAULT_WG_IFACE}.conf"
+  uninstall_managed_swap
+  remove_file_if_exists /etc/systemd/system/warp-vps-redsocks.service
+  remove_file_if_exists /etc/systemd/system/warp-vps.service
+  remove_file_if_exists /etc/systemd/system/warp-vps-health.service
+  remove_file_if_exists /etc/systemd/system/warp-vps-health.timer
+  remove_file_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service
+  remove_file_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service
+  remove_file_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer
+  remove_file_if_exists "/etc/systemd/system/multi-user.target.wants/wg-quick@${WG_IFACE}.service"
+  if [ "$remove_wg_config" -eq 1 ]; then
+    remove_file_if_exists "${WG_CONFIG:-$DEFAULT_WG_CONFIG}"
   fi
-  safe_move_if_exists "$ETC_DIR" "$backup_dir" "etc-warp-vps-manager"
-  safe_move_if_exists "$APP_DIR" "$backup_dir" "opt-warp-vps-manager"
-  safe_move_if_exists "$STATE_DIR" "$backup_dir" "var-lib-warp-vps-manager"
-  safe_move_if_exists "$BIN_PATH" "$backup_dir" "usr-local-bin-warp-vps"
-  systemctl daemon-reload || die "systemd 重新加载失败；分流已停止，但请检查备份目录"
-  printf 'WARP VPS Manager 已卸载，文件已移动到备份目录：%s\n' "$backup_dir"
+  remove_tree_if_exists "$ETC_DIR"
+  remove_tree_if_exists "$APP_DIR"
+  remove_tree_if_exists "$STATE_DIR"
+  remove_file_if_exists "$BIN_PATH"
+  systemctl daemon-reload || die "systemd 重新加载失败；分流已停止，请检查残留文件"
+  printf 'WARP VPS Manager 已卸载，项目文件已永久删除。\n'
   if [ "$UNINSTALL_REMOVE_DEPENDENCIES" -eq 1 ]; then
     printf 'Cloudflare WARP、redsocks 和 wireguard-tools 等专用运行依赖已卸载。\n'
   else
@@ -2877,9 +2982,9 @@ usage() {
   switch wireguard|socks [安装选项]
                   非交互切换模式；复用同一安装事务
   logs            查看最近日志
-  uninstall       交互卸载，并询问是否一并卸载相关运行依赖
-  uninstall --yes 非交互卸载项目，保留依赖
-  uninstall all   非交互卸载项目及 Cloudflare WARP、redsocks、wireguard-tools
+  uninstall       交互永久删除项目，并询问是否一并卸载相关运行依赖
+  uninstall --yes 非交互永久删除项目，保留依赖
+  uninstall all   非交互永久删除项目及 Cloudflare WARP、redsocks、wireguard-tools
 
 内部命令：
   heal            健康检查和自动修复

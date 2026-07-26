@@ -77,11 +77,11 @@ Socks5 会让支持回落的客户端从 QUIC 改用经 WARP 转发的 TCP；其
 
 | 命令 | 用途 |
 |---|---|
-| `warp-vps uninstall` | 交互卸载，并选择是否卸载运行依赖 |
-| `warp-vps uninstall --yes` | 非交互卸载项目，保留依赖 |
-| `warp-vps uninstall all` | 非交互卸载项目及 Cloudflare WARP、redsocks、wireguard-tools |
+| `warp-vps uninstall` | 交互永久删除项目，并选择是否卸载运行依赖 |
+| `warp-vps uninstall --yes` | 非交互永久删除项目，保留依赖 |
+| `warp-vps uninstall all` | 非交互永久删除项目及 Cloudflare WARP、redsocks、wireguard-tools |
 
-三种卸载方式都会先停止自动修复，并确认分流规则已经失效，再把项目文件移到 `/var/backups/warp-vps-manager/`。
+三种卸载方式都会先停止自动修复，并确认分流规则已经失效，再永久删除确认归属的项目文件，不创建卸载备份。无法确认由本项目创建的现有 WireGuard 配置会保留；若该配置位于项目目录内，卸载会要求先迁移到目录外。
 
 ## IP 规则来源
 

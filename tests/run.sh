@@ -3925,22 +3925,22 @@ test_uninstall_missing_unit_is_already_disabled() {
     'a missing unit should not require an is-enabled query'
 }
 
-test_uninstall_orders_teardown_before_dependencies_and_files() {
-  local body resolve_line deactivate_line backup_line dependency_line move_line
+test_uninstall_orders_teardown_before_dependencies_and_deletion() {
+  local body resolve_line deactivate_line dependency_line delete_line swap_line
   body="$(function_body "$MANAGER_SCRIPT" cmd_uninstall)"
   resolve_line="$(line_number "$body" 'resolve_uninstall_scope')"
   deactivate_line="$(line_number "$body" 'deactivate_runtime_for_uninstall')"
-  backup_line="$(line_number "$body" 'install -d -m 0755 "$backup_dir"')"
   dependency_line="$(line_number "$body" 'uninstall_project_dependencies')"
-  move_line="$(line_number "$body" 'safe_move_if_exists "$REDSOCKS_FALLBACK_BIN"')"
-  if [ -z "$resolve_line" ] || [ -z "$deactivate_line" ] || [ -z "$backup_line" ] \
-    || [ -z "$dependency_line" ] || [ -z "$move_line" ]; then
+  delete_line="$(line_number "$body" 'remove_file_if_exists "$REDSOCKS_FALLBACK_BIN"')"
+  swap_line="$(line_number "$body" 'uninstall_managed_swap')"
+  if [ -z "$resolve_line" ] || [ -z "$deactivate_line" ] \
+    || [ -z "$dependency_line" ] || [ -z "$delete_line" ] || [ -z "$swap_line" ]; then
     fail 'uninstall phase boundaries are incomplete'
     return 1
   fi
-  if [ "$resolve_line" -ge "$deactivate_line" ] || [ "$deactivate_line" -ge "$backup_line" ] \
-    || [ "$backup_line" -ge "$dependency_line" ] || [ "$dependency_line" -ge "$move_line" ]; then
-    fail 'uninstall must resolve input, deactivate rules, uninstall dependencies, then move files'
+  if [ "$resolve_line" -ge "$deactivate_line" ] || [ "$deactivate_line" -ge "$dependency_line" ] \
+    || [ "$dependency_line" -ge "$delete_line" ] || [ "$delete_line" -ge "$swap_line" ]; then
+    fail 'uninstall must resolve input, deactivate rules, uninstall dependencies, then delete files'
     return 1
   fi
 
@@ -3948,6 +3948,221 @@ test_uninstall_orders_teardown_before_dependencies_and_files() {
   main_body="$(function_body "$MANAGER_SCRIPT" main)"
   assert_contains "$main_body" 'cmd_uninstall "$@"' \
     'main must forward uninstall options instead of silently ignoring them'
+}
+
+test_uninstall_permanently_deletes_owned_paths_without_backup() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local root file_path tree_path dynamic_dir output rc=0
+  root="$(mktemp -d)"
+  file_path="${root}/managed-file"
+  tree_path="${root}/managed-tree"
+  dynamic_dir="${root}/dynamic-config-path"
+  : > "$file_path"
+  mkdir -p "${tree_path}/nested" "$dynamic_dir"
+  : > "${tree_path}/nested/state"
+
+  remove_file_if_exists "$file_path"
+  if [ -e "$file_path" ] || [ -L "$file_path" ]; then
+    fail 'uninstall file deletion left the managed file behind'
+    return 1
+  fi
+
+  output="$(remove_file_if_exists "$dynamic_dir" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a dynamic file path was recursively accepted as a directory'
+    return 1
+  }
+  [ -d "$dynamic_dir" ] || {
+    fail 'a dynamic file path recursively deleted a directory'
+    return 1
+  }
+  assert_contains "$output" '无法永久删除文件' \
+    'directory rejection should identify the failed file deletion' || return 1
+
+  remove_tree_if_exists "$tree_path"
+  if [ -e "$tree_path" ] || [ -L "$tree_path" ]; then
+    fail 'uninstall tree deletion left the fixed project directory behind'
+    return 1
+  fi
+  remove_tree_if_exists "$root"
+
+  local uninstall_body file_body tree_body swap_body
+  uninstall_body="$(function_body "$MANAGER_SCRIPT" cmd_uninstall)"
+  file_body="$(function_body "$MANAGER_SCRIPT" remove_file_if_exists)"
+  tree_body="$(function_body "$MANAGER_SCRIPT" remove_tree_if_exists)"
+  swap_body="$(function_body "$MANAGER_SCRIPT" uninstall_managed_swap)"
+  assert_contains "$file_body" 'rm -f -- "$path"' \
+    'file deletion should be permanent and non-recursive' || return 1
+  assert_not_contains "$file_body" 'rm -rf' \
+    'dynamic file paths must never use recursive deletion' || return 1
+  assert_contains "$tree_body" 'rm -rf -- "$path"' \
+    'fixed project directories should be permanently deleted' || return 1
+  assert_contains "$uninstall_body" 'managed_wireguard_config_owned' \
+    'WireGuard config deletion must require project ownership evidence' || return 1
+  assert_contains "$uninstall_body" 'if [ "$remove_wg_config" -eq 1 ]' \
+    'only an owned WireGuard config may enter permanent deletion' || return 1
+  assert_not_contains "$uninstall_body" 'BACKUP_ROOT' \
+    'uninstall must not create a backup root' || return 1
+  assert_not_contains "$swap_body" 'backup' \
+    'managed Swap uninstall must not create an fstab or Swap backup'
+}
+
+test_uninstall_wireguard_config_requires_project_account_match() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local root ownership_body
+  assert_eq '/var/lib/warp-vps-manager/wgcf/wgcf-account.toml' "$WGCF_ACCOUNT" \
+    'the manager must resolve its project-owned wgcf account path' || return 1
+  root="$(mktemp -d)"
+  WGCF_ACCOUNT="${root}/wgcf-account.toml"
+  WG_CONFIG="${root}/warp-vps-wg.conf"
+  printf 'private_key = "project-private-key="\n' > "$WGCF_ACCOUNT"
+  printf '[Interface]\nPrivateKey = project-private-key=\n' > "$WG_CONFIG"
+  managed_wireguard_config_owned || {
+    fail 'a WireGuard config matching the project wgcf account should be owned'
+    return 1
+  }
+
+  printf "private_key = 'different-private-key='\n" > "$WGCF_ACCOUNT"
+  if managed_wireguard_config_owned; then
+    fail 'a WireGuard config with a different private key was claimed as project-owned'
+    return 1
+  fi
+
+  ownership_body="$(function_body "$MANAGER_SCRIPT" managed_wireguard_config_owned)"
+  assert_contains "$ownership_body" 'hmac.compare_digest' \
+    'WireGuard ownership must compare keys without printing them' || return 1
+  assert_not_contains "$ownership_body" 'print(' \
+    'WireGuard ownership must not expose private keys' || return 1
+  remove_tree_if_exists "$root"
+}
+
+test_uninstall_rejects_unowned_wireguard_config_in_project_tree() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local root output production_remove_tree alias_path rc=0
+  root="$(mktemp -d)"
+  production_remove_tree="$(declare -f remove_tree_if_exists)"
+  ETC_DIR="${root}/etc"
+  APP_DIR="${root}/app"
+  STATE_DIR="${root}/state"
+  mkdir -p "$ETC_DIR" "$APP_DIR" "$STATE_DIR"
+  WG_CONFIG="${ETC_DIR}/nested/../unowned.conf"
+  wireguard_config_in_project_tree || {
+    fail 'an unowned WireGuard path inside a project tree was not detected'
+    return 1
+  }
+  WG_CONFIG="${root}/outside.conf"
+  if wireguard_config_in_project_tree; then
+    fail 'an external WireGuard path was mistaken for a project-tree path'
+    return 1
+  fi
+  : > "${ETC_DIR}/aliased.conf"
+  alias_path="${root}/project-alias"
+  ln -s "$ETC_DIR" "$alias_path"
+  WG_CONFIG="${alias_path}/aliased.conf"
+  wireguard_config_in_project_tree || {
+    fail 'an external symlink into a project tree bypassed the deletion boundary'
+    return 1
+  }
+  WG_CONFIG="${ETC_DIR}/unowned.conf"
+  : > "$WG_CONFIG"
+
+  require_root() { :; }
+  load_uninstall_config() {
+    WARP_MODE=wireguard
+    WG_IFACE=warp-vps-wg
+    WG_CONFIG="${ETC_DIR}/unowned.conf"
+    MANAGED_WARP_SVC=0
+    UNINSTALL_WIREGUARD_PRESENT=1
+    UNINSTALL_RUNTIME_IDENTIFIED=1
+  }
+  recover_uninstall_runtime_from_unit() { :; }
+  managed_wireguard_config_owned() { return 1; }
+  deactivate_runtime_for_uninstall() { printf 'unexpected-deactivation\n'; }
+  remove_file_if_exists() { printf 'unexpected-delete:%s\n' "$1"; }
+  remove_tree_if_exists() { printf 'unexpected-delete:%s\n' "$1"; }
+  uninstall_managed_swap() { printf 'unexpected-delete:swap\n'; }
+  systemctl() { :; }
+
+  output="$(cmd_uninstall --yes 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'uninstall accepted an unowned WireGuard config inside a deletion tree'
+    return 1
+  }
+  assert_contains "$output" '请先将文件移到项目目录外并更新 WG_CONFIG' \
+    'the ownership conflict should provide an actionable path' || return 1
+  assert_not_contains "$output" 'unexpected-deactivation' \
+    'ownership conflict must stop before runtime mutation' || return 1
+  assert_not_contains "$output" 'unexpected-delete:' \
+    'ownership conflict must stop before permanent deletion' || return 1
+  eval "$production_remove_tree"
+  remove_tree_if_exists "$root"
+}
+
+test_managed_swap_uninstall_verifies_state_without_backup() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local root mock_fstab_tmp events='' swap_active=1 fstab_listed=1
+  root="$(mktemp -d)"
+  mock_fstab_tmp="${root}/fstab.tmp"
+  managed_swap_listed_in() {
+    case "$1" in
+      /proc/swaps) [ "$swap_active" -eq 1 ] ;;
+      /etc/fstab) [ "$fstab_listed" -eq 1 ] ;;
+      *) return 1 ;;
+    esac
+  }
+  swapoff() {
+    events="${events}swapoff\n"
+    swap_active=0
+  }
+  mktemp() { printf '%s\n' "$mock_fstab_tmp"; }
+  awk() {
+    events="${events}awk\n"
+    printf 'cleaned fstab\n'
+  }
+  install() {
+    events="${events}install\n"
+    fstab_listed=0
+  }
+  rm() {
+    events="${events}rm\n"
+    command rm "$@"
+  }
+  remove_file_if_exists() { events="${events}delete-swap\n"; }
+  info_line() { :; }
+
+  uninstall_managed_swap
+  assert_eq 'swapoff\nawk\ninstall\nrm\ndelete-swap\n' "$events" \
+    'Swap uninstall must deactivate, rewrite, remove its temp file, then delete the Swap file' \
+    || return 1
+  [ ! -e "$mock_fstab_tmp" ] || {
+    fail 'Swap uninstall left its transient fstab file behind'
+    return 1
+  }
+  remove_tree_if_exists "$root"
+  unset -f awk install mktemp rm swapoff
+
+  local output rc=0 swap_body
+  managed_swap_listed_in() { die "无法读取 Swap 状态文件：$1"; }
+  remove_file_if_exists() { printf 'unexpected-delete\n'; }
+  output="$(uninstall_managed_swap 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'Swap uninstall continued after a state query failure'
+    return 1
+  }
+  assert_not_contains "$output" 'unexpected-delete' \
+    'Swap state query failure must stop before permanent deletion' || return 1
+
+  swap_body="$(function_body "$MANAGER_SCRIPT" uninstall_managed_swap)"
+  assert_contains "$swap_body" 'swapoff "$MANAGED_SWAP_FILE" || die' \
+    'Swap deactivation failure must stop permanent deletion' || return 1
+  assert_contains "$swap_body" 'if ! awk' \
+    'fstab generation failure must stop permanent deletion' || return 1
+  assert_contains "$swap_body" 'if ! install' \
+    'fstab replacement failure must stop permanent deletion'
 }
 
 test_all_dependency_packages_are_explicit_and_scoped() {
@@ -4130,7 +4345,7 @@ test_uninstall_scope_controls_dependency_and_fallback_cleanup() {
 
   local dependency_calls=0
   local prompt_calls=0
-  local moved_paths=''
+  local removed_paths=''
   require_root() { :; }
   read_input() {
     prompt_calls=$((prompt_calls + 1))
@@ -4147,31 +4362,30 @@ test_uninstall_scope_controls_dependency_and_fallback_cleanup() {
   recover_uninstall_runtime_from_unit() { :; }
   managed_redsocks_fallback_exists() { return 0; }
   deactivate_runtime_for_uninstall() { :; }
-  date() { printf '20260718T120000Z\n'; }
-  install() { :; }
   section() { :; }
   info_line() { :; }
-  print_move_target_if_exists() { :; }
+  print_remove_target_if_exists() { :; }
   uninstall_project_dependencies() { dependency_calls=$((dependency_calls + 1)); }
-  safe_move_if_exists() { moved_paths="${moved_paths}$1\n"; }
+  remove_file_if_exists() { removed_paths="${removed_paths}$1\n"; }
+  remove_tree_if_exists() { removed_paths="${removed_paths}$1\n"; }
   uninstall_managed_swap() { :; }
   systemctl() { :; }
 
   cmd_uninstall --yes >/dev/null
   assert_eq '0' "$dependency_calls" 'project-only uninstall must keep dependencies' || return 1
   assert_eq '0' "$prompt_calls" '--yes must not prompt' || return 1
-  assert_not_contains "$moved_paths" "$REDSOCKS_FALLBACK_BIN" \
+  assert_not_contains "$removed_paths" "$REDSOCKS_FALLBACK_BIN" \
     'project-only uninstall must keep a managed redsocks dependency' || return 1
 
-  moved_paths=''
+  removed_paths=''
   cmd_uninstall all >/dev/null
   assert_eq '1' "$dependency_calls" 'all uninstall must remove dependencies' || return 1
   assert_eq '0' "$prompt_calls" 'all must not prompt' || return 1
-  assert_contains "$moved_paths" "$REDSOCKS_FALLBACK_BIN" \
-    'all uninstall must move an owned source-built redsocks binary'
+  assert_contains "$removed_paths" "$REDSOCKS_FALLBACK_BIN" \
+    'all uninstall must permanently delete an owned source-built redsocks binary'
 }
 
-test_dependency_failure_stops_before_file_moves() {
+test_dependency_failure_stops_before_file_deletion() {
   source_without_main "$MANAGER_SCRIPT"
 
   require_root() { :; }
@@ -4186,13 +4400,13 @@ test_dependency_failure_stops_before_file_moves() {
   recover_uninstall_runtime_from_unit() { :; }
   managed_redsocks_fallback_exists() { return 1; }
   deactivate_runtime_for_uninstall() { :; }
-  date() { printf '20260718T120000Z\n'; }
-  install() { :; }
   section() { :; }
   info_line() { :; }
-  print_move_target_if_exists() { :; }
+  print_remove_target_if_exists() { :; }
   uninstall_project_dependencies() { return 1; }
-  safe_move_if_exists() { printf 'unexpected-move:%s\n' "$1"; }
+  remove_file_if_exists() { printf 'unexpected-delete:%s\n' "$1"; }
+  remove_tree_if_exists() { printf 'unexpected-delete:%s\n' "$1"; }
+  uninstall_managed_swap() { printf 'unexpected-delete:%s\n' "$MANAGED_SWAP_FILE"; }
 
   local output rc=0
   output="$(cmd_uninstall all 2>&1)" || rc=$?
@@ -4200,29 +4414,37 @@ test_dependency_failure_stops_before_file_moves() {
     fail 'dependency failure was reported as a successful uninstall'
     return 1
   }
-  assert_not_contains "$output" 'unexpected-move:' \
-    'dependency failure must stop before any project file is moved' || return 1
+  assert_not_contains "$output" 'unexpected-delete:' \
+    'dependency failure must stop before any project file is deleted' || return 1
   assert_not_contains "$output" 'WARP VPS Manager 已卸载' \
     'dependency failure must not print uninstall success'
 }
 
 test_readme_documents_all_uninstall_modes() {
   source_without_main "$MANAGER_SCRIPT"
-  assert_file_matches "$README_FILE" 'warp-vps uninstall` \| 交互卸载' \
+  assert_file_matches "$README_FILE" 'warp-vps uninstall` \| 交互永久删除项目' \
     'README should document interactive uninstall' || return 1
-  assert_file_matches "$README_FILE" 'warp-vps uninstall --yes` \| 非交互卸载项目，保留依赖' \
+  assert_file_matches "$README_FILE" 'warp-vps uninstall --yes` \| 非交互永久删除项目，保留依赖' \
     'README should document direct project-only uninstall' || return 1
-  assert_file_matches "$README_FILE" 'warp-vps uninstall all` \| 非交互卸载项目及' \
+  assert_file_matches "$README_FILE" 'warp-vps uninstall all` \| 非交互永久删除项目及' \
     'README should document direct all uninstall' || return 1
-  assert_file_matches "$README_FILE" '三种卸载方式都会先停止自动修复，并确认分流规则已经失效' \
-    'README should promise the verified common rule teardown' || return 1
+  assert_file_matches "$README_FILE" '确认分流规则已经失效，再永久删除确认归属的项目文件，不创建卸载备份' \
+    'README should document verified teardown and permanent deletion' || return 1
+  assert_file_matches "$README_FILE" '无法确认由本项目创建的现有 WireGuard 配置会保留' \
+    'README should document the WireGuard ownership boundary' || return 1
+  assert_file_matches "$README_FILE" '若该配置位于项目目录内，卸载会要求先迁移到目录外' \
+    'README should document the actionable project-tree conflict' || return 1
+  assert_file_not_matches "$README_FILE" '/var/backups/warp-vps-manager/' \
+    'README must not promise an uninstall backup' || return 1
   assert_file_not_matches "$README_FILE" '^[-*] 卸载不会删除系统依赖包' \
     'README must not retain the obsolete unconditional dependency promise' || return 1
 
   local help_output
   help_output="$(usage)"
-  assert_contains "$help_output" 'uninstall --yes' 'CLI help should document direct project-only uninstall' || return 1
-  assert_contains "$help_output" 'uninstall all' 'CLI help should document direct all uninstall'
+  assert_contains "$help_output" 'uninstall --yes 非交互永久删除项目' \
+    'CLI help should document permanent project-only uninstall' || return 1
+  assert_contains "$help_output" 'uninstall all   非交互永久删除项目及' \
+    'CLI help should document permanent all uninstall'
 }
 
 test_reinstall_rejects_residual_socks_rules() {
@@ -5515,13 +5737,17 @@ run_test 'uninstall fails closed without runtime identity' test_uninstall_fails_
 run_test 'Socks uninstall clears known rules before missing ip handling' test_socks_uninstall_stops_known_rules_before_missing_ip_failure
 run_test 'uninstall state queries fail closed' test_uninstall_state_queries_fail_closed
 run_test 'missing uninstall units are already disabled' test_uninstall_missing_unit_is_already_disabled
-run_test 'uninstall teardown precedes dependencies and file moves' test_uninstall_orders_teardown_before_dependencies_and_files
+run_test 'uninstall teardown precedes dependencies and permanent deletion' test_uninstall_orders_teardown_before_dependencies_and_deletion
+run_test 'uninstall permanently deletes owned paths without backup' test_uninstall_permanently_deletes_owned_paths_without_backup
+run_test 'uninstall requires project account ownership for WireGuard config deletion' test_uninstall_wireguard_config_requires_project_account_match
+run_test 'uninstall rejects unowned WireGuard config inside project trees' test_uninstall_rejects_unowned_wireguard_config_in_project_tree
+run_test 'managed Swap uninstall verifies state without backup' test_managed_swap_uninstall_verifies_state_without_backup
 run_test 'all dependency packages are explicit and scoped' test_all_dependency_packages_are_explicit_and_scoped
 run_test 'dependency services stop independently' test_dependency_services_stop_independently
 run_test 'dependency uninstall requires an absent postcondition' test_dependency_uninstall_requires_absent_postcondition
 run_test 'RPM dependency postcondition parsing fails closed' test_rpm_dependency_postcondition_parser_fails_closed
 run_test 'uninstall scope controls dependency and fallback cleanup' test_uninstall_scope_controls_dependency_and_fallback_cleanup
-run_test 'dependency failure stops before file moves' test_dependency_failure_stops_before_file_moves
+run_test 'dependency failure stops before file deletion' test_dependency_failure_stops_before_file_deletion
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
 run_test 'reinstall rejects residual Socks rules' test_reinstall_rejects_residual_socks_rules
 run_test 'reinstall quiesces health and optional backends' test_reinstall_quiesces_health_and_optional_backends
