@@ -5372,7 +5372,7 @@ test_no_sha_gate() {
     'manager downloads must not be blocked by embedded SHA comparisons'
 }
 
-test_noninteractive_contract_is_documented_and_downloads_are_bounded() {
+test_public_install_contract_and_downloads_are_bounded() {
   local install_fetch update_fetch rpm_install
   install_fetch="$(function_body "$INSTALL_SCRIPT" fetch_asset)"
   update_fetch="$(function_body "$MANAGER_SCRIPT" download_update_asset)"
@@ -5393,27 +5393,25 @@ test_noninteractive_contract_is_documented_and_downloads_are_bounded() {
     'RPM key import must use the completed local download' || return 1
   assert_not_contains "$rpm_install" 'rpm --import https://' \
     'RPM must not perform an unbounded remote key import' || return 1
-  assert_file_matches "$README_FILE" 'bash -s -- --install --non-interactive' \
-    'README must show the stdin-safe noninteractive installation entry' || return 1
+  assert_file_matches "$README_FILE" \
+    '^bash <\(curl -fsSL https://raw\.githubusercontent\.com/mqfut123/warp-vps-manager/main/install\.sh\)$' \
+    'README must show the single Bash process-substitution installer' || return 1
+  assert_file_not_matches "$README_FILE" 'bash -o pipefail -c|curl[^<]*\|[[:space:]]*bash|bash -s -- --install --non-interactive' \
+    'README must not publish pipeline wrappers or additional remote install entries' || return 1
+  local public_install_count
+  public_install_count="$(
+    grep -Ec 'raw\.githubusercontent\.com/mqfut123/warp-vps-manager/main/install\.sh' "$README_FILE"
+  )"
+  assert_eq '1' "$public_install_count" \
+    'README must contain exactly one public remote install command' || return 1
   assert_file_matches "$README_FILE" 'warp-vps switch wireguard' \
     'README must document noninteractive mode switching' || return 1
-  assert_file_matches "$README_FILE" '退出码 `0`.*`2`.*其他非零值' \
-    'README must document automation exit statuses' || return 1
   assert_file_matches "$README_FILE" 'Google IPv4 UDP/443（QUIC）.*拒绝' \
     'README must document the scoped Google QUIC reject' || return 1
   assert_file_matches "$README_FILE" '其他 Google IPv4 UDP 端口和非 Google 目标 UDP 不受影响' \
     'README must not imply that Socks blocks every UDP packet' || return 1
   assert_file_not_matches "$README_FILE" 'IPv4 UDP( 和 QUIC|/QUIC) 使用 VPS 原生出口' \
-    'README must not describe Google QUIC as using the native VPS exit' || return 1
-  awk '
-    /^```bash$/ { in_bash=1; has_pipefail=0; next }
-    /^```$/ { in_bash=0; next }
-    in_bash && /bash -o pipefail -c/ { has_pipefail=1 }
-    in_bash && /raw\.githubusercontent\.com\/mqfut123\/warp-vps-manager\/main\/install\.sh/ {
-      if (!has_pipefail || index($0, "curl -fsSL") == 0) bad=1
-    }
-    END { exit bad }
-  ' "$README_FILE" || fail 'every documented remote installer pipeline must propagate curl failures'
+    'README must not describe Google QUIC as using the native VPS exit'
 }
 
 run_test 'install mode retries after invalid input' test_install_mode_reprompts
@@ -5544,7 +5542,7 @@ run_test 'main is the single public project source' test_main_is_the_single_publ
 run_test 'logs follow the configured WireGuard interface' test_logs_follow_custom_wireguard_interface
 run_test 'project version and GitHub commit API gates are absent' test_no_project_version_or_commit_api_gate
 run_test 'embedded SHA gates are absent' test_no_sha_gate
-run_test 'noninteractive CLI and bounded downloads are documented' test_noninteractive_contract_is_documented_and_downloads_are_bounded
+run_test 'public installer and bounded downloads are documented' test_public_install_contract_and_downloads_are_bounded
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
