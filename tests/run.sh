@@ -1484,7 +1484,13 @@ test_apt_wireguard_dependencies_are_minimal() {
   assert_not_contains "$package_calls" 'nftables' 'WireGuard mode must not install nftables' || return 1
   assert_not_contains "$package_calls" 'iptables' 'WireGuard mode must not install iptables' || return 1
   assert_not_contains "$package_calls" 'redsocks' 'WireGuard mode must not install redsocks' || return 1
-  assert_not_contains "$package_calls" 'cloudflare-warp' 'WireGuard mode must not install cloudflare-warp'
+  assert_not_contains "$package_calls" 'cloudflare-warp' 'WireGuard mode must not install cloudflare-warp' || return 1
+
+  package_calls=''
+  PREVIOUS_MODE=socks
+  pkg_install_apt wireguard google
+  assert_contains "$package_calls" 'nftables' \
+    'switching from Socks must retain nftables until its old table can be cleared'
 }
 
 test_existing_cloudflare_apt_repo_refreshes_before_updates() {
@@ -1574,7 +1580,14 @@ test_rpm_wireguard_dependencies_are_minimal() {
   assert_not_contains "$package_calls" 'redsocks' 'WireGuard mode must not install redsocks' || return 1
   assert_not_contains "$package_calls" 'cloudflare-warp' 'WireGuard mode must not install cloudflare-warp' || return 1
   assert_eq '0' "$extra_repo_calls" \
-    'WireGuard mode must not enable EPEL, CRB or PowerTools repositories'
+    'WireGuard mode must not enable EPEL, CRB or PowerTools repositories' || return 1
+
+  package_calls=''
+  PREVIOUS_MODE=socks
+  pkg_install_rpm wireguard dnf google
+  assert_contains "$package_calls" 'nftables' \
+    'switching from Socks must retain nftables until its old table can be cleared' || return 1
+  PREVIOUS_MODE=''
 
   root="$(mktemp -d)"
   repo="$root/cloudflare-warp.repo"
@@ -1793,6 +1806,24 @@ test_wireguard_dependencies_do_not_require_socks_tools() {
   assert_not_contains "$checks" ' ss' 'WireGuard dependency checks must not require ss' || return 1
   assert_contains "$checks" ' timeout' 'WireGuard dependency checks must bound wgcf execution' || return 1
   assert_not_contains "$checks" ' nft' 'WireGuard dependency checks must not require nftables' || return 1
+
+  PREVIOUS_MODE=socks
+  if mode_dependencies_complete wireguard google; then
+    fail 'a Socks to WireGuard transition without nft must repair the cleanup dependency'
+    return 1
+  fi
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl|ip|python3|timeout|sha256sum|wg|wg-quick|nft) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  mode_dependencies_complete wireguard google || {
+    fail 'a Socks to WireGuard transition should reuse complete cleanup dependencies'
+    return 1
+  }
+  PREVIOUS_MODE=''
 
   command() {
     [ "$1" = '-v' ] || return 1
@@ -3066,6 +3097,21 @@ test_wireguard_apply_clears_stale_socks_table() {
     fail 'a failed stale Socks table deletion must remain a local WireGuard apply error'
     return 1
   fi
+
+  table_present=0
+  delete_fails=0
+  route_calls=0
+  command() {
+    [ "${1:-}" = '-v' ] && [ "${2:-}" = nft ] && return 1
+    builtin command "$@"
+  }
+  apply_rules || {
+    fail 'a clean precise WireGuard apply should work without the optional nft command'
+    return 1
+  }
+  assert_eq '1' "$route_calls" \
+    'precise WireGuard routes should still apply when no Socks cleanup tool is installed' || return 1
+  unset -f command
 }
 
 test_mode_switch_rejects_live_opposite_backend() {
@@ -3156,8 +3202,8 @@ test_opposite_backend_checks_preserve_three_states() {
   socks_table_absent || rc=$?
   assert_eq '2' "$rc" \
     'a missing nft userspace command cannot prove that an old kernel table is absent' || return 1
-  if clear_socks_table_for_wireguard; then
-    fail 'WireGuard activation must not claim a stale Socks table was cleared without nft'
+  if ! clear_socks_table_for_wireguard; then
+    fail 'a clean precise WireGuard activation must not require the optional nft command'
     return 1
   fi
   unset -f command

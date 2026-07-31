@@ -1045,7 +1045,7 @@ socks_table_absent() {
 }
 
 clear_socks_table_for_wireguard() {
-  command -v nft >/dev/null 2>&1 || return 1
+  command -v nft >/dev/null 2>&1 || return 0
   local tables rc
   tables="$(nft list tables 2>/dev/null)" || return 1
   rc=0

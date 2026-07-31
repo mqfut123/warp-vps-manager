@@ -441,7 +441,7 @@ pkg_install_apt() {
   apt_get update -y
 
   if [ "$mode" = "wireguard" ]; then
-    if [ "$scope" = "global" ]; then
+    if [ "$scope" = "global" ] || [ "${PREVIOUS_MODE:-}" = "socks" ]; then
       apt_get install -y curl ca-certificates coreutils nftables iproute2 python3 wireguard-tools
     else
       apt_get install -y curl ca-certificates coreutils iproute2 python3 wireguard-tools
@@ -637,7 +637,7 @@ pkg_install_rpm() {
     cloudflare_metadata_ready=1
   fi
   if [ "$mode" = "wireguard" ]; then
-    if [ "$scope" = "global" ]; then
+    if [ "$scope" = "global" ] || [ "${PREVIOUS_MODE:-}" = "socks" ]; then
       "$manager" install -y curl ca-certificates coreutils nftables iproute python3 wireguard-tools
     else
       "$manager" install -y curl ca-certificates coreutils iproute python3 wireguard-tools
@@ -710,8 +710,8 @@ install_dependencies() {
     command -v wg-quick >/dev/null 2>&1 || die "依赖安装后仍找不到 wg-quick"
     command -v sha256sum >/dev/null 2>&1 || die "依赖安装后仍找不到 sha256sum"
     unit_file_exists 'wg-quick@.service' || die "wireguard-tools 已安装但找不到 wg-quick@.service"
-    if [ "$scope" = "global" ]; then
-      command -v nft >/dev/null 2>&1 || die "WireGuard 全局模式依赖安装后仍找不到 nftables"
+    if [ "$scope" = "global" ] || [ "${PREVIOUS_MODE:-}" = "socks" ]; then
+      command -v nft >/dev/null 2>&1 || die "WireGuard 当前安装路径依赖安装后仍找不到 nftables"
     fi
   else
     command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
@@ -735,7 +735,8 @@ mode_dependencies_complete() {
         && command -v wg-quick >/dev/null 2>&1 \
         && command -v sha256sum >/dev/null 2>&1 \
         && unit_file_exists 'wg-quick@.service' \
-        && { [ "$scope" != "global" ] || command -v nft >/dev/null 2>&1; }
+        && { { [ "$scope" != "global" ] && [ "${PREVIOUS_MODE:-}" != "socks" ]; } \
+          || command -v nft >/dev/null 2>&1; }
       ;;
     socks)
       command -v ss >/dev/null 2>&1 \
