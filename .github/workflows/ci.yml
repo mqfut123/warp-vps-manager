@@ -54,6 +54,7 @@ jobs:
 
           RULES_DIR="$REPO_ROOT/rules"
           WARP_SCOPE=global
+          WG_IFACE="$DEFAULT_WG_IFACE"
           REDSOCKS_UID=65534
           REDSOCKS_PORT=23456
           NFT_CONF="$RUNNER_TEMP/warp-vps-socks-global.nft"
