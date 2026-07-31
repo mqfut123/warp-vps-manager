@@ -63,11 +63,11 @@ Socks5 会让支持回落的客户端从 QUIC 改用经 WARP 转发的 TCP；其
 
 | 命令 | 用途 |
 |---|---|
-| `warp-vps status` | 查看服务、接口、端口和分流规则 |
+| `warp-vps status` | 查看配置、服务、接口、端口和分流服务运行态 |
 | `warp-vps test` | 运行分流与外部连通性诊断 |
 | `warp-vps unlock-check` | 检测 Gemini 和 YouTube Premium |
 | `warp-vps restart` | 重启 WARP 分流链路 |
-| `warp-vps update` | 更新程序与 Google IP 规则 |
+| `warp-vps update` | 更新程序与 Google IP 规则；旧版规则差异不会阻止更新 |
 | `warp-vps reinstall --scope global` | 保持运行模式并切换到全局 WARP |
 | `warp-vps reinstall --scope google` | 保持运行模式并切回 Google 精准分流 |
 | `warp-vps switch wireguard` | 切换到 WireGuard |

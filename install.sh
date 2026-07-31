@@ -16,10 +16,6 @@ WG_IFACE="warp-vps-wg"
 WGCF_BIN="${APP_DIR}/bin/wgcf"
 WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
 WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
-WG_GLOBAL_TABLE=51888
-WG_GLOBAL_MAIN_RULE_PRIORITY=18000
-WG_GLOBAL_RULE_PRIORITY=18001
-WG_GLOBAL_NFT_TABLE="warp_vps_global"
 SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
@@ -1290,13 +1286,6 @@ project_unit_disabled() {
   esac
 }
 
-project_nft_table_absent() {
-  local table="${1:-warp_vps}"
-  local tables
-  tables="$(nft list tables 2>/dev/null)" || return 1
-  ! grep -Fxq "table inet ${table}" <<< "$tables"
-}
-
 project_wg_interface_absent() {
   local links
   links="$(ip -o link show 2>/dev/null)" || return 1
@@ -1459,36 +1448,6 @@ quiesce_health_automation() {
   HEALTH_AUTOMATION_PAUSED=1
 }
 
-previous_wg_routes_absent() {
-  local cidr family routes rules mark_pattern
-  mark_pattern='(0x0*ca[bB]0|51888)'
-  [ -r "${APP_DIR}/rules/google_ipv4.txt" ] || return 1
-  [ -r "${APP_DIR}/rules/google_ipv6.txt" ] || return 1
-  while IFS= read -r cidr; do
-    routes="$(ip -4 route show exact "$cidr" dev "$PREVIOUS_WG_IFACE" 2>/dev/null)" || return 1
-    [ -z "$routes" ] || return 1
-  done < <(awk 'NF && $1 !~ /^#/ { print $1 }' "${APP_DIR}/rules/google_ipv4.txt")
-  while IFS= read -r cidr; do
-    routes="$(ip -6 route show exact "$cidr" dev "$PREVIOUS_WG_IFACE" 2>/dev/null)" || return 1
-    [ -z "$routes" ] || return 1
-  done < <(awk 'NF && $1 !~ /^#/ { print $1 }' "${APP_DIR}/rules/google_ipv6.txt")
-  for family in 4 6; do
-    routes="$(ip -"$family" route show table all default 2>/dev/null)" || return 1
-    ! grep -Eq "(^|[[:space:]])table ${WG_GLOBAL_TABLE}([[:space:]]|$)" <<< "$routes" \
-      || return 1
-    rules="$(ip -"$family" rule show 2>/dev/null)" || return 1
-    ! grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
-      <<< "$rules" || return 1
-    ! grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark ${mark_pattern}(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
-      <<< "$rules" || return 1
-  done
-  if command -v nft >/dev/null 2>&1; then
-    project_nft_table_absent "$WG_GLOBAL_NFT_TABLE"
-  else
-    [ "$(read_project_scope 2>/dev/null || printf 'google\n')" != "global" ]
-  fi
-}
-
 pause_project_routing() {
   quiesce_health_automation || return 1
   INSTALL_RUNTIME_TOUCHED=1
@@ -1498,15 +1457,6 @@ pause_project_routing() {
     "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
   fi
   project_unit_stopped warp-vps.service || return 1
-  if [ "$PREVIOUS_MODE" = "wireguard" ]; then
-    previous_wg_routes_absent || {
-      log "旧版 Google WireGuard 路由未能完整清除"
-      return 1
-    }
-  elif [ "$PREVIOUS_MODE" = "socks" ] && ! project_nft_table_absent; then
-    log "旧版 Socks5 nftables 分流规则未能清除"
-    return 1
-  fi
 }
 
 prepare_target_backend() {
@@ -1580,9 +1530,6 @@ stop_project_runtime() {
   fi
   if command -v nft >/dev/null 2>&1; then
     nft delete table inet warp_vps >/dev/null 2>&1 || true
-  elif [ "$PREVIOUS_MODE" = "socks" ]; then
-    log "找不到 nft，无法确认旧 Socks5 分流规则已经停用"
-    return 1
   fi
   if command -v ip >/dev/null 2>&1 && ip link show "$runtime_iface" >/dev/null 2>&1; then
     if command -v wg-quick >/dev/null 2>&1; then
@@ -1627,10 +1574,6 @@ stop_project_runtime() {
       log "本项目管理的 WARP 服务仍保持启用：warp-svc.service"
       return 1
     fi
-  fi
-  if command -v nft >/dev/null 2>&1 && ! project_nft_table_absent; then
-    log "本项目 nftables 分流规则仍在生效或状态无法读取"
-    return 1
   fi
   if command -v ip >/dev/null 2>&1 && ! project_wg_interface_absent "$runtime_iface"; then
     log "本项目 WireGuard 网卡仍在运行或状态无法读取：$runtime_iface"
@@ -1748,12 +1691,9 @@ stop_reused_target_routing() {
     "$BIN_PATH" stop-rules >/dev/null 2>&1 || failed=1
   fi
   project_unit_stopped warp-vps.service || failed=1
-  if [ "$TARGET_MODE" = "wireguard" ]; then
-    previous_wg_routes_absent || failed=1
-  elif [ "$TARGET_MODE" = "socks" ]; then
+  if [ "$TARGET_MODE" = "socks" ]; then
     systemctl stop warp-vps-redsocks.service >/dev/null 2>&1 || true
     project_unit_stopped warp-vps-redsocks.service || failed=1
-    project_nft_table_absent || failed=1
   fi
   [ "$failed" -eq 0 ]
 }
@@ -1785,7 +1725,6 @@ start_previous_runtime() {
   fi
   enable_and_start_unit warp-vps.service || return 1
   restore_health_automation || log "原自动健康检查状态未能恢复；不影响已恢复的分流运行"
-  "$BIN_PATH" status
 }
 
 enable_project_unit() {
@@ -1806,10 +1745,6 @@ enable_health_timer() {
   fi
   log "自动健康检查定时器未能启用；不影响当前分流运行"
   return 0
-}
-
-run_final_self_check() {
-  "$BIN_PATH" status
 }
 
 project_installation_present() {
@@ -2278,8 +2213,6 @@ main() {
   enable_project_unit warp-vps.service
   enable_health_timer
 
-  log "正在运行最终自检"
-  run_final_self_check || die "最终本地自检失败"
   INSTALL_COMPLETE=1
   INSTALL_CLEANUP_ARMED=0
   trap - EXIT

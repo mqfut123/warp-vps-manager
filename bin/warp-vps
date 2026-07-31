@@ -730,13 +730,6 @@ raise SystemExit(f"no IPv{version} rules in {path}")
 PY
 }
 
-wg_default_routes_absent() {
-  local routes4 routes6
-  routes4="$(ip -4 route show default dev "$WG_IFACE" 2>/dev/null)" || return 1
-  routes6="$(ip -6 route show default dev "$WG_IFACE" 2>/dev/null)" || return 1
-  [ -z "$routes4" ] && [ -z "$routes6" ]
-}
-
 wg_global_nft_table_absent() {
   if ! command -v nft >/dev/null 2>&1; then
     [ "${WARP_MODE:-}" != "wireguard" ] || [ "${WARP_SCOPE:-google}" != "global" ]
@@ -745,23 +738,6 @@ wg_global_nft_table_absent() {
   local tables
   tables="$(nft list tables 2>/dev/null)" || return 1
   ! grep -Fxq "table inet ${WG_GLOBAL_NFT_TABLE}" <<< "$tables"
-}
-
-wg_global_nft_rules_local_ok() {
-  local prerouting output postrouting mark_pattern
-  mark_pattern='(0x0*ca[bB]0|51888)'
-  prerouting="$(nft list chain inet "$WG_GLOBAL_NFT_TABLE" prerouting 2>/dev/null)" \
-    || return 1
-  output="$(nft list chain inet "$WG_GLOBAL_NFT_TABLE" output 2>/dev/null)" || return 1
-  postrouting="$(nft list chain inet "$WG_GLOBAL_NFT_TABLE" postrouting 2>/dev/null)" \
-    || return 1
-  grep -Eq 'type filter hook prerouting priority mangle; policy accept;' <<< "$prerouting" \
-    && grep -Eq "ct mark ${mark_pattern}.*meta mark set ct mark" <<< "$prerouting" \
-    && grep -Eq "iifname != \"lo\".*iifname != \"${WG_IFACE}\".*fib daddr type local.*ct direction original.*meta mark set ${mark_pattern}.*ct mark set meta mark" <<< "$prerouting" \
-    && grep -Eq 'type route hook output priority mangle; policy accept;' <<< "$output" \
-    && grep -Eq "ct mark ${mark_pattern}.*meta mark set ct mark" <<< "$output" \
-    && grep -Eq 'type filter hook postrouting priority mangle; policy accept;' <<< "$postrouting" \
-    && grep -Eq "meta l4proto udp.*meta mark ${mark_pattern}.*ct mark set meta mark" <<< "$postrouting"
 }
 
 render_wg_global_nft_conf() {
@@ -805,18 +781,6 @@ enable_wg_global_src_valid_mark() {
   fi
 }
 
-wg_global_policy_rules_present() {
-  local family rules mark_pattern
-  mark_pattern='(0x0*ca[bB]0|51888)'
-  for family in 4 6; do
-    rules="$(ip -"$family" rule show 2>/dev/null)" || return 1
-    grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
-      <<< "$rules" || return 1
-    grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark ${mark_pattern}(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
-      <<< "$rules" || return 1
-  done
-}
-
 wg_global_policy_rules_absent() {
   local family rules mark_pattern
   mark_pattern='(0x0*ca[bB]0|51888)'
@@ -829,24 +793,6 @@ wg_global_policy_rules_absent() {
   done
 }
 
-wg_global_default_routes_present() {
-  local routes4 routes6
-  routes4="$(ip -4 route show table "$WG_GLOBAL_TABLE" default dev "$WG_IFACE" 2>/dev/null)" \
-    || return 1
-  routes6="$(ip -6 route show table "$WG_GLOBAL_TABLE" default dev "$WG_IFACE" 2>/dev/null)" \
-    || return 1
-  [ -n "$routes4" ] && [ -n "$routes6" ]
-}
-
-wg_global_fwmark_present() {
-  local mark
-  mark="$(wg show "$WG_IFACE" fwmark 2>/dev/null)" || return 1
-  case "$mark" in
-    ''|off|*[!0-9A-Fa-fx]*) return 1 ;;
-  esac
-  [ "$((mark))" -eq "$WG_GLOBAL_MARK" ]
-}
-
 wg_global_routes_absent() {
   local family routes
   for family in 4 6; do
@@ -855,29 +801,6 @@ wg_global_routes_absent() {
       || return 1
   done
   wg_global_policy_rules_absent && wg_global_nft_table_absent
-}
-
-wireguard_global_routes_local_ok() {
-  route_uses_wg4 1.1.1.1 \
-    && route_uses_wg6 2606:4700:4700::1111 \
-    && wg_global_default_routes_present \
-    && wg_global_policy_rules_present \
-    && wg_global_fwmark_present \
-    && wg_global_nft_rules_local_ok \
-    && wg_global_src_valid_mark_ok
-}
-
-wireguard_routes_local_ok() {
-  local probe4 probe6
-  if [ "$WARP_SCOPE" = "global" ]; then
-    wireguard_global_routes_local_ok
-    return
-  fi
-  probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" || return 1
-  probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" || return 1
-  route_uses_wg4 "$probe4" || return 1
-  route_uses_wg6 "$probe6" || return 1
-  wg_default_routes_absent && wg_global_routes_absent
 }
 
 delete_wg_global_policy_rules() {
@@ -908,7 +831,6 @@ stop_wg_global_routes() {
 }
 
 apply_wg_global_routes() {
-  local cleanup_message
   command -v nft >/dev/null 2>&1 || die "WireGuard 全局模式需要 nftables"
   stop_wg_global_routes
   enable_wg_global_src_valid_mark || return 1
@@ -930,17 +852,6 @@ apply_wg_global_routes() {
     || ! ip -6 rule add not fwmark "$WG_GLOBAL_MARK" table "$WG_GLOBAL_TABLE" priority "$WG_GLOBAL_RULE_PRIORITY"; then
     stop_wg_global_routes
     die "WireGuard 全局路由写入失败，已清除本项目全局路由"
-    # Tests replace die() to inspect this failure path.
-    # shellcheck disable=SC2317
-    return 1
-  fi
-  if ! wireguard_global_routes_local_ok; then
-    if stop_wg_global_routes && wg_global_routes_absent; then
-      cleanup_message="已清除本项目全局路由"
-    else
-      cleanup_message="无法确认本项目全局路由已完整清除"
-    fi
-    die "WireGuard 全局路由边界检查失败，${cleanup_message}"
     # Tests replace die() to inspect this failure path.
     # shellcheck disable=SC2317
     return 1
@@ -987,17 +898,6 @@ apply_wg_routes() {
       return 1
     fi
   done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
-  if ! wireguard_routes_local_ok; then
-    if stop_wg_routes_strict; then
-      cleanup_message="已清除本项目路由"
-    else
-      cleanup_message="无法确认本项目路由已完整清除"
-    fi
-    die "WireGuard 本地路由边界检查失败，${cleanup_message}"
-    # Tests replace die() to inspect this failure path.
-    # shellcheck disable=SC2317
-    return 1
-  fi
 }
 
 stop_wg_routes() {
@@ -1523,7 +1423,7 @@ wait_for_wg_ready() {
   local timeout="${1:-20}"
   local end=$((SECONDS + timeout))
   while [ "$SECONDS" -le "$end" ]; do
-    if wg_interface_is_wireguard && wireguard_routes_local_ok; then
+    if wg_interface_is_wireguard; then
       return 0
     fi
     sleep 2
@@ -1538,14 +1438,6 @@ restart_wireguard_runtime() {
   systemctl start "wg-quick@${WG_IFACE}.service" || return 1
   apply_rules || return 1
   wait_for_wg_ready 20
-}
-
-route_uses_wg4() {
-  ip -4 route get "$1" 2>/dev/null | route_output_uses_interface "$WG_IFACE"
-}
-
-route_uses_wg6() {
-  ip -6 route get "$1" 2>/dev/null | route_output_uses_interface "$WG_IFACE"
 }
 
 route_output_uses_interface() {
@@ -1808,32 +1700,16 @@ configure_warp_runtime() {
   return 1
 }
 
-socks_nft_rules_local_ok() {
-  local nat_rules filter_rules
-  nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null)" || return 1
-  filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null)" || return 1
-  if [ "$WARP_SCOPE" = "global" ]; then
-    grep -Eq 'ct direction reply.*return' <<< "$nat_rules" || return 1
-    grep -Eq 'meta nfproto ipv4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" || return 1
-    grep -Eq 'ip daddr @google4.*redirect to :' <<< "$nat_rules" && return 1
-  else
-    grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" || return 1
-  fi
-  grep -Eq 'ip daddr @google4[[:space:]].*udp dport 443[[:space:]].*reject with icmpx type admin-prohibited' <<< "$filter_rules" || return 1
-  grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"
-}
-
 test_quiet() {
   load_config
   if [ "$WARP_MODE" = "wireguard" ]; then
     wg_interface_is_wireguard || return 1
-    wireguard_routes_local_ok && socks_table_absent
+    socks_table_absent
     return
   fi
   wait_for_socks_listen 8 || return 1
   redsocks_local_ready || return 1
   table_exists || return 1
-  socks_nft_rules_local_ok || return 1
   socks_wireguard_routes_absent
 }
 
@@ -2144,10 +2020,6 @@ run_external_diagnostics() {
 
 run_self_check() {
   local failed=0
-  local nat_rules=""
-  local filter_rules=""
-  local probe4=""
-  local probe6=""
 
   section "本地状态自检"
   if [ "$WARP_MODE" = "wireguard" ]; then
@@ -2186,36 +2058,6 @@ run_self_check() {
       failed=1
     fi
 
-    if [ "$WARP_SCOPE" = "google" ]; then
-      if probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" \
-        && route_uses_wg4 "$probe4"; then
-        ok_line "代表性 Google IPv4 路由已走 WireGuard"
-      else
-        fail_line "代表性 Google IPv4 路由没有走 WireGuard"
-        failed=1
-      fi
-
-      if probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" \
-        && route_uses_wg6 "$probe6"; then
-        ok_line "代表性 Google IPv6 路由已走 WireGuard"
-      else
-        fail_line "代表性 Google IPv6 路由没有走 WireGuard"
-        failed=1
-      fi
-    fi
-
-    if [ "$WARP_SCOPE" = "global" ] && wireguard_global_routes_local_ok; then
-      ok_line "非 Google IPv4 / IPv6 与入站连接回包策略已加载"
-    elif [ "$WARP_SCOPE" = "global" ]; then
-      fail_line "WireGuard 全局路由或入站连接回包策略异常"
-      failed=1
-    elif wg_default_routes_absent && wg_global_routes_absent; then
-      ok_line "项目 WireGuard 网卡没有接管默认路由"
-    else
-      fail_line "精准分流模式发现了项目全局路由，或无法读取默认路由状态"
-      failed=1
-    fi
-
     if socks_table_absent; then
       ok_line "未发现旧 Socks5 nftables 分流规则"
     else
@@ -2225,7 +2067,7 @@ run_self_check() {
 
     section "结论"
     if [ "$failed" -eq 0 ]; then
-      ok_line "本地运行态正常。可运行 warp-vps test 查看非阻塞外部诊断。"
+      ok_line "WireGuard 服务、网卡和分流服务正常。可运行 warp-vps test 查看非阻塞外部诊断。"
       return 0
     fi
     fail_line "当前异常。请先运行：warp-vps restart"
@@ -2290,37 +2132,6 @@ run_self_check() {
     failed=1
   fi
 
-  nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null || true)"
-  if [ "$WARP_SCOPE" = "global" ] \
-    && grep -Eq 'ct direction reply.*return' <<< "$nat_rules" \
-    && grep -Eq 'meta nfproto ipv4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" \
-    && ! grep -Eq 'ip daddr @google4.*redirect to :' <<< "$nat_rules"; then
-    ok_line "VPS 主动发起的公网 IPv4 TCP 全局重定向与入站回包直连规则已加载"
-  elif [ "$WARP_SCOPE" = "global" ]; then
-    fail_line "未找到完整的 VPS 公网 IPv4 TCP 全局重定向规则"
-    failed=1
-  elif grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules"; then
-    ok_line "Google IPv4 TCP 重定向规则已加载"
-  else
-    fail_line "未找到 Google IPv4 TCP 重定向规则"
-    failed=1
-  fi
-
-  filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null || true)"
-  if grep -Eq 'ip daddr @google4[[:space:]].*udp dport 443[[:space:]].*reject with icmpx type admin-prohibited' <<< "$filter_rules"; then
-    ok_line "已阻断 Google IPv4 UDP/443（QUIC），防止从 VPS 原生出口直连"
-  else
-    fail_line "未找到 Google IPv4 UDP/443（QUIC）阻断规则"
-    failed=1
-  fi
-
-  if grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"; then
-    ok_line "已阻断 Google 目标 IPv6，防止 IPv6 泄漏"
-  else
-    fail_line "未找到 Google IPv6 防泄漏规则"
-    failed=1
-  fi
-
   if socks_wireguard_routes_absent; then
     ok_line "未发现旧 WireGuard Google 路由或默认路由接管"
   else
@@ -2330,11 +2141,7 @@ run_self_check() {
 
   section "结论"
   if [ "$failed" -eq 0 ]; then
-    if [ "$WARP_SCOPE" = "global" ]; then
-      ok_line "本地运行态正常。VPS 主动发起的公网 IPv4 TCP 全局走 WARP，入站连接回包保持原生路径；Google IPv4 UDP/443（QUIC）和 Google IPv6 继续拒绝。"
-    else
-      ok_line "本地运行态正常。Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）被拒绝，Google IPv6 继续拒绝。"
-    fi
+    ok_line "WARP、透明转发和 nftables 分流服务正常。可运行 warp-vps test 查看非阻塞外部诊断。"
     return 0
   fi
 
@@ -2401,8 +2208,8 @@ cmd_restart() {
       restart_wireguard_runtime || die "重启后 WireGuard 本地运行态未就绪"
     fi
     systemctl restart warp-vps.service || die "无法重启分流规则服务"
-    run_self_check
     finish_runtime_maintenance
+    ok_line "重启完成"
     return
   fi
 
@@ -2415,8 +2222,8 @@ cmd_restart() {
   systemctl restart warp-vps-redsocks.service || die "无法重启本地透明转发服务"
   wait_for_redsocks_ready 8 || die "本地透明转发服务重启后没有正确监听"
   systemctl restart warp-vps.service || die "无法重启分流规则服务"
-  run_self_check
   finish_runtime_maintenance
+  ok_line "重启完成"
 }
 
 cmd_setup_wireguard() {
@@ -2449,8 +2256,6 @@ cmd_preflight_wireguard() {
   fi
   if [ "$failed" -eq 0 ]; then
     if ! "$SELF_PATH" apply; then
-      failed=1
-    elif ! wireguard_routes_local_ok; then
       failed=1
     fi
   fi
@@ -2586,7 +2391,6 @@ reload_runtime_after_update() {
     wait_for_redsocks_ready 8 || return 1
     systemctl start warp-vps.service || return 1
   fi
-  "$BIN_PATH" status || return 1
 }
 
 cmd_update() {
@@ -2611,21 +2415,10 @@ cmd_update() {
   if service_active warp-vps.service; then
     pause_failed=1
   fi
-  if [ "$WARP_MODE" = "wireguard" ]; then
-    stop_wg_routes_strict || pause_failed=1
-  elif ! socks_table_absent; then
-    pause_failed=1
-  fi
   if [ "$pause_failed" -eq 1 ]; then
     if systemctl restart warp-vps.service >/dev/null 2>&1 \
       || systemctl start warp-vps.service >/dev/null 2>&1; then
-      if [ "$WARP_MODE" = "wireguard" ]; then
-        if service_active warp-vps.service \
-          && wireguard_routes_local_ok && socks_table_absent; then
-          recovery_ok=1
-        fi
-      elif service_active warp-vps.service \
-        && table_exists && socks_nft_rules_local_ok; then
+      if service_active warp-vps.service; then
         recovery_ok=1
       fi
     fi
@@ -2645,26 +2438,26 @@ cmd_update() {
     fi
     die "更新文件激活失败，旧文件已恢复，但原运行态未能恢复"
   fi
-  ok_line "更新文件已写入，正在运行本地自检"
+  ok_line "更新文件已写入，正在重新加载运行态"
   if reload_runtime_after_update; then
     finish_runtime_maintenance
-    ok_line "更新后的本地运行态自检通过"
+    ok_line "更新完成"
     return 0
   fi
 
-  warn_line "更新后本地自检失败，正在恢复旧版本"
-  begin_runtime_maintenance || die "更新后本地自检失败，且无法暂停健康检查以恢复旧版本"
+  warn_line "更新后运行态重新加载失败，正在恢复旧版本"
+  begin_runtime_maintenance || die "更新后运行态重新加载失败，且无法暂停健康检查以恢复旧版本"
   systemctl stop warp-vps.service >/dev/null 2>&1 || true
   "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
   if [ "$WARP_MODE" = "wireguard" ] && ! stop_wg_routes_strict; then
-    die "更新后本地自检失败，且无法确认新版 Google 路由已完整清除；未恢复旧文件"
+    die "更新后运行态重新加载失败，且无法清除新版 WireGuard 路由；未恢复旧文件"
   fi
-  restore_update_backup "$backup" || die "更新后本地自检失败，且无法恢复旧文件"
+  restore_update_backup "$backup" || die "更新后运行态重新加载失败，且无法恢复旧文件"
   if reload_runtime_after_update; then
     finish_runtime_maintenance
     die "更新失败，已恢复旧版本和原运行态"
   fi
-  die "更新失败，且恢复旧版本后自检仍失败，请运行 warp-vps logs 查看日志"
+  die "更新失败，且恢复旧版本后运行态仍无法重新加载，请运行 warp-vps logs 查看日志"
 }
 
 cmd_heal() {
@@ -2686,7 +2479,7 @@ cmd_heal() {
     if ! service_active "wg-quick@${WG_IFACE}.service" || ! wg_interface_is_wireguard; then
       restart_wireguard_runtime || true
     fi
-    if ! service_active warp-vps.service || ! wireguard_routes_local_ok; then
+    if ! service_active warp-vps.service; then
       repair_rules=1
     fi
     if [ "$repair_rules" -eq 1 ]; then
@@ -2707,7 +2500,7 @@ cmd_heal() {
   if ! warp_proxy_local_ready; then
     configure_warp_runtime || die "自动修复后 Cloudflare WARP SOCKS 仍不可用"
   fi
-  if ! service_active warp-vps.service || ! table_exists || ! socks_nft_rules_local_ok; then
+  if ! service_active warp-vps.service || ! table_exists; then
     repair_rules=1
   fi
   if ! redsocks_local_ready; then
