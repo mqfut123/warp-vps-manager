@@ -579,9 +579,9 @@ rpm_install_redsocks() {
 
 refresh_cloudflare_rpm_repo() {
   local key_file key_tmp repo_file repo_tmp
+  repo_file="${1:-/etc/yum.repos.d/cloudflare-warp.repo}"
   key_file="${STATE_DIR}/cloudflare-warp-pubkey.gpg"
   key_tmp="${key_file}.new"
-  repo_file=/etc/yum.repos.d/cloudflare-warp.repo
   repo_tmp="${repo_file}.new"
   install -d -m 0755 "$STATE_DIR" /etc/yum.repos.d
   curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
@@ -599,16 +599,39 @@ refresh_cloudflare_rpm_repo() {
   mv "$repo_tmp" "$repo_file" || die "无法启用 Cloudflare WARP RPM 软件源"
 }
 
+prepare_existing_cloudflare_rpm_repo() {
+  local manager="$1"
+  local repo_file="${2:-/etc/yum.repos.d/cloudflare-warp.repo}"
+  local disabled_file="${repo_file}.warp-vps-disabled.$$"
+  [ -e "$repo_file" ] || return 1
+  if command -v curl >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then
+    refresh_cloudflare_rpm_repo "$repo_file"
+    return 0
+  fi
+
+  mv "$repo_file" "$disabled_file" \
+    || die "无法临时停用旧 Cloudflare WARP RPM 软件源"
+  if ! "$manager" install -y curl ca-certificates rpm; then
+    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
+    die "无法安装刷新 Cloudflare WARP RPM 软件源所需的基础工具"
+  fi
+  if ! command -v curl >/dev/null 2>&1 || ! command -v rpm >/dev/null 2>&1; then
+    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
+    die "刷新 Cloudflare WARP RPM 软件源所需的基础工具安装不完整"
+  fi
+  mv "$disabled_file" "$repo_file" \
+    || die "无法恢复 Cloudflare WARP RPM 软件源"
+  refresh_cloudflare_rpm_repo "$repo_file"
+}
+
 pkg_install_rpm() {
   local mode="$1"
   local manager="$2"
   local scope="${3:-google}"
   local repo_file="${4:-/etc/yum.repos.d/cloudflare-warp.repo}"
   local cloudflare_repo_ready=0 cloudflare_metadata_ready=0
-  if [ -e "$repo_file" ] \
-    && command -v curl >/dev/null 2>&1 \
-    && command -v rpm >/dev/null 2>&1; then
-    refresh_cloudflare_rpm_repo
+  if [ -e "$repo_file" ]; then
+    prepare_existing_cloudflare_rpm_repo "$manager" "$repo_file"
     cloudflare_repo_ready=1
     "$manager" clean metadata || die "无法刷新 RPM 软件源元数据"
     cloudflare_metadata_ready=1
@@ -633,7 +656,7 @@ pkg_install_rpm() {
   if [ "$OS_ID" != "fedora" ]; then
     enable_rhel_extra_repos
   fi
-  "$manager" install -y curl ca-certificates coreutils nftables iproute python3
+  "$manager" install -y curl ca-certificates coreutils nftables iproute python3 rpm
   rpm_install_redsocks "$manager"
   if ! warp_client_complete; then
     if [ "$cloudflare_repo_ready" -eq 0 ]; then

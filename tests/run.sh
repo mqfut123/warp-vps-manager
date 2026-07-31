@@ -1597,6 +1597,53 @@ test_rpm_wireguard_dependencies_are_minimal() {
   unset -f command
 }
 
+test_rpm_existing_repo_bootstraps_refresh_tools_before_wireguard() {
+  source_without_main "$INSTALL_SCRIPT"
+
+  local root repo package_calls='' tools_ready=0 repo_enabled_during_bootstrap=0
+  local bootstrap_line refresh_line clean_line install_line
+  root="$(mktemp -d)"
+  repo="$root/cloudflare-warp.repo"
+  printf 'stale cloudflare repo\n' > "$repo"
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl|rpm) [ "$tools_ready" -eq 1 ] ;;
+      *) builtin command "$@" ;;
+    esac
+  }
+  dnf() {
+    if [ "$1" = install ] && [ "$tools_ready" -eq 0 ]; then
+      [ ! -e "$repo" ] || repo_enabled_during_bootstrap=1
+      tools_ready=1
+    fi
+    package_calls="${package_calls}$*"$'\n'
+    return 0
+  }
+  refresh_cloudflare_rpm_repo() {
+    package_calls="${package_calls}refresh-cloudflare"$'\n'
+  }
+
+  pkg_install_rpm wireguard dnf google "$repo"
+  assert_eq '0' "$repo_enabled_during_bootstrap" \
+    'the stale Cloudflare RPM repo must be disabled while refresh tools are installed' || return 1
+  [ -e "$repo" ] || {
+    fail 'the existing Cloudflare RPM repo must be restored before refresh'
+    return 1
+  }
+  bootstrap_line="$(line_number "$package_calls" 'install -y curl ca-certificates rpm')"
+  refresh_line="$(line_number "$package_calls" 'refresh-cloudflare')"
+  clean_line="$(line_number "$package_calls" 'clean metadata')"
+  install_line="$(line_number "$package_calls" 'wireguard-tools')"
+  if [ -z "$bootstrap_line" ] || [ -z "$refresh_line" ] || [ -z "$clean_line" ] \
+    || [ -z "$install_line" ] || [ "$bootstrap_line" -ge "$refresh_line" ] \
+    || [ "$refresh_line" -ge "$clean_line" ] || [ "$clean_line" -ge "$install_line" ]; then
+    fail 'missing RPM refresh tools must bootstrap with the stale repo disabled before WireGuard dependencies'
+    return 1
+  fi
+  unset -f command
+}
+
 test_socks_dependencies_are_mode_specific() {
   source_without_main "$INSTALL_SCRIPT"
 
@@ -7208,6 +7255,7 @@ run_test 'Ubuntu derivatives prefer UBUNTU_CODENAME' test_ubuntu_codename_takes_
 run_test 'apt WireGuard dependencies are mode specific' test_apt_wireguard_dependencies_are_minimal
 run_test 'existing Cloudflare APT source refreshes before updates' test_existing_cloudflare_apt_repo_refreshes_before_updates
 run_test 'RPM WireGuard dependencies are mode specific' test_rpm_wireguard_dependencies_are_minimal
+run_test 'RPM existing repo bootstraps refresh tools before WireGuard dependencies' test_rpm_existing_repo_bootstraps_refresh_tools_before_wireguard
 run_test 'Socks dependencies are mode specific' test_socks_dependencies_are_mode_specific
 run_test 'complete mode dependencies skip package-manager access' test_complete_mode_dependencies_skip_package_manager
 run_test 'incomplete dependencies use the current package candidate' test_incomplete_dependencies_use_current_package_candidate
