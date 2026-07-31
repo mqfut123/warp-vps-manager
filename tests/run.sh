@@ -283,14 +283,41 @@ test_existing_config_validation_precedes_runtime_mutation() {
   }
 
   printf 'UNKNOWN_FIELD=1\n' >> "$CONFIG_FILE"
+  validate_existing_config || {
+    fail 'a harmless legacy field must not block migration to the canonical config'
+    return 1
+  }
+
+  sed -i.bak 's/^WG_IFACE=warp-vps-wg$/WG_IFACE=invalid interface/' "$CONFIG_FILE"
   rc=0
   output="$(validate_existing_config 2>&1)" || rc=$?
   [ "$rc" -ne 0 ] || {
-    fail 'a structurally damaged existing config must reject activation'
+    fail 'an invalid active WireGuard interface identity must reject migration'
     return 1
   }
-  assert_contains "$output" '现有配置损坏，未修改当前运行态' \
-    'full existing config validation should fail before backup or runtime teardown'
+  assert_contains "$output" '现有 WireGuard' \
+    'an unsafe WireGuard runtime identity should be reported before mutation'
+}
+
+test_wireguard_config_does_not_require_socks_fields() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root
+  root="$(mktemp -d)"
+  CONFIG_FILE="$root/config.env"
+  cat > "$CONFIG_FILE" <<'EOF'
+WARP_MODE=wireguard
+WARP_SCOPE=google
+WG_IFACE=warp-vps-wg
+WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+EOF
+
+  load_config || {
+    fail 'a WireGuard config should not require unused redsocks identity fields'
+    return 1
+  }
+  assert_eq 'wireguard' "$WARP_MODE" 'the minimal WireGuard config must retain its mode' || return 1
+  assert_eq 'root' "$REDSOCKS_USER" \
+    'unused redsocks identity should receive an internal default in WireGuard mode'
 }
 
 test_warp_port_reprompts() {
@@ -1460,6 +1487,62 @@ test_apt_wireguard_dependencies_are_minimal() {
   assert_not_contains "$package_calls" 'cloudflare-warp' 'WireGuard mode must not install cloudflare-warp'
 }
 
+test_existing_cloudflare_apt_repo_refreshes_before_updates() {
+  source_without_main "$INSTALL_SCRIPT"
+  local root repo events='' mode
+  root="$(mktemp -d)"
+  repo="$root/cloudflare-client.list"
+  printf 'stale cloudflare source\n' > "$repo"
+  OS_CODENAME=noble
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|gpg) return 0 ;; *) builtin command "$@" ;; esac
+  }
+  refresh_cloudflare_apt_repo() { events="${events}refresh-cloudflare"$'\n'; }
+  apt_get() { events="${events}apt:$*"$'\n'; }
+  warp_client_complete() { return 0; }
+  redsocks_path() { return 1; }
+  disable_new_packaged_redsocks_service() { :; }
+  log() { :; }
+
+  for mode in wireguard socks; do
+    events=''
+    pkg_install_apt "$mode" google "$repo" || {
+      fail "an existing Cloudflare source should be refreshed before $mode dependencies"
+      return 1
+    }
+    assert_eq 'refresh-cloudflare' "$(head -n 1 <<< "$events")" \
+      "an existing Cloudflare source must be refreshed before the first $mode apt update" || return 1
+  done
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|gpg) return 1 ;; *) builtin command "$@" ;; esac
+  }
+  events=''
+  refresh_cloudflare_apt_repo() {
+    events="${events}refresh-cloudflare"$'\n'
+    printf 'fresh cloudflare source\n' > "$repo"
+  }
+  apt_get() {
+    if [ "$1" = update ] && [ -e "$repo" ]; then
+      fail 'the stale Cloudflare source remained enabled while installing refresh prerequisites'
+      return 1
+    fi
+    events="${events}apt:$*"$'\n'
+  }
+  prepare_existing_cloudflare_apt_repo "$repo" || {
+    fail 'a stale Cloudflare source should be repairable when curl and gpg are missing'
+    return 1
+  }
+  assert_eq $'apt:update -y\napt:install -y curl ca-certificates gnupg\nrefresh-cloudflare' \
+    "${events%$'\n'}" \
+    'refresh prerequisites must install with the stale source disabled before repo refresh' || return 1
+  assert_eq 'fresh cloudflare source' "$(< "$repo")" \
+    'the repaired Cloudflare source must replace the temporarily disabled stale source'
+}
+
 test_rpm_wireguard_dependencies_are_minimal() {
   source_without_main "$INSTALL_SCRIPT"
   declare -F pkg_install_rpm >/dev/null || {
@@ -1467,13 +1550,13 @@ test_rpm_wireguard_dependencies_are_minimal() {
     return 1
   }
 
-  local package_calls=''
+  local package_calls='' root repo refresh_line clean_line install_line
   dnf() {
-    package_calls="${package_calls}$*\n"
+    package_calls="${package_calls}$*"$'\n'
     return 0
   }
   yum() {
-    package_calls="${package_calls}$*\n"
+    package_calls="${package_calls}$*"$'\n'
     return 0
   }
   local extra_repo_calls=0
@@ -1492,6 +1575,26 @@ test_rpm_wireguard_dependencies_are_minimal() {
   assert_not_contains "$package_calls" 'cloudflare-warp' 'WireGuard mode must not install cloudflare-warp' || return 1
   assert_eq '0' "$extra_repo_calls" \
     'WireGuard mode must not enable EPEL, CRB or PowerTools repositories'
+
+  root="$(mktemp -d)"
+  repo="$root/cloudflare-warp.repo"
+  printf 'stale cloudflare repo\n' > "$repo"
+  package_calls=''
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|rpm) return 0 ;; *) builtin command "$@" ;; esac
+  }
+  refresh_cloudflare_rpm_repo() { package_calls="${package_calls}refresh-cloudflare"$'\n'; }
+  pkg_install_rpm wireguard dnf google "$repo"
+  refresh_line="$(line_number "$package_calls" 'refresh-cloudflare')"
+  clean_line="$(line_number "$package_calls" 'clean metadata')"
+  install_line="$(line_number "$package_calls" 'wireguard-tools')"
+  if [ -z "$refresh_line" ] || [ -z "$clean_line" ] || [ -z "$install_line" ] \
+    || [ "$refresh_line" -ge "$clean_line" ] || [ "$clean_line" -ge "$install_line" ]; then
+    fail 'an existing Cloudflare RPM repo must refresh before a WireGuard dependency transaction'
+    return 1
+  fi
+  unset -f command
 }
 
 test_socks_dependencies_are_mode_specific() {
@@ -1558,6 +1661,70 @@ test_complete_mode_dependencies_skip_package_manager() {
   assert_eq '0' "$package_calls" 'complete dependencies should skip package installation'
 }
 
+test_incomplete_dependencies_use_current_package_candidate() {
+  source_without_main "$INSTALL_SCRIPT"
+  local manager_calls='' rpm_installed=1 warp_ready=0 clean_line candidate_line
+  OS_ID=fedora
+  STATE_DIR=/unused/state
+
+  enable_rhel_extra_repos() { :; }
+  rpm_install_redsocks() { :; }
+  warp_client_complete() { [ "$warp_ready" -eq 1 ]; }
+  install() { return 0; }
+  curl() { return 0; }
+  chmod() { return 0; }
+  mv() { return 0; }
+  rpm() {
+    case "$1" in
+      --import) return 0 ;;
+      -q) [ "$rpm_installed" -eq 1 ] ;;
+      *) return 1 ;;
+    esac
+  }
+  dnf() {
+    manager_calls="${manager_calls}$*"$'\n'
+    case "$*" in
+      *cloudflare-warp*) warp_ready=1 ;;
+    esac
+    return 0
+  }
+
+  pkg_install_rpm socks dnf || {
+    fail 'an incomplete installed WARP dependency should be repaired from the current repository candidate'
+    return 1
+  }
+  assert_not_contains "$manager_calls" 'reinstall' \
+    'RPM dependency repair must not reinstall the already installed version instead of selecting the current candidate' \
+    || return 1
+  grep -Eq '^(install|upgrade).*cloudflare-warp' <<< "$manager_calls" || {
+    fail 'an incomplete installed WARP dependency must use an install or upgrade candidate transaction'
+    return 1
+  }
+  clean_line="$(line_number "$manager_calls" 'clean metadata')"
+  candidate_line="$(line_number "$manager_calls" 'upgrade -y --best cloudflare-warp')"
+  if [ -z "$clean_line" ] || [ -z "$candidate_line" ] || [ "$clean_line" -ge "$candidate_line" ]; then
+    fail 'RPM metadata must expire before selecting an upgrade candidate'
+    return 1
+  fi
+
+  manager_calls=''
+  rpm_installed=0
+  warp_ready=0
+  pkg_install_rpm socks dnf || {
+    fail 'a missing WARP dependency should install from the current repository candidate'
+    return 1
+  }
+  grep -Eq '^install.*cloudflare-warp' <<< "$manager_calls" || {
+    fail 'a missing RPM dependency must use the current install candidate'
+    return 1
+  }
+  clean_line="$(line_number "$manager_calls" 'clean metadata')"
+  candidate_line="$(line_number "$manager_calls" 'install -y cloudflare-warp')"
+  if [ -z "$clean_line" ] || [ -z "$candidate_line" ] || [ "$clean_line" -ge "$candidate_line" ]; then
+    fail 'RPM metadata must expire before selecting a fresh install candidate'
+  fi
+}
+
 test_wireguard_dependencies_do_not_require_socks_tools() {
   source_without_main "$INSTALL_SCRIPT"
   local checks=''
@@ -1566,7 +1733,7 @@ test_wireguard_dependencies_do_not_require_socks_tools() {
     [ "$1" = '-v' ] || return 1
     checks="${checks} $2"
     case "$2" in
-      curl|ip|python3|timeout|wg|wg-quick) return 0 ;;
+      curl|ip|python3|timeout|sha256sum|wg|wg-quick) return 0 ;;
       *) return 1 ;;
     esac
   }
@@ -1583,12 +1750,23 @@ test_wireguard_dependencies_do_not_require_socks_tools() {
   command() {
     [ "$1" = '-v' ] || return 1
     case "$2" in
-      curl|ip|python3|wg|wg-quick) return 0 ;;
+      curl|ip|python3|sha256sum|wg|wg-quick) return 0 ;;
       *) return 1 ;;
     esac
   }
   if mode_dependencies_complete wireguard; then
     fail 'WireGuard dependencies without timeout must not skip coreutils repair'
+  fi
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl|ip|python3|timeout|wg|wg-quick) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  if mode_dependencies_complete wireguard; then
+    fail 'WireGuard dependencies without sha256sum must not skip coreutils repair'
   fi
 }
 
@@ -1598,7 +1776,7 @@ test_wireguard_dependency_reuse_requires_systemd_template() {
   command() {
     [ "$1" = '-v' ] || return 1
     case "$2" in
-      curl|ip|python3|timeout|wg|wg-quick) return 0 ;;
+      curl|ip|python3|timeout|sha256sum|wg|wg-quick) return 0 ;;
       *) return 1 ;;
     esac
   }
@@ -1682,7 +1860,7 @@ test_wireguard_uses_runtime_capability() {
 
 test_wgcf_fixed_binary_replaces_old_copy_atomically() {
   source_without_main "$MANAGER_SCRIPT"
-  local root request_log output rc=0 download_target
+  local root request_log output rc=0 download_target payload_hash
   root="$(mktemp -d)"
   request_log="$root/requests"
   DEFAULT_WGCF_BIN="$root/bin/wgcf"
@@ -1695,6 +1873,10 @@ test_wgcf_fixed_binary_replaces_old_copy_atomically() {
     > "$WGCF_BIN"
   chmod 0755 "$WGCF_BIN"
   : > "$request_log"
+  payload_hash="$(printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "wgcf v2.2.32\\n"' \
+    | sha256sum | awk '{ print $1 }')"
 
   curl() {
     local destination='' url='' arg
@@ -1710,6 +1892,14 @@ test_wgcf_fixed_binary_replaces_old_copy_atomically() {
       esac
     done
     printf '%s\t%s\n' "$url" "$destination" >> "$request_log"
+    if [ "${url##*/}" = 'checksums.txt' ]; then
+      if [ "${WGCF_TEST_BAD_CHECKSUM:-0}" -eq 1 ]; then
+        printf '%064d  wgcf_2.2.32_linux_amd64\n' 0
+      else
+        printf '%s  wgcf_2.2.32_linux_amd64\n' "$payload_hash"
+      fi
+      return 0
+    fi
     printf '%s\n' \
       '#!/usr/bin/env bash' \
       'printf "wgcf v2.2.32\\n"' \
@@ -1724,6 +1914,14 @@ test_wgcf_fixed_binary_replaces_old_copy_atomically() {
     'a partial download must not replace the existing executable' || return 1
 
   WGCF_TEST_CURL_FAIL=0
+  WGCF_TEST_BAD_CHECKSUM=1
+  rc=0
+  output="$(install_wgcf_binary 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'a checksum mismatch must fail fixed-version setup' || return 1
+  assert_eq 'wgcf v2.2.31' "$("$WGCF_BIN" --version)" \
+    'an unverified download must not replace the existing executable' || return 1
+
+  WGCF_TEST_BAD_CHECKSUM=0
   install_wgcf_binary >/dev/null || {
     fail 'the fixed wgcf version should replace an executable old copy'
     return 1
@@ -1733,7 +1931,7 @@ test_wgcf_fixed_binary_replaces_old_copy_atomically() {
   assert_contains "$(< "$request_log")" \
     '/v2.2.32/wgcf_2.2.32_linux_amd64' \
     'wgcf downloads must use the fixed release and matching asset name' || return 1
-  download_target="$(awk -F '\t' 'END { print $2 }' "$request_log")"
+  download_target="$(awk -F '\t' '$1 ~ /linux_amd64$/ { target=$2 } END { print target }' "$request_log")"
   [ "$download_target" != "$WGCF_BIN" ] || {
     fail 'wgcf must download beside the live path before atomic activation'
     return 1
@@ -1773,8 +1971,8 @@ test_wireguard_config_generation_is_retryable() {
     'wgcf registration should use its noninteractive accept-tos flag' || return 1
   assert_contains "$body" 'run_wgcf_command register --accept-tos' \
     'wgcf registration must use the bounded command wrapper' || return 1
-  assert_contains "$body" '&& run_wgcf_command generate' \
-    'wgcf generation must not continue after registration fails' || return 1
+  assert_contains "$body" 'run_wgcf_command generate' \
+    'wgcf generation must use the bounded command wrapper' || return 1
   assert_not_contains "$body" "printf 'yes" \
     'wgcf registration must not depend on an interactive prompt pipe' || return 1
   assert_contains "$body" 'config_tmp="${WG_CONFIG}.new.$$"' \
@@ -1794,6 +1992,7 @@ test_wireguard_config_generation_is_retryable() {
   root="$(mktemp -d)"
   event="$root/wgcf-events"
   STATE_DIR="$root/state"
+  WGCF_ACCOUNT="$STATE_DIR/wgcf/wgcf-account.toml"
   WG_IFACE=warp-vps-wg
   WG_CONFIG="$root/warp-vps-wg.conf"
   WGCF_BIN="$root/wgcf"
@@ -1835,15 +2034,52 @@ test_wireguard_config_generation_is_retryable() {
   assert_eq 'generate' "$(< "$event")" \
     'an existing-account timeout must not discard it and attempt a fresh registration' || return 1
 
-  STATE_DIR="$root/fresh-state"
   : > "$event"
+  run_wgcf_command() {
+    printf '%s\n' "$*" >> "$event"
+    return 42
+  }
+  rc=0
+  output="$(generate_wg_config 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'an existing-account generation error must fail the transaction' || return 1
+  assert_contains "$output" '生成 WireGuard 配置失败' \
+    'an existing-account generation error should remain a local generation failure' || return 1
+  assert_eq 'generate' "$(< "$event")" \
+    'an existing account must never be discarded for a new registration after generate fails' || return 1
+
+  STATE_DIR="$root/fresh-state"
+  WGCF_ACCOUNT="$STATE_DIR/wgcf/wgcf-account.toml"
+  : > "$event"
+  run_wgcf_command() {
+    printf '%s\n' "$*" >> "$event"
+    return 124
+  }
   rc=0
   output="$(generate_wg_config 2>&1)" || rc=$?
   assert_eq '1' "$rc" 'a fresh registration timeout must fail the transaction' || return 1
-  assert_contains "$output" '注册或生成 WireGuard 配置超时' \
-    'a fresh timeout should explain which necessary phase failed' || return 1
+  assert_contains "$output" '注册 WireGuard 账户超时' \
+    'a fresh registration timeout should identify the failed phase' || return 1
   assert_eq 'register --accept-tos' "$(< "$event")" \
     'wgcf generate must not run after fresh registration times out' || return 1
+
+  STATE_DIR="$root/fresh-success-state"
+  WGCF_ACCOUNT="$STATE_DIR/wgcf/wgcf-account.toml"
+  : > "$event"
+  wg_config_valid() { return 0; }
+  run_wgcf_command() {
+    printf '%s\n' "$*" >> "$event"
+    case "$1" in
+      register) printf 'fresh-account\n' > wgcf-account.toml ;;
+      generate) /bin/cp "${FIXTURE_DIR}/wireguard/valid.conf" wgcf-profile.conf ;;
+    esac
+    return 0
+  }
+  generate_wg_config || {
+    fail 'a fresh host should register once and generate its first WireGuard profile'
+    return 1
+  }
+  assert_eq $'register --accept-tos\ngenerate' "$(< "$event")" \
+    'only a host without an account should run the registration flow' || return 1
 
   eval "$wg_config_valid_definition"
 
@@ -2813,6 +3049,11 @@ test_mode_switch_rejects_live_opposite_backend() {
     fail 'WireGuard local state should pass after the old Socks table is absent'
     return 1
   }
+  socks_table_absent() { return 2; }
+  test_quiet || {
+    fail 'an unreadable opposite-backend query must not fail an otherwise healthy WireGuard runtime'
+    return 1
+  }
 
   WARP_MODE=socks
   WG_IFACE=warp-vps-wg
@@ -2842,6 +3083,84 @@ test_mode_switch_rejects_live_opposite_backend() {
   test_quiet || {
     fail 'a dormant WireGuard interface is harmless once Google and default routes use native interfaces'
     return 1
+  }
+  socks_wireguard_routes_absent() { return 2; }
+  test_quiet || {
+    fail 'an unreadable opposite-backend query must not fail an otherwise healthy Socks runtime'
+    return 1
+  }
+}
+
+test_opposite_backend_checks_preserve_three_states() {
+  source_without_main "$MANAGER_SCRIPT"
+  local rc=0 failures=0 warnings=0
+
+  nft() { return 1; }
+  rc=0
+  socks_table_absent || rc=$?
+  assert_eq '2' "$rc" \
+    'an nftables query error must be distinct from a confirmed stale Socks table' || return 1
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    [ "$2" != nft ] && builtin command "$@"
+  }
+  rc=0
+  socks_table_absent || rc=$?
+  assert_eq '2' "$rc" \
+    'a missing nft userspace command cannot prove that an old kernel table is absent' || return 1
+  if clear_socks_table_for_wireguard; then
+    fail 'WireGuard activation must not claim a stale Socks table was cleared without nft'
+    return 1
+  fi
+  unset -f command
+
+  rule_probe_ip() { return 1; }
+  rc=0
+  socks_wireguard_routes_absent || rc=$?
+  assert_eq '2' "$rc" \
+    'a route query error must be distinct from a confirmed stale WireGuard route' || return 1
+
+  section() { :; }
+  info_line() { :; }
+  ok_line() { :; }
+  fail_line() { failures=$((failures + 1)); }
+  warn_line() { warnings=$((warnings + 1)); }
+  unit_ready() { return 0; }
+  wg_interface_is_wireguard() { return 0; }
+  socks_table_absent() { return 2; }
+  WARP_MODE=wireguard
+  WARP_SCOPE=google
+  WG_IFACE=warp-vps-wg
+  run_self_check || {
+    fail 'status must remain usable when only the opposite-backend query is unreadable'
+    return 1
+  }
+  assert_eq '0' "$failures" \
+    'opposite-backend query uncertainty must not be reported as a confirmed local failure' || return 1
+  [ "$warnings" -gt 0 ] || {
+    fail 'opposite-backend query uncertainty should remain visible as a warning'
+    return 1
+  }
+
+  failures=0
+  warnings=0
+  wait_for_socks_listen() { return 0; }
+  redsocks_local_ready() { return 0; }
+  table_exists() { return 0; }
+  socks_wireguard_routes_absent() { return 2; }
+  WARP_MODE=socks
+  WARP_SCOPE=google
+  WARP_SOCKS_PORT=23456
+  REDSOCKS_PORT=23457
+  run_self_check || {
+    fail 'Socks status must remain usable when only the opposite-backend query is unreadable'
+    return 1
+  }
+  assert_eq '0' "$failures" \
+    'Socks route-query uncertainty must not be reported as a confirmed local failure' || return 1
+  [ "$warnings" -gt 0 ] || {
+    fail 'Socks route-query uncertainty should remain visible as a warning'
   }
 }
 
@@ -3954,6 +4273,89 @@ test_update_rolls_back_activation_and_service_write_failures() {
     'a new service start failure must restore the old runtime'
 }
 
+test_wireguard_update_rollback_uses_interface_boundary() {
+  run_wireguard_rollback() {
+    local interface_cleanup_rc="$1"
+    (
+      source_without_main "$MANAGER_SCRIPT"
+      local reload_calls=0
+      WARP_MODE=wireguard
+      WARP_SCOPE=google
+      WG_IFACE=warp-vps-wg
+      STATE_DIR=/unused/state
+      APP_DIR=/unused/app
+      RULES_DIR=/unused/app/rules
+
+      require_root() { :; }
+      load_config() { :; }
+      section() { :; }
+      info_line() { :; }
+      ok_line() { :; }
+      warn_line() { :; }
+      install() { return 0; }
+      download_update_asset() { :; }
+      validate_update_stage() { :; }
+      backup_current_installation() { :; }
+      begin_runtime_maintenance() { return 0; }
+      finish_runtime_maintenance() { :; }
+      service_active() { return 1; }
+      activate_update_stage() { return 0; }
+      reload_runtime_after_update() {
+        reload_calls=$((reload_calls + 1))
+        [ "$reload_calls" -gt 1 ]
+      }
+      stop_wg_routes_strict() {
+        printf 'UNEXPECTED:strict-route-shape-check\n'
+        return 1
+      }
+      remove_wireguard_interface() {
+        printf 'EVENT:remove-interface\n'
+        return "$interface_cleanup_rc"
+      }
+      restore_update_backup() {
+        printf 'EVENT:restore-old-files\n'
+        return 0
+      }
+      systemctl() { return 0; }
+      manager_mock() {
+        case "$1" in stop-rules|install-systemd) return 0 ;; *) return 1 ;; esac
+      }
+      BIN_PATH=manager_mock
+      cmd_update
+    )
+  }
+
+  local output rc=0 cleanup_line restore_line
+  output="$(run_wireguard_rollback 0 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a failed new WireGuard runtime must still report the update as failed after rollback'
+    return 1
+  }
+  assert_contains "$output" 'EVENT:remove-interface' \
+    'WireGuard update rollback must tear down the staged interface' || return 1
+  assert_contains "$output" 'EVENT:restore-old-files' \
+    'old files should be restored after the staged interface is gone' || return 1
+  assert_not_contains "$output" 'UNEXPECTED:strict-route-shape-check' \
+    'WireGuard update rollback must not depend on old CIDR or display-parser shape' || return 1
+  cleanup_line="$(line_number "$output" 'EVENT:remove-interface')"
+  restore_line="$(line_number "$output" 'EVENT:restore-old-files')"
+  if [ -z "$cleanup_line" ] || [ -z "$restore_line" ] || [ "$cleanup_line" -ge "$restore_line" ]; then
+    fail 'the staged WireGuard interface must disappear before old files are restored'
+    return 1
+  fi
+
+  rc=0
+  output="$(run_wireguard_rollback 1 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a WireGuard interface cleanup failure must stop update rollback'
+    return 1
+  }
+  assert_contains "$output" 'EVENT:remove-interface' \
+    'the failed cleanup fixture must reach the interface boundary' || return 1
+  assert_not_contains "$output" 'EVENT:restore-old-files' \
+    'old files must not be restored while the staged WireGuard interface is still live'
+}
+
 test_restart_and_update_restore_required_units() {
   local restart_body reload_body heal_body update_body rollback_body
   restart_body="$(function_body "$MANAGER_SCRIPT" cmd_restart)"
@@ -3984,7 +4386,7 @@ test_restart_and_update_restore_required_units() {
   assert_contains "$update_body" 'restore_update_backup "$backup"' \
     'a partial update activation must restore the previous files' || return 1
 
-  local stop_line activate_line strict_cleanup_line restore_line
+  local stop_line activate_line interface_cleanup_line restore_line
   stop_line="$(line_number "$update_body" '"$BIN_PATH" stop-rules')"
   activate_line="$(line_number "$update_body" 'activate_update_stage "$stage"')"
   if [ -z "$stop_line" ] || [ -z "$activate_line" ] || [ "$stop_line" -ge "$activate_line" ]; then
@@ -3992,12 +4394,14 @@ test_restart_and_update_restore_required_units() {
     return 1
   fi
   rollback_body="$(awk '/更新后运行态重新加载失败，正在恢复旧版本/ { found=1 } found { print }' <<< "$update_body")"
-  strict_cleanup_line="$(line_number "$rollback_body" 'stop_wg_routes_strict')"
+  interface_cleanup_line="$(line_number "$rollback_body" 'remove_wireguard_interface')"
   restore_line="$(line_number "$rollback_body" 'restore_update_backup "$backup"')"
-  if [ -z "$strict_cleanup_line" ] || [ -z "$restore_line" ] \
-    || [ "$strict_cleanup_line" -ge "$restore_line" ]; then
-    fail 'WireGuard update rollback must prove new routes are gone before restoring old rule files'
+  if [ -z "$interface_cleanup_line" ] || [ -z "$restore_line" ] \
+    || [ "$interface_cleanup_line" -ge "$restore_line" ]; then
+    fail 'WireGuard update rollback must remove the staged interface before restoring old files'
   fi
+  assert_not_contains "$rollback_body" 'stop_wg_routes_strict' \
+    'update rollback must not parse the staged or previous route snapshot'
 }
 
 test_update_reuses_healthy_backends() {
@@ -4958,7 +5362,7 @@ test_managed_swap_uninstall_verifies_state_without_backup() {
   source_without_main "$MANAGER_SCRIPT"
 
   local root mock_fstab_tmp events='' swap_active=1 fstab_listed=1
-  root="$(mktemp -d)"
+  root="$(command mktemp -d)"
   mock_fstab_tmp="${root}/fstab.tmp"
   managed_swap_listed_in() {
     case "$1" in
@@ -5271,6 +5675,42 @@ test_dependency_failure_stops_before_file_deletion() {
     'dependency failure must stop before any project file is deleted' || return 1
   assert_not_contains "$output" 'WARP VPS Manager 已卸载' \
     'dependency failure must not print uninstall success'
+}
+
+test_uninstall_daemon_reload_failure_is_post_commit_warning() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  require_root() { :; }
+  load_uninstall_config() {
+    WARP_MODE=socks
+    WARP_SCOPE=google
+    WG_IFACE=warp-vps-wg
+    WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+    MANAGED_WARP_SVC=0
+    UNINSTALL_WIREGUARD_PRESENT=0
+    UNINSTALL_RUNTIME_IDENTIFIED=1
+  }
+  recover_uninstall_runtime_from_unit() { :; }
+  managed_redsocks_fallback_exists() { return 1; }
+  deactivate_runtime_for_uninstall() { :; }
+  section() { :; }
+  info_line() { :; }
+  print_remove_target_if_exists() { :; }
+  uninstall_managed_swap() { :; }
+  remove_file_if_exists() { :; }
+  remove_tree_if_exists() { :; }
+  systemctl() {
+    [ "$*" != 'daemon-reload' ]
+  }
+
+  local output rc=0
+  output="$(cmd_uninstall --yes 2>&1)" || rc=$?
+  assert_eq '0' "$rc" \
+    'daemon-reload failure after permanent deletion must not report the uninstall as uncommitted' || return 1
+  assert_contains "$output" 'systemd' \
+    'the post-delete daemon-reload failure should remain visible' || return 1
+  assert_contains "$output" 'WARP VPS Manager 已卸载' \
+    'the command must still report the already completed permanent deletion'
 }
 
 test_readme_documents_all_uninstall_modes() {
@@ -6052,6 +6492,137 @@ test_active_wireguard_invalid_config_keeps_live_backend() {
   fi
 }
 
+test_wireguard_reuse_probe_unknown_falls_through_to_teardown() {
+  source_without_main "$INSTALL_SCRIPT"
+  local die_calls=0
+  PREVIOUS_MODE=wireguard
+  PREVIOUS_WG_IFACE=warp-vps-wg
+  project_unit_active() { return 2; }
+  project_wg_interface_present() { return 2; }
+  die() { die_calls=$((die_calls + 1)); return 1; }
+
+  if current_backend_reusable wireguard 0 ''; then
+    fail 'an unreadable WireGuard reuse probe must not claim the backend is reusable'
+    return 1
+  fi
+  assert_eq '0' "$die_calls" \
+    'reuse-probe uncertainty should fall through to the real teardown boundary instead of blocking early'
+}
+
+test_wireguard_prepared_target_cleanup_removes_real_interface() {
+  source_without_main "$INSTALL_SCRIPT"
+  local events='' interface_present=1
+  TARGET_MODE=wireguard
+  TARGET_PREP_STARTED=1
+  INSTALL_RUNTIME_TOUCHED=1
+  PROJECT_STAGE_DIR=/staged-target-does-not-exist
+  TARGET_CONFIG_FILE=/staged-target-does-not-exist/config.env
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+
+  systemctl() {
+    events="${events}systemctl:$*"$'\n'
+    return 0
+  }
+  project_wg_interface_present() {
+    [ "$interface_present" -eq 1 ]
+  }
+  wg-quick() {
+    events="${events}wg-quick:$*"$'\n'
+    return 1
+  }
+  ip() {
+    events="${events}ip:$*"$'\n'
+    if [ "$*" = 'link delete dev warp-vps-wg' ]; then
+      interface_present=0
+    fi
+    return 0
+  }
+
+  cleanup_prepared_target wireguard || {
+    fail 'prepared-target cleanup should delete a WireGuard interface that is still present'
+    return 1
+  }
+  assert_contains "$events" 'wg-quick:down /etc/wireguard/warp-vps-wg.conf' \
+    'WireGuard cleanup should first use the configured wg-quick identity' || return 1
+  assert_contains "$events" 'ip:link delete dev warp-vps-wg' \
+    'WireGuard cleanup should fall back to deleting a still-present kernel interface' || return 1
+  assert_eq '0' "$interface_present" \
+    'successful prepared-target cleanup must leave the project interface absent' || return 1
+
+  events=''
+  interface_present=1
+  ip() {
+    events="${events}ip:$*"$'\n'
+    return 0
+  }
+  if cleanup_prepared_target wireguard; then
+    fail 'prepared-target cleanup must fail when the WireGuard interface remains present'
+    return 1
+  fi
+  assert_contains "$events" 'ip:link delete dev warp-vps-wg' \
+    'the persistent-interface fixture must reach the real delete boundary'
+}
+
+test_runtime_restore_avoids_duplicate_cleanup_and_always_restores_health() {
+  source_without_main "$INSTALL_SCRIPT"
+  local events=''
+  TARGET_MODE=wireguard
+  TARGET_PREP_STARTED=1
+  INSTALL_RUNTIME_TOUCHED=1
+  INSTALL_FILES_ACTIVATED=1
+  INSTALL_BACKEND_REUSED=0
+  PROJECT_BACKUP_DIR=/rollback-fixture-does-not-exist
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+
+  stop_project_runtime() {
+    events="${events}stop-project-runtime"$'\n'
+    return 0
+  }
+  cleanup_prepared_target() {
+    events="${events}duplicate-target-cleanup"$'\n'
+    return 0
+  }
+  restore_project_files() {
+    events="${events}restore-project-files"$'\n'
+    return 0
+  }
+  restore_health_automation() {
+    events="${events}restore-health"$'\n'
+    return 0
+  }
+  systemctl() { return 0; }
+
+  restore_previous_runtime || {
+    fail 'a successful activated-file rollback should restore the previous runtime'
+    return 1
+  }
+  assert_contains "$events" 'stop-project-runtime' \
+    'activated target runtime must be stopped before old files are restored' || return 1
+  assert_not_contains "$events" 'duplicate-target-cleanup' \
+    'the same target runtime must not be cleaned twice after stop_project_runtime succeeds' || return 1
+  assert_contains "$events" 'restore-health' \
+    'activated-file rollback without an old config must restore health automation' || return 1
+
+  events=''
+  INSTALL_RUNTIME_TOUCHED=0
+  INSTALL_FILES_ACTIVATED=0
+  cleanup_prepared_target() { return 0; }
+  restore_prepared_target_files() {
+    events="${events}restore-prepared-files-failed"$'\n'
+    return 1
+  }
+  if restore_previous_runtime; then
+    fail 'a prepared-file restore failure must remain visible to rollback'
+    return 1
+  fi
+  assert_contains "$events" 'restore-prepared-files-failed' \
+    'the failure fixture must reach prepared-file restoration' || return 1
+  assert_contains "$events" 'restore-health' \
+    'health automation must still be restored when prepared-file restoration fails'
+}
+
 test_untouched_wireguard_preparation_restores_files_without_runtime_cleanup() {
   source_without_main "$INSTALL_SCRIPT"
   local events=''
@@ -6537,17 +7108,25 @@ test_no_project_version_or_commit_api_gate() {
 }
 
 test_no_sha_gate() {
-  assert_file_not_matches "$INSTALL_SCRIPT" 'sha256|SOURCE_SHA|expected_sha' \
-    'installer downloads must not be blocked by embedded SHA comparisons' || return 1
-  assert_file_not_matches "$MANAGER_SCRIPT" 'sha256|hashlib|expected_sha' \
-    'manager downloads must not be blocked by embedded SHA comparisons'
+  local install_fetch update_fetch wgcf_install
+  install_fetch="$(function_body "$INSTALL_SCRIPT" fetch_asset)"
+  update_fetch="$(function_body "$MANAGER_SCRIPT" download_update_asset)"
+  wgcf_install="$(function_body "$MANAGER_SCRIPT" install_wgcf_binary)"
+  assert_not_contains "$install_fetch" 'sha256' \
+    'installer project downloads must not be blocked by an embedded project snapshot hash' || return 1
+  assert_not_contains "$update_fetch" 'sha256' \
+    'project updates must not be blocked by an embedded project snapshot hash' || return 1
+  assert_contains "$wgcf_install" 'checksums.txt' \
+    'the pinned upstream wgcf binary must use its matching official checksum manifest' || return 1
+  assert_contains "$wgcf_install" 'sha256sum' \
+    'the pinned upstream wgcf binary must be verified before activation'
 }
 
 test_public_install_contract_and_downloads_are_bounded() {
   local install_fetch update_fetch rpm_install
   install_fetch="$(function_body "$INSTALL_SCRIPT" fetch_asset)"
   update_fetch="$(function_body "$MANAGER_SCRIPT" download_update_asset)"
-  rpm_install="$(function_body "$INSTALL_SCRIPT" pkg_install_rpm)"
+  rpm_install="$(function_body "$INSTALL_SCRIPT" refresh_cloudflare_rpm_repo)"
   assert_contains "$install_fetch" '--connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT"' \
     'installer project downloads must have a connection deadline' || return 1
   assert_contains "$install_fetch" '--max-time "$DOWNLOAD_MAX_TIME"' \
@@ -6591,6 +7170,7 @@ run_test 'reinstall keeps the current mode by default' test_reinstall_keeps_curr
 run_test 'route scope prompt defaults to precise Google routing' test_route_scope_prompt_and_defaults
 run_test 'route scope config remains backward compatible' test_route_scope_config_is_backward_compatible
 run_test 'existing config validation precedes runtime mutation' test_existing_config_validation_precedes_runtime_mutation
+run_test 'WireGuard config ignores unused Socks fields' test_wireguard_config_does_not_require_socks_fields
 run_test 'SOCKS port retries after a stray backslash' test_warp_port_reprompts
 run_test 'reinstall can reuse its current SOCKS port' test_existing_project_port_is_reusable
 run_test 'SOCKS port checks ignore UDP-only listeners' test_port_checks_only_tcp
@@ -6626,9 +7206,11 @@ run_test 'uninstall only stops a managed WARP service' test_managed_warp_service
 run_test 'package manager selection is capability based' test_package_manager_detection_is_capability_based
 run_test 'Ubuntu derivatives prefer UBUNTU_CODENAME' test_ubuntu_codename_takes_precedence
 run_test 'apt WireGuard dependencies are mode specific' test_apt_wireguard_dependencies_are_minimal
+run_test 'existing Cloudflare APT source refreshes before updates' test_existing_cloudflare_apt_repo_refreshes_before_updates
 run_test 'RPM WireGuard dependencies are mode specific' test_rpm_wireguard_dependencies_are_minimal
 run_test 'Socks dependencies are mode specific' test_socks_dependencies_are_mode_specific
 run_test 'complete mode dependencies skip package-manager access' test_complete_mode_dependencies_skip_package_manager
+run_test 'incomplete dependencies use the current package candidate' test_incomplete_dependencies_use_current_package_candidate
 run_test 'WireGuard dependencies exclude Socks-only tools' test_wireguard_dependencies_do_not_require_socks_tools
 run_test 'WireGuard dependency reuse requires its systemd template' test_wireguard_dependency_reuse_requires_systemd_template
 run_test 'WARP reuse requires both CLI and service unit' test_warp_client_reuse_requires_cli_and_unit
@@ -6655,6 +7237,7 @@ run_test 'Socks runtime accepts the v0.1.11 rule shape' test_socks_runtime_accep
 run_test 'Socks global nft redirects public IPv4 TCP' test_socks_global_nft_redirects_public_ipv4_tcp
 run_test 'WireGuard apply clears stale Socks nft state' test_wireguard_apply_clears_stale_socks_table
 run_test 'mode switches reject a live opposite backend' test_mode_switch_rejects_live_opposite_backend
+run_test 'opposite backend checks preserve conflict absent and unknown states' test_opposite_backend_checks_preserve_three_states
 run_test 'SSH peer protection preserves the rule-check status' test_ssh_peer_route_uses_rule_check_status
 run_test 'existing WARP registration is reused safely' test_existing_warp_registration_is_reused
 run_test 'WARP registration distinguishes present missing and unknown' test_warp_registration_has_three_states
@@ -6682,6 +7265,7 @@ run_test 'rule metadata counts gate install and update' test_rule_metadata_count
 run_test 'update rollback restores existing and missing files' test_update_rollback_restores_existing_and_missing_files
 run_test 'update accepts legacy Socks runtime' test_update_accepts_legacy_socks_runtime
 run_test 'update rolls back activation and service failures' test_update_rolls_back_activation_and_service_write_failures
+run_test 'WireGuard update rollback uses the interface boundary' test_wireguard_update_rollback_uses_interface_boundary
 run_test 'restart update and heal restore required units' test_restart_and_update_restore_required_units
 run_test 'updates reuse healthy mode backends' test_update_reuses_healthy_backends
 run_test 'updates repair only missing mode backends' test_update_repairs_only_missing_backends
@@ -6712,6 +7296,7 @@ run_test 'dependency uninstall requires an absent postcondition' test_dependency
 run_test 'RPM dependency postcondition parsing fails closed' test_rpm_dependency_postcondition_parser_fails_closed
 run_test 'uninstall scope controls dependency and fallback cleanup' test_uninstall_scope_controls_dependency_and_fallback_cleanup
 run_test 'dependency failure stops before file deletion' test_dependency_failure_stops_before_file_deletion
+run_test 'post-delete daemon reload failure is only a warning' test_uninstall_daemon_reload_failure_is_post_commit_warning
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
 run_test 'README documents route scope behavior' test_readme_documents_route_scope_contract
 run_test 'reinstall accepts legacy Socks cleanup' test_reinstall_accepts_legacy_socks_rule_cleanup
@@ -6722,6 +7307,9 @@ run_test 'healthy reinstall reuses its backend without external setup' test_rein
 run_test 'WireGuard reuse requires a real kernel device' test_wireguard_reuse_requires_real_kernel_device
 run_test 'WireGuard target preflight waits for old Socks teardown' test_wireguard_target_preflight_waits_for_old_socks_teardown
 run_test 'active WireGuard invalid config keeps the live backend' test_active_wireguard_invalid_config_keeps_live_backend
+run_test 'WireGuard reuse probe uncertainty falls through to teardown' test_wireguard_reuse_probe_unknown_falls_through_to_teardown
+run_test 'WireGuard prepared-target cleanup removes the real interface' test_wireguard_prepared_target_cleanup_removes_real_interface
+run_test 'runtime restore avoids duplicate cleanup and always restores health' test_runtime_restore_avoids_duplicate_cleanup_and_always_restores_health
 run_test 'untouched WireGuard preparation restores files without runtime cleanup' test_untouched_wireguard_preparation_restores_files_without_runtime_cleanup
 run_test 'touched WireGuard rollback still runs runtime cleanup' test_touched_wireguard_rollback_still_runs_runtime_cleanup
 run_test 'target preparation failure keeps the old runtime running' test_target_preparation_failure_keeps_old_runtime_running
@@ -6734,7 +7322,7 @@ run_test 'wgcf maps MIPS and s390x assets' test_wgcf_mips_and_s390x_asset_mappin
 run_test 'main is the single public project source' test_main_is_the_single_public_update_source
 run_test 'logs follow the configured WireGuard interface' test_logs_follow_custom_wireguard_interface
 run_test 'project version and GitHub commit API gates are absent' test_no_project_version_or_commit_api_gate
-run_test 'embedded SHA gates are absent' test_no_sha_gate
+run_test 'project SHA gates are absent and wgcf checksum is verified' test_no_sha_gate
 run_test 'public installer and bounded downloads are documented' test_public_install_contract_and_downloads_are_bounded
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"

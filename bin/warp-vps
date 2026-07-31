@@ -189,9 +189,17 @@ load_config() {
   WG_CONFIG="${WG_CONFIG:-/etc/wireguard/${WG_IFACE}.conf}"
   [ -n "${WARP_SOCKS_PORT:-}" ] || WARP_SOCKS_PORT=0
   [ -n "${REDSOCKS_PORT:-}" ] || REDSOCKS_PORT=0
-  [ -n "${REDSOCKS_USER:-}" ] || die "配置缺少 REDSOCKS_USER"
-  [ -n "${REDSOCKS_UID:-}" ] || die "配置缺少 REDSOCKS_UID"
-  REDSOCKS_GROUP="${REDSOCKS_GROUP:-$REDSOCKS_USER}"
+  if [ "$WARP_MODE" = "socks" ]; then
+    [ -n "${REDSOCKS_USER:-}" ] || die "配置缺少 REDSOCKS_USER"
+    [ -n "${REDSOCKS_UID:-}" ] || die "配置缺少 REDSOCKS_UID"
+    REDSOCKS_GROUP="${REDSOCKS_GROUP:-$REDSOCKS_USER}"
+    [ -n "${REDSOCKS_BIN:-}" ] || die "配置缺少 REDSOCKS_BIN"
+  else
+    REDSOCKS_USER="${REDSOCKS_USER:-root}"
+    REDSOCKS_UID="${REDSOCKS_UID:-0}"
+    REDSOCKS_GROUP="${REDSOCKS_GROUP:-root}"
+    REDSOCKS_BIN="${REDSOCKS_BIN:-/usr/sbin/redsocks}"
+  fi
   if [ -z "${MANAGED_WARP_SVC:-}" ]; then
     if [ "$WARP_MODE" = "socks" ]; then
       MANAGED_WARP_SVC=1
@@ -205,19 +213,17 @@ load_config() {
       MANAGED_REDSOCKS_BIN=1
     fi
   fi
-  [ -n "${REDSOCKS_GROUP:-}" ] || die "配置缺少 REDSOCKS_GROUP"
-  [ -n "${REDSOCKS_BIN:-}" ] || die "配置缺少 REDSOCKS_BIN"
   REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
   if [ "$WARP_MODE" = "socks" ]; then
     valid_config_port "$WARP_SOCKS_PORT" || die "配置里的 WARP_SOCKS_PORT 不是有效端口"
     valid_config_port "$REDSOCKS_PORT" || die "配置里的 REDSOCKS_PORT 不是有效端口"
+    case "$REDSOCKS_UID" in ''|*[!0-9]*) die "配置里的 REDSOCKS_UID 不是有效数字" ;; esac
+    valid_config_name "$REDSOCKS_USER" || die "配置里的 REDSOCKS_USER 不是有效用户"
+    valid_config_name "$REDSOCKS_GROUP" || die "配置里的 REDSOCKS_GROUP 不是有效用户组"
+    valid_config_path "$REDSOCKS_BIN" || die "配置里的 REDSOCKS_BIN 不是安全绝对路径"
   fi
-  case "$REDSOCKS_UID" in ''|*[!0-9]*) die "配置里的 REDSOCKS_UID 不是有效数字" ;; esac
   case "$MANAGED_WARP_SVC" in 0|1) ;; *) die "配置里的 MANAGED_WARP_SVC 不是有效值" ;; esac
   case "$MANAGED_REDSOCKS_BIN" in 0|1) ;; *) die "配置里的 MANAGED_REDSOCKS_BIN 不是有效值" ;; esac
-  valid_config_name "$REDSOCKS_USER" || die "配置里的 REDSOCKS_USER 不是有效用户"
-  valid_config_name "$REDSOCKS_GROUP" || die "配置里的 REDSOCKS_GROUP 不是有效用户组"
-  valid_config_path "$REDSOCKS_BIN" || die "配置里的 REDSOCKS_BIN 不是安全绝对路径"
   valid_config_iface "$WG_IFACE" || die "配置里的 WG_IFACE 不是有效网卡名"
   valid_config_path "$WGCF_BIN" || die "配置里的 WGCF_BIN 不是安全绝对路径"
   valid_config_path "$WG_CONFIG" || die "配置里的 WG_CONFIG 不是安全绝对路径"
@@ -451,18 +457,19 @@ protect_ssh_peer_route() {
 }
 
 wgcf_asset_spec() {
+  local version="${DEFAULT_WGCF_VERSION#v}"
   case "$(uname -m)" in
-    x86_64|amd64) printf 'wgcf_2.2.32_linux_amd64\n' ;;
-    aarch64|arm64) printf 'wgcf_2.2.32_linux_arm64\n' ;;
-    armv7l) printf 'wgcf_2.2.32_linux_armv7\n' ;;
-    armv6l) printf 'wgcf_2.2.32_linux_armv6\n' ;;
-    armv5*) printf 'wgcf_2.2.32_linux_armv5\n' ;;
-    i386|i486|i586|i686) printf 'wgcf_2.2.32_linux_386\n' ;;
-    mips) printf 'wgcf_2.2.32_linux_mips_softfloat\n' ;;
-    mipsel|mipsle) printf 'wgcf_2.2.32_linux_mipsle_softfloat\n' ;;
-    mips64) printf 'wgcf_2.2.32_linux_mips64_softfloat\n' ;;
-    mips64el|mips64le) printf 'wgcf_2.2.32_linux_mips64le_softfloat\n' ;;
-    s390x) printf 'wgcf_2.2.32_linux_s390x\n' ;;
+    x86_64|amd64) printf 'wgcf_%s_linux_amd64\n' "$version" ;;
+    aarch64|arm64) printf 'wgcf_%s_linux_arm64\n' "$version" ;;
+    armv7l) printf 'wgcf_%s_linux_armv7\n' "$version" ;;
+    armv6l) printf 'wgcf_%s_linux_armv6\n' "$version" ;;
+    armv5*) printf 'wgcf_%s_linux_armv5\n' "$version" ;;
+    i386|i486|i586|i686) printf 'wgcf_%s_linux_386\n' "$version" ;;
+    mips) printf 'wgcf_%s_linux_mips_softfloat\n' "$version" ;;
+    mipsel|mipsle) printf 'wgcf_%s_linux_mipsle_softfloat\n' "$version" ;;
+    mips64) printf 'wgcf_%s_linux_mips64_softfloat\n' "$version" ;;
+    mips64el|mips64le) printf 'wgcf_%s_linux_mips64le_softfloat\n' "$version" ;;
+    s390x) printf 'wgcf_%s_linux_s390x\n' "$version" ;;
     *) die "WireGuard 模式暂不支持当前 CPU 架构：$(uname -m)" ;;
   esac
 }
@@ -472,12 +479,25 @@ install_wgcf_binary() {
     return 0
   fi
   install -d -m 0755 "$(dirname "$WGCF_BIN")"
-  local asset_name url staged
+  local asset_name url checksums expected actual staged
   asset_name="$(wgcf_asset_spec)"
   url="https://github.com/ViRb3/wgcf/releases/download/${DEFAULT_WGCF_VERSION}/${asset_name}"
   staged="${WGCF_BIN}.new.$$"
   curl -LfsS --connect-timeout 10 --max-time 120 "$url" -o "$staged" \
     || die "wgcf 下载失败：$asset_name"
+  checksums="$(curl -LfsS --connect-timeout 10 --max-time 120 \
+    "https://github.com/ViRb3/wgcf/releases/download/${DEFAULT_WGCF_VERSION}/checksums.txt")" \
+    || die "wgcf 官方校验文件下载失败：${DEFAULT_WGCF_VERSION}"
+  expected="$(awk -v asset="$asset_name" '
+    $2 == asset { value=tolower($1); count++ }
+    END { if (count != 1) exit 1; print value }
+  ' <<< "$checksums")" || die "wgcf 官方校验文件缺少唯一资产记录：$asset_name"
+  case "$expected" in ''|*[!0-9a-fA-F]*) die "wgcf 官方校验值格式无效：$asset_name" ;; esac
+  [ "${#expected}" -eq 64 ] || die "wgcf 官方校验值长度无效：$asset_name"
+  command -v sha256sum >/dev/null 2>&1 || die "找不到 sha256sum，无法校验 wgcf"
+  actual="$(sha256sum "$staged" | awk '{ print tolower($1) }')" \
+    || die "无法计算 wgcf SHA-256：$asset_name"
+  [ "$actual" = "$expected" ] || die "wgcf SHA-256 校验失败：$asset_name"
   chmod 0755 "$staged" || die "无法设置 wgcf 执行权限"
   mv "$staged" "$WGCF_BIN" || die "无法激活 wgcf：$WGCF_BIN"
   log "已下载 wgcf：${DEFAULT_WGCF_VERSION} ${asset_name}"
@@ -615,11 +635,10 @@ generate_wg_config() {
     return 0
   fi
 
-  local stage fresh profile_dir account_source config_stage config_tmp account_tmp backup_dir
+  local stage profile_dir account_source config_stage config_tmp account_tmp backup_dir
   local wgcf_rc=0
   stage="${STATE_DIR}/wgcf-stage-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  fresh="${stage}/fresh"
-  account_source="${STATE_DIR}/wgcf/wgcf-account.toml"
+  account_source="$WGCF_ACCOUNT"
   config_stage="${stage}/${WG_IFACE}.conf"
   config_tmp="${WG_CONFIG}.new.$$"
   account_tmp="${account_source}.new.$$"
@@ -630,34 +649,46 @@ generate_wg_config() {
   profile_dir=""
   if [ -s "$account_source" ]; then
     install -m 0600 "$account_source" "${stage}/wgcf-account.toml"
-    if (
-      cd "$stage"
-      run_wgcf_command generate >/dev/null
-    ); then
-      profile_dir="$stage"
-    else
-      wgcf_rc=$?
-      case "$wgcf_rc" in
-        124|137) die "wgcf 生成 WireGuard 配置超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
-      esac
-    fi
-  fi
-
-  if [ -z "$profile_dir" ]; then
-    install -d -m 0700 "$fresh"
     wgcf_rc=0
     (
-      cd "$fresh" \
-        && run_wgcf_command register --accept-tos >/dev/null \
-        && run_wgcf_command generate >/dev/null
+      cd "$stage"
+      run_wgcf_command generate >/dev/null
     ) || wgcf_rc=$?
     if [ "$wgcf_rc" -ne 0 ]; then
       case "$wgcf_rc" in
-        124|137) die "wgcf 注册或生成 WireGuard 配置超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
-        *) die "wgcf 注册或生成 WireGuard 配置失败" ;;
+        124|137) die "wgcf 生成 WireGuard 配置超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
+        *) die "wgcf 使用现有账户生成 WireGuard 配置失败" ;;
       esac
     fi
-    profile_dir="$fresh"
+    profile_dir="$stage"
+  else
+    wgcf_rc=0
+    (
+      cd "$stage"
+      run_wgcf_command register --accept-tos >/dev/null
+    ) || wgcf_rc=$?
+    if [ "$wgcf_rc" -ne 0 ]; then
+      case "$wgcf_rc" in
+        124|137) die "wgcf 注册 WireGuard 账户超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
+        *) die "wgcf 注册 WireGuard 账户失败" ;;
+      esac
+    fi
+    [ -s "${stage}/wgcf-account.toml" ] || die "wgcf 没有生成账户文件"
+    install -m 0600 "${stage}/wgcf-account.toml" "$account_tmp" \
+      || die "无法保存新注册的 wgcf 账户文件"
+    mv "$account_tmp" "$account_source" || die "无法激活新注册的 wgcf 账户文件"
+    wgcf_rc=0
+    (
+      cd "$stage"
+      run_wgcf_command generate >/dev/null
+    ) || wgcf_rc=$?
+    if [ "$wgcf_rc" -ne 0 ]; then
+      case "$wgcf_rc" in
+        124|137) die "wgcf 生成 WireGuard 配置超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
+        *) die "wgcf 生成 WireGuard 配置失败；已保留新注册账户供下次重试" ;;
+      esac
+    fi
+    profile_dir="$stage"
   fi
 
   [ -s "${profile_dir}/wgcf-account.toml" ] || die "wgcf 没有生成账户文件"
@@ -688,22 +719,14 @@ PY
   chmod 0600 "$config_stage"
   wg_config_valid "$config_stage" || die "wgcf 生成的 WireGuard 配置无法被 wg-quick 解析"
 
-  if [ -e "$WG_CONFIG" ] || { [ -s "$account_source" ] && [ "$profile_dir" = "$fresh" ]; }; then
+  if [ -e "$WG_CONFIG" ]; then
     install -d -m 0700 "$backup_dir"
-    if [ -e "$WG_CONFIG" ]; then
-      install -m 0600 "$WG_CONFIG" "${backup_dir}/$(basename "$WG_CONFIG").invalid" \
-        || die "无法备份旧 WireGuard 配置"
-    fi
-    if [ -s "$account_source" ] && [ "$profile_dir" = "$fresh" ]; then
-      install -m 0600 "$account_source" "${backup_dir}/wgcf-account.toml.invalid" \
-        || die "无法备份旧 wgcf 账户文件"
-    fi
+    install -m 0600 "$WG_CONFIG" "${backup_dir}/$(basename "$WG_CONFIG").invalid" \
+      || die "无法备份旧 WireGuard 配置"
   fi
 
   install -m 0600 "$config_stage" "$config_tmp"
   mv "$config_tmp" "$WG_CONFIG"
-  install -m 0600 "${profile_dir}/wgcf-account.toml" "$account_tmp"
-  mv "$account_tmp" "$account_source"
 }
 
 route_file_lines() {
@@ -736,11 +759,10 @@ PY
 
 wg_global_nft_table_absent() {
   if ! command -v nft >/dev/null 2>&1; then
-    [ "${WARP_MODE:-}" != "wireguard" ] || [ "${WARP_SCOPE:-google}" != "global" ]
-    return
+    return 2
   fi
   local tables
-  tables="$(nft list tables 2>/dev/null)" || return 1
+  tables="$(nft list tables 2>/dev/null)" || return 2
   ! grep -Fxq "table inet ${WG_GLOBAL_NFT_TABLE}" <<< "$tables"
 }
 
@@ -789,7 +811,7 @@ wg_global_policy_rules_absent() {
   local family rules mark_pattern
   mark_pattern='(0x0*ca[bB]0|51888)'
   for family in 4 6; do
-    rules="$(ip -"$family" rule show 2>/dev/null)" || return 1
+    rules="$(ip -"$family" rule show 2>/dev/null)" || return 2
     ! grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
       <<< "$rules" || return 1
     ! grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark ${mark_pattern}(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
@@ -800,7 +822,7 @@ wg_global_policy_rules_absent() {
 wg_global_routes_absent() {
   local family routes
   for family in 4 6; do
-    routes="$(ip -"$family" route show table all default 2>/dev/null)" || return 1
+    routes="$(ip -"$family" route show table all default 2>/dev/null)" || return 2
     ! grep -Eq "(^|[[:space:]])table ${WG_GLOBAL_TABLE}([[:space:]]|$)" <<< "$routes" \
       || return 1
   done
@@ -1010,9 +1032,9 @@ table_exists() {
 }
 
 socks_table_absent() {
-  command -v nft >/dev/null 2>&1 || return 0
+  command -v nft >/dev/null 2>&1 || return 2
   local tables rc
-  tables="$(nft list tables 2>/dev/null)" || return 1
+  tables="$(nft list tables 2>/dev/null)" || return 2
   rc=0
   grep -Fxq 'table inet warp_vps' <<< "$tables" || rc=$?
   case "$rc" in
@@ -1023,7 +1045,7 @@ socks_table_absent() {
 }
 
 clear_socks_table_for_wireguard() {
-  command -v nft >/dev/null 2>&1 || return 0
+  command -v nft >/dev/null 2>&1 || return 1
   local tables rc
   tables="$(nft list tables 2>/dev/null)" || return 1
   rc=0
@@ -1038,7 +1060,6 @@ clear_socks_table_for_wireguard() {
 
 apply_rules() {
   load_config
-  validate_repo_raw_base "$REPO_RAW_BASE"
   install -d -m 0755 "$ETC_DIR"
   if [ "$WARP_MODE" = "wireguard" ]; then
     clear_socks_table_for_wireguard || die "无法清除旧 Socks5 分流规则"
@@ -1457,19 +1478,26 @@ route_output_uses_interface() {
 }
 
 socks_wireguard_routes_absent() {
-  local probe4 route4 defaults4 defaults6
-  probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" || return 1
-  route4="$(ip -4 route get "$probe4" 2>/dev/null)" || return 1
+  local probe4 route4 defaults4 defaults6 global_rc=0
+  probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" || return 2
+  route4="$(ip -4 route get "$probe4" 2>/dev/null)" || return 2
   if route_output_uses_interface "$WG_IFACE" <<< "$route4"; then
     return 1
   fi
-  defaults4="$(ip -4 route show default 2>/dev/null)" || return 1
-  defaults6="$(ip -6 route show default 2>/dev/null)" || return 1
+  defaults4="$(ip -4 route show default 2>/dev/null)" || return 2
+  defaults6="$(ip -6 route show default 2>/dev/null)" || return 2
   if route_output_uses_interface "$WG_IFACE" <<< "$defaults4"; then
     return 1
   fi
-  ! route_output_uses_interface "$WG_IFACE" <<< "$defaults6" \
-    && wg_global_routes_absent
+  if route_output_uses_interface "$WG_IFACE" <<< "$defaults6"; then
+    return 1
+  fi
+  wg_global_routes_absent || global_rc=$?
+  case "$global_rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 clear_socks_wireguard_routes() {
@@ -1705,16 +1733,26 @@ configure_warp_runtime() {
 }
 
 test_quiet() {
+  local opposite_rc=0
   load_config
   if [ "$WARP_MODE" = "wireguard" ]; then
     wg_interface_is_wireguard || return 1
-    socks_table_absent
-    return
+    socks_table_absent || opposite_rc=$?
+    case "$opposite_rc" in
+      0) return 0 ;;
+      1) return 1 ;;
+      *) warn "暂时无法读取旧 Socks5 nftables 状态；不影响当前 WireGuard 健康判断"; return 0 ;;
+    esac
   fi
   wait_for_socks_listen 8 || return 1
   redsocks_local_ready || return 1
   table_exists || return 1
-  socks_wireguard_routes_absent
+  socks_wireguard_routes_absent || opposite_rc=$?
+  case "$opposite_rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) warn "暂时无法读取旧 WireGuard 路由状态；不影响当前 Socks5 健康判断"; return 0 ;;
+  esac
 }
 
 print_rule_summary() {
@@ -2023,7 +2061,7 @@ run_external_diagnostics() {
 }
 
 run_self_check() {
-  local failed=0
+  local failed=0 opposite_rc=0
 
   section "本地状态自检"
   if [ "$WARP_MODE" = "wireguard" ]; then
@@ -2062,12 +2100,13 @@ run_self_check() {
       failed=1
     fi
 
-    if socks_table_absent; then
-      ok_line "未发现旧 Socks5 nftables 分流规则"
-    else
-      fail_line "旧 Socks5 nftables 分流规则仍在生效，或状态无法读取"
-      failed=1
-    fi
+    opposite_rc=0
+    socks_table_absent || opposite_rc=$?
+    case "$opposite_rc" in
+      0) ok_line "未发现旧 Socks5 nftables 分流规则" ;;
+      1) fail_line "旧 Socks5 nftables 分流规则仍在生效"; failed=1 ;;
+      *) warn_line "暂时无法读取旧 Socks5 nftables 状态；当前 WireGuard 检查继续" ;;
+    esac
 
     section "结论"
     if [ "$failed" -eq 0 ]; then
@@ -2136,12 +2175,13 @@ run_self_check() {
     failed=1
   fi
 
-  if socks_wireguard_routes_absent; then
-    ok_line "未发现旧 WireGuard Google 路由或默认路由接管"
-  else
-    fail_line "旧 WireGuard Google 路由、默认路由仍在生效，或无法读取本地路由状态"
-    failed=1
-  fi
+  opposite_rc=0
+  socks_wireguard_routes_absent || opposite_rc=$?
+  case "$opposite_rc" in
+    0) ok_line "未发现旧 WireGuard Google 路由或默认路由接管" ;;
+    1) fail_line "旧 WireGuard Google 路由或默认路由仍在生效"; failed=1 ;;
+    *) warn_line "暂时无法读取旧 WireGuard 路由状态；当前 Socks5 检查继续" ;;
+  esac
 
   section "结论"
   if [ "$failed" -eq 0 ]; then
@@ -2453,8 +2493,11 @@ cmd_update() {
   begin_runtime_maintenance || die "更新后运行态重新加载失败，且无法暂停健康检查以恢复旧版本"
   systemctl stop warp-vps.service >/dev/null 2>&1 || true
   "$BIN_PATH" stop-rules >/dev/null 2>&1 || true
-  if [ "$WARP_MODE" = "wireguard" ] && ! stop_wg_routes_strict; then
-    die "更新后运行态重新加载失败，且无法清除新版 WireGuard 路由；未恢复旧文件"
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    systemctl stop "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
+    if ! remove_wireguard_interface; then
+      die "更新后运行态重新加载失败，且无法停止新版 WireGuard 网卡；未恢复旧文件"
+    fi
   fi
   restore_update_backup "$backup" || die "更新后运行态重新加载失败，且无法恢复旧文件"
   if reload_runtime_after_update; then
@@ -2469,6 +2512,7 @@ cmd_heal() {
   load_config
   local repair_rules=0
   local repair_redsocks=0
+  local opposite_rc=0
   if required_runtime_units_ready && test_quiet; then
     log "健康检查正常"
     return 0
@@ -2477,9 +2521,11 @@ cmd_heal() {
   if [ "$WARP_MODE" = "wireguard" ]; then
     systemctl enable "wg-quick@${WG_IFACE}.service" warp-vps.service >/dev/null \
       || die "无法启用 WireGuard 项目服务"
-    if ! socks_table_absent; then
-      repair_rules=1
-    fi
+    socks_table_absent || opposite_rc=$?
+    case "$opposite_rc" in
+      1) repair_rules=1 ;;
+      2) warn "暂时无法读取旧 Socks5 nftables 状态，本次不据此修改规则" ;;
+    esac
     if ! service_active "wg-quick@${WG_IFACE}.service" || ! wg_interface_is_wireguard; then
       restart_wireguard_runtime || true
     fi
@@ -2496,9 +2542,12 @@ cmd_heal() {
     fi
     return 0
   fi
-  if ! socks_wireguard_routes_absent; then
-    clear_socks_wireguard_routes || true
-  fi
+  opposite_rc=0
+  socks_wireguard_routes_absent || opposite_rc=$?
+  case "$opposite_rc" in
+    1) clear_socks_wireguard_routes || true ;;
+    2) warn "暂时无法读取旧 WireGuard 路由状态，本次不据此修改路由" ;;
+  esac
   systemctl enable warp-svc.service warp-vps-redsocks.service warp-vps.service >/dev/null \
     || die "无法启用 Socks5 项目服务"
   if ! warp_proxy_local_ready; then
@@ -3057,7 +3106,8 @@ cmd_uninstall() {
   remove_tree_if_exists "$APP_DIR"
   remove_tree_if_exists "$STATE_DIR"
   remove_file_if_exists "$BIN_PATH"
-  systemctl daemon-reload || die "systemd 重新加载失败；分流已停止，请检查残留文件"
+  systemctl daemon-reload \
+    || warn "项目文件已删除，但 systemd 重新加载失败；请稍后执行 systemctl daemon-reload"
   printf 'WARP VPS Manager 已卸载，项目文件已永久删除。\n'
   if [ "$UNINSTALL_REMOVE_DEPENDENCIES" -eq 1 ]; then
     printf 'Cloudflare WARP、redsocks 和 wireguard-tools 等专用运行依赖已卸载。\n'

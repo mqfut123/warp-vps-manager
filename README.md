@@ -14,7 +14,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh)
 ```
 
-全新安装默认选择 **Google 精准分流 + WireGuard + 1G Swap**。安装器会先处理 Swap，随后选择路由范围和运行模式；路由范围直接回车即保持默认的 Google 精准分流。检测到已有项目安装时，再运行同一命令会进入管理菜单。
+全新安装默认选择 **Google 精准分流 + WireGuard + 1G Swap**。v1.1.3 将路由范围和运行模式分开选择：安装器先处理 Swap，再选择 Google 精准分流或全局 WARP，最后选择 WireGuard 或 Socks5；路由范围输入 `1` 或直接回车即使用默认的 Google 精准分流，输入 `2` 使用全局 WARP。检测到已有项目安装时，再运行同一命令会进入管理菜单。
 
 ## 和其他方案对比
 
@@ -29,6 +29,8 @@ WARP VPS Manager 默认使用 Google 官方公网 IP 列表，并排除 Google C
 | 全局 WARP | 整台 VPS 的流量统一更换出口 | 所有业务都需要使用 WARP |
 
 ## 两种路由范围
+
+v1.1.3 的 Google 精准分流和全局 WARP 都可以搭配 WireGuard 或 Socks5，切换路由范围不需要重新选择另一套管理工具。
 
 - **精准分流 Google（默认）**：网站、面板、API 和其他业务继续使用 VPS 原生 IP。
 - **全局走 WARP**：WireGuard 接管公网 IPv4、IPv6 与全部协议；Socks5 接管 VPS 主动发起的公网 IPv4 TCP。
@@ -47,15 +49,18 @@ WireGuard 全局模式让公网 IPv4、IPv6、TCP、UDP 和 QUIC 全部走 WARP�
 
 Socks5 会让支持回落的客户端从 QUIC 改用经 WARP 转发的 TCP；其他 Google IPv4 UDP 端口和非 Google 目标 UDP 不受影响。
 
-## 支持环境
+## 运行条件
 
 - 使用 `systemd` 的 Linux VPS
-- Debian、Ubuntu 及其他 APT 系统
-- Fedora、CentOS、RHEL、Rocky Linux、AlmaLinux 及其他 DNF/YUM 系统
+- 使用 APT、DNF 或 YUM，并能从当前配置的软件源取得所选模式的依赖
 - WireGuard 模式需要系统能够通过 `wg-quick` 创建项目网卡；全局范围同时需要 nftables
 - Socks5 模式需要 nftables `OUTPUT` NAT，并且系统与架构有可用的 Cloudflare WARP 软件包
 
 安装器按系统实际提供的包管理器和网络能力选择安装路径，不依赖固定发行版版本表。
+
+全新安装会准备所选模式需要的依赖；已有依赖满足当前模式时直接复用，只有缺少依赖时才调用 APT、DNF 或 YUM。系统组件使用当前发行版仓库的候选版本，Cloudflare WARP 使用 Cloudflare 官方仓库的候选版本，不会顺带升级其他已安装系统软件。
+
+WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`。下载的官方二进制通过对应架构的官方 `checksums.txt` 校验后才会启用。
 
 ## 管理命令
 
@@ -67,7 +72,7 @@ Socks5 会让支持回落的客户端从 QUIC 改用经 WARP 转发的 TCP；其
 | `warp-vps test` | 运行分流与外部连通性诊断 |
 | `warp-vps unlock-check` | 检测 Gemini 和 YouTube Premium |
 | `warp-vps restart` | 重启 WARP 分流链路 |
-| `warp-vps update` | 更新程序与 Google IP 规则；旧版规则差异不会阻止更新 |
+| `warp-vps update` | 更新程序与 Google IP 规则；不安装或升级运行依赖，旧版规则差异不会阻止更新 |
 | `warp-vps reinstall --scope global` | 保持运行模式并切换到全局 WARP |
 | `warp-vps reinstall --scope google` | 保持运行模式并切回 Google 精准分流 |
 | `warp-vps switch wireguard` | 切换到 WireGuard |
@@ -88,6 +93,6 @@ Socks5 会让支持回落的客户端从 QUIC 改用经 WARP 转发的 TCP；其
 
 ## IP 规则来源
 
-规则来自 Google 官方的 [公网 IP 列表](https://www.gstatic.com/ipranges/goog.json)，并排除 [Google Cloud 客户外部 IP](https://www.gstatic.com/ipranges/cloud.json)。运行 `warp-vps update` 即可获取项目发布的最新规则。
+规则来自 Google 官方的 [公网 IP 列表](https://www.gstatic.com/ipranges/goog.json)，并排除 [Google Cloud 客户外部 IP](https://www.gstatic.com/ipranges/cloud.json)。维护者生成并审核固定快照后随项目发布；运行 `warp-vps update` 即可获取已发布的最新规则，不会在 VPS 上直接采用尚未审核的 Google 实时列表。
 
 本项目使用 [MIT License](LICENSE)。

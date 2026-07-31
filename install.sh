@@ -14,7 +14,6 @@ NFT_CONF="${ETC_DIR}/nftables.conf"
 REDSOCKS_USER="warp-vps-redsocks"
 WG_IFACE="warp-vps-wg"
 WGCF_BIN="${APP_DIR}/bin/wgcf"
-WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
 WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
 SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
@@ -381,12 +380,64 @@ apply_swap_choice() {
   done
 }
 
+refresh_cloudflare_apt_repo() {
+  local codename arch
+  install -d -m 0755 /usr/share/keyrings || return 1
+  curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+    https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
+    || return 1
+
+  codename="$OS_CODENAME"
+  if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
+    codename="$(lsb_release -cs)"
+  fi
+  [ -n "$codename" ] || return 1
+
+  arch="$(dpkg --print-architecture)" || return 1
+  cat > /etc/apt/sources.list.d/cloudflare-client.list <<EOF
+deb [arch=${arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
+EOF
+}
+
+prepare_existing_cloudflare_apt_repo() {
+  local repo_file="${1:-/etc/apt/sources.list.d/cloudflare-client.list}"
+  local disabled_file="${repo_file}.warp-vps-disabled.$$"
+  [ -e "$repo_file" ] || return 1
+  if command -v curl >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
+    refresh_cloudflare_apt_repo || die "Cloudflare WARP APT 公钥或软件源刷新失败"
+    return 0
+  fi
+
+  mv "$repo_file" "$disabled_file" \
+    || die "无法临时停用旧 Cloudflare WARP APT 软件源"
+  if ! apt_get update -y \
+    || ! apt_get install -y curl ca-certificates gnupg; then
+    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
+    die "无法安装刷新 Cloudflare WARP APT 软件源所需的基础工具"
+  fi
+  if ! refresh_cloudflare_apt_repo; then
+    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
+    die "Cloudflare WARP APT 公钥或软件源刷新失败"
+  fi
+  rm -f "$disabled_file" || true
+}
+
 pkg_install_apt() {
   local mode="$1"
   local scope="${2:-google}"
-  local install_rc
+  local repo_file="${3:-/etc/apt/sources.list.d/cloudflare-client.list}"
+  local install_rc cloudflare_repo_ready=0
   export DEBIAN_FRONTEND=noninteractive
   log "如果系统自动更新正在占用 apt/dpkg，最多等待 20 分钟"
+  if [ -e "$repo_file" ]; then
+    prepare_existing_cloudflare_apt_repo "$repo_file"
+    cloudflare_repo_ready=1
+  elif [ "$mode" = "socks" ] && ! warp_client_complete \
+    && command -v curl >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
+    refresh_cloudflare_apt_repo || die "Cloudflare WARP APT 公钥或软件源刷新失败"
+    cloudflare_repo_ready=1
+  fi
   apt_get update -y
 
   if [ "$mode" = "wireguard" ]; then
@@ -409,22 +460,9 @@ pkg_install_apt() {
     return
   fi
 
-  install -d -m 0755 /usr/share/keyrings
-  curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
-    https://pkg.cloudflareclient.com/pubkey.gpg \
-    | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-
-  local codename="$OS_CODENAME"
-  if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
-    codename="$(lsb_release -cs)"
+  if [ "$cloudflare_repo_ready" -eq 0 ]; then
+    refresh_cloudflare_apt_repo || die "Cloudflare WARP APT 公钥或软件源刷新失败"
   fi
-  [ -n "$codename" ] || die "无法识别当前系统代号，不能配置 Cloudflare WARP 软件源"
-
-  local arch
-  arch="$(dpkg --print-architecture)"
-  cat > /etc/apt/sources.list.d/cloudflare-client.list <<EOF
-deb [arch=${arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
-EOF
   apt_get update -y
   apt_get install -y --reinstall cloudflare-warp
 }
@@ -539,11 +577,42 @@ rpm_install_redsocks() {
   build_redsocks_from_source
 }
 
+refresh_cloudflare_rpm_repo() {
+  local key_file key_tmp repo_file repo_tmp
+  key_file="${STATE_DIR}/cloudflare-warp-pubkey.gpg"
+  key_tmp="${key_file}.new"
+  repo_file=/etc/yum.repos.d/cloudflare-warp.repo
+  repo_tmp="${repo_file}.new"
+  install -d -m 0755 "$STATE_DIR" /etc/yum.repos.d
+  curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+    https://pkg.cloudflareclient.com/pubkey.gpg \
+    -o "$key_tmp" \
+    || die "Cloudflare WARP RPM 公钥下载失败"
+  rpm --import "$key_tmp" || die "Cloudflare WARP RPM 公钥导入失败"
+  chmod 0644 "$key_tmp"
+  mv "$key_tmp" "$key_file" || die "无法保存 Cloudflare WARP RPM 公钥"
+  curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
+    https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
+    -o "$repo_tmp" \
+    || die "Cloudflare WARP RPM 软件源下载失败"
+  chmod 0644 "$repo_tmp"
+  mv "$repo_tmp" "$repo_file" || die "无法启用 Cloudflare WARP RPM 软件源"
+}
+
 pkg_install_rpm() {
   local mode="$1"
   local manager="$2"
   local scope="${3:-google}"
-  local key_file key_tmp repo_file repo_tmp
+  local repo_file="${4:-/etc/yum.repos.d/cloudflare-warp.repo}"
+  local cloudflare_repo_ready=0 cloudflare_metadata_ready=0
+  if [ -e "$repo_file" ] \
+    && command -v curl >/dev/null 2>&1 \
+    && command -v rpm >/dev/null 2>&1; then
+    refresh_cloudflare_rpm_repo
+    cloudflare_repo_ready=1
+    "$manager" clean metadata || die "无法刷新 RPM 软件源元数据"
+    cloudflare_metadata_ready=1
+  fi
   if [ "$mode" = "wireguard" ]; then
     if [ "$scope" = "global" ]; then
       "$manager" install -y curl ca-certificates coreutils nftables iproute python3 wireguard-tools
@@ -553,32 +622,35 @@ pkg_install_rpm() {
     return
   fi
 
+  if [ "$cloudflare_repo_ready" -eq 0 ] && ! warp_client_complete \
+    && command -v curl >/dev/null 2>&1 \
+    && command -v rpm >/dev/null 2>&1; then
+    refresh_cloudflare_rpm_repo
+    cloudflare_repo_ready=1
+    "$manager" clean metadata || die "无法刷新 RPM 软件源元数据"
+    cloudflare_metadata_ready=1
+  fi
   if [ "$OS_ID" != "fedora" ]; then
     enable_rhel_extra_repos
   fi
   "$manager" install -y curl ca-certificates coreutils nftables iproute python3
   rpm_install_redsocks "$manager"
   if ! warp_client_complete; then
-    key_file="${STATE_DIR}/cloudflare-warp-pubkey.gpg"
-    key_tmp="${key_file}.new"
-    repo_file=/etc/yum.repos.d/cloudflare-warp.repo
-    repo_tmp="${repo_file}.new"
-    install -d -m 0755 "$STATE_DIR" /etc/yum.repos.d
-    curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
-      https://pkg.cloudflareclient.com/pubkey.gpg \
-      -o "$key_tmp" \
-      || die "Cloudflare WARP RPM 公钥下载失败"
-    rpm --import "$key_tmp" || die "Cloudflare WARP RPM 公钥导入失败"
-    chmod 0644 "$key_tmp"
-    mv "$key_tmp" "$key_file" || die "无法保存 Cloudflare WARP RPM 公钥"
-    curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
-      https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
-      -o "$repo_tmp" \
-      || die "Cloudflare WARP RPM 软件源下载失败"
-    chmod 0644 "$repo_tmp"
-    mv "$repo_tmp" "$repo_file" || die "无法启用 Cloudflare WARP RPM 软件源"
+    if [ "$cloudflare_repo_ready" -eq 0 ]; then
+      refresh_cloudflare_rpm_repo
+    fi
+    if [ "$cloudflare_metadata_ready" -eq 0 ]; then
+      "$manager" clean metadata || die "无法刷新 RPM 软件源元数据"
+    fi
     if rpm -q cloudflare-warp >/dev/null 2>&1; then
-      "$manager" reinstall -y cloudflare-warp
+      if [ "$manager" = "dnf" ]; then
+        "$manager" upgrade -y --best cloudflare-warp
+      else
+        "$manager" update -y cloudflare-warp
+      fi
+      if ! warp_client_complete; then
+        "$manager" reinstall -y cloudflare-warp
+      fi
     else
       "$manager" install -y cloudflare-warp
     fi
@@ -613,6 +685,7 @@ install_dependencies() {
   if [ "$mode" = "wireguard" ]; then
     command -v wg >/dev/null 2>&1 || die "依赖安装后仍找不到 wg"
     command -v wg-quick >/dev/null 2>&1 || die "依赖安装后仍找不到 wg-quick"
+    command -v sha256sum >/dev/null 2>&1 || die "依赖安装后仍找不到 sha256sum"
     unit_file_exists 'wg-quick@.service' || die "wireguard-tools 已安装但找不到 wg-quick@.service"
     if [ "$scope" = "global" ]; then
       command -v nft >/dev/null 2>&1 || die "WireGuard 全局模式依赖安装后仍找不到 nftables"
@@ -637,6 +710,7 @@ mode_dependencies_complete() {
     wireguard)
       command -v wg >/dev/null 2>&1 \
         && command -v wg-quick >/dev/null 2>&1 \
+        && command -v sha256sum >/dev/null 2>&1 \
         && unit_file_exists 'wg-quick@.service' \
         && { [ "$scope" != "global" ] || command -v nft >/dev/null 2>&1; }
       ;;
@@ -1124,10 +1198,19 @@ PY
 validate_existing_config() {
   [ -e "$CONFIG_FILE" ] || return 0
   [ -r "$CONFIG_FILE" ] || die "现有配置无法读取，未修改当前运行态：$CONFIG_FILE"
-  WARP_VPS_CONFIG_FILE="$CONFIG_FILE" \
-    WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
-    bash -c '. "$1"; load_config' _ "$PROJECT_STAGE_DIR/bin/warp-vps" \
-    || die "现有配置损坏，未修改当前运行态：$CONFIG_FILE"
+  local line mode="" iface="warp-vps-wg" config="/etc/wireguard/warp-vps-wg.conf"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      WARP_MODE=*) mode="${line#*=}" ;;
+      WG_IFACE=*) iface="${line#*=}" ;;
+      WG_CONFIG=*) config="${line#*=}" ;;
+    esac
+  done < "$CONFIG_FILE"
+  [ "$mode" = "wireguard" ] || return 0
+  valid_runtime_iface "$iface" \
+    || die "现有 WireGuard 网卡名无效，未修改当前运行态：$iface"
+  valid_runtime_path "$config" \
+    || die "现有 WireGuard 配置路径无效，未修改当前运行态：$config"
 }
 
 stage_project_files() {
@@ -1149,7 +1232,7 @@ backup_project_files() {
   PROJECT_BACKUP_DIR="${STATE_DIR}/install-rollback/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   install -d -m 0755 "$PROJECT_BACKUP_DIR/app/bin" "$PROJECT_BACKUP_DIR/app/rules" \
     "$PROJECT_BACKUP_DIR/etc" "$PROJECT_BACKUP_DIR/systemd" \
-    "$PROJECT_BACKUP_DIR/state/wgcf" "$PROJECT_BACKUP_DIR/missing" || return 1
+    "$PROJECT_BACKUP_DIR/missing" || return 1
   backup_project_file "${APP_DIR}/install.sh" "$PROJECT_BACKUP_DIR/app/install.sh" app-install 0755 || return 1
   backup_project_file "${APP_DIR}/bin/warp-vps" "$PROJECT_BACKUP_DIR/app/bin/warp-vps" app-manager 0755 || return 1
   backup_project_file "$WGCF_BIN" "$PROJECT_BACKUP_DIR/app/bin/wgcf" wgcf-binary 0755 || return 1
@@ -1159,7 +1242,6 @@ backup_project_files() {
   backup_project_file "$BIN_PATH" "$PROJECT_BACKUP_DIR/warp-vps" command 0755 || return 1
   backup_project_file "$CONFIG_FILE" "$PROJECT_BACKUP_DIR/config.env" config 0600 || return 1
   backup_project_file "$WG_CONFIG" "$PROJECT_BACKUP_DIR/wireguard.conf" wireguard-config 0600 || return 1
-  backup_project_file "$WGCF_ACCOUNT" "$PROJECT_BACKUP_DIR/state/wgcf/wgcf-account.toml" wgcf-account 0600 || return 1
   backup_project_file "$REDSOCKS_CONF" "$PROJECT_BACKUP_DIR/etc/redsocks.conf" redsocks-config 0644 || return 1
   backup_project_file "$NFT_CONF" "$PROJECT_BACKUP_DIR/etc/nftables.conf" nftables-config 0644 || return 1
   backup_project_file /etc/systemd/system/warp-vps-redsocks.service \
@@ -1207,7 +1289,6 @@ restore_project_files() {
   restore_project_file "$BIN_PATH" "$PROJECT_BACKUP_DIR/warp-vps" command 0755 || return 1
   restore_project_file "$CONFIG_FILE" "$PROJECT_BACKUP_DIR/config.env" config 0600 || return 1
   restore_project_file "$WG_CONFIG" "$PROJECT_BACKUP_DIR/wireguard.conf" wireguard-config 0600 || return 1
-  restore_project_file "$WGCF_ACCOUNT" "$PROJECT_BACKUP_DIR/state/wgcf/wgcf-account.toml" wgcf-account 0600 || return 1
   restore_project_file "$REDSOCKS_CONF" "$PROJECT_BACKUP_DIR/etc/redsocks.conf" redsocks-config 0644 || return 1
   restore_project_file "$NFT_CONF" "$PROJECT_BACKUP_DIR/etc/nftables.conf" nftables-config 0644 || return 1
   restore_project_file /etc/systemd/system/warp-vps-redsocks.service \
@@ -1414,7 +1495,7 @@ current_backend_reusable() {
     project_unit_active "wg-quick@${PREVIOUS_WG_IFACE}.service" || service_rc=$?
     project_wg_interface_present "$PREVIOUS_WG_IFACE" || interface_rc=$?
     if [ "$service_rc" -eq 2 ] || [ "$interface_rc" -eq 2 ]; then
-      die "无法确认当前 WireGuard 本地运行态；未执行重装"
+      return 1
     fi
     if [ "$service_rc" -eq 0 ] && [ "$interface_rc" -eq 0 ]; then
       wg show "$PREVIOUS_WG_IFACE" >/dev/null 2>&1 || return 1
@@ -1606,9 +1687,9 @@ restore_previous_runtime() {
       return 0
     fi
     cleanup_prepared_target "$TARGET_MODE" || failed=1
-    restore_prepared_target_files || return 1
+    restore_prepared_target_files || failed=1
     restore_health_automation \
-      || log "自动健康检查未能恢复；旧分流运行态未受影响"
+      || { log "自动健康检查未能恢复；旧分流运行态未受影响"; failed=1; }
     [ "$failed" -eq 0 ]
     return
   fi
@@ -1619,8 +1700,9 @@ restore_previous_runtime() {
     else
       stop_project_runtime "$WG_IFACE" "$WG_CONFIG" || failed=1
     fi
+  else
+    cleanup_prepared_target "$TARGET_MODE" || failed=1
   fi
-  cleanup_prepared_target "$TARGET_MODE" || failed=1
   restore_project_files || return 1
   systemctl daemon-reload >/dev/null 2>&1 || failed=1
 
@@ -1646,6 +1728,7 @@ cleanup_prepared_target() {
         WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
         "$PROJECT_STAGE_DIR/bin/warp-vps" stop-rules >/dev/null 2>&1 || true
     fi
+    interface_rc=0
     project_wg_interface_present "$WG_IFACE" || interface_rc=$?
     [ "$interface_rc" -ne 2 ] || return 1
     if [ "$interface_rc" -eq 0 ]; then
@@ -1654,6 +1737,7 @@ cleanup_prepared_target() {
           || wg-quick down "$WG_IFACE" >/dev/null 2>&1 \
           || true
       fi
+      interface_rc=0
       project_wg_interface_present "$WG_IFACE" || interface_rc=$?
       if [ "$interface_rc" -eq 0 ]; then
         ip link delete dev "$WG_IFACE" >/dev/null 2>&1 || failed=1
@@ -1661,7 +1745,7 @@ cleanup_prepared_target() {
         failed=1
       fi
     fi
-    interface_rc=1
+    interface_rc=0
     project_wg_interface_present "$WG_IFACE" || interface_rc=$?
     [ "$interface_rc" -eq 1 ] || failed=1
   elif [ "$selected_mode" = "socks" ] && [ "$PREVIOUS_MODE" != "socks" ] \
@@ -1679,7 +1763,6 @@ restore_prepared_target_files() {
   install -d -m 0755 "$PROJECT_BACKUP_DIR/failed-new" || return 1
   [ "$TARGET_MODE" = "wireguard" ] || return 0
   restore_project_file "$WG_CONFIG" "$PROJECT_BACKUP_DIR/wireguard.conf" wireguard-config 0600 || return 1
-  restore_project_file "$WGCF_ACCOUNT" "$PROJECT_BACKUP_DIR/state/wgcf/wgcf-account.toml" wgcf-account 0600 || return 1
   restore_project_file "$WGCF_BIN" "$PROJECT_BACKUP_DIR/app/bin/wgcf" wgcf-binary 0755 || return 1
 }
 
