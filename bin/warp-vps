@@ -1258,7 +1258,9 @@ stop_rules_for_uninstall() {
   elif [ "${WARP_MODE:-socks}" = "socks" ] || [ "${WARP_SCOPE:-google}" = "global" ]; then
     die "找不到 nft 命令，无法确认本项目分流规则已经失效"
   fi
-  if command -v ip >/dev/null 2>&1 && ! wg_global_routes_absent; then
+  if [ "${WARP_SCOPE:-google}" = "global" ] \
+    && command -v ip >/dev/null 2>&1 \
+    && ! wg_global_routes_absent; then
     die "本项目 WireGuard 全局路由仍在生效，卸载已中止"
   fi
 }

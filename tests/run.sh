@@ -4940,6 +4940,37 @@ test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path() {
     'uninstall must stop each backend independently'
 }
 
+test_uninstall_precise_wireguard_does_not_require_nft() {
+  source_without_main "$MANAGER_SCRIPT"
+  local route_stops=0 global_checks=0
+  WARP_MODE=wireguard
+  WARP_SCOPE=google
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      ip) return 0 ;;
+      nft) return 1 ;;
+      *) builtin command "$@" ;;
+    esac
+  }
+  stop_wg_routes() { route_stops=$((route_stops + 1)); }
+  wg_global_routes_absent() {
+    global_checks=$((global_checks + 1))
+    return 2
+  }
+
+  stop_rules_for_uninstall || {
+    fail 'precise WireGuard uninstall must not require the optional nft command'
+    return 1
+  }
+  assert_eq '1' "$route_stops" \
+    'precise WireGuard uninstall must still remove its owned routes' || return 1
+  assert_eq '0' "$global_checks" \
+    'precise WireGuard uninstall must not query unrelated global nft state' || return 1
+  unset -f command
+}
+
 test_uninstall_quiesces_health_before_backends() {
   source_without_main "$MANAGER_SCRIPT"
   WG_IFACE=warp-vps-wg
@@ -7375,6 +7406,7 @@ run_test 'Socks heal waits for redsocks before routing' test_socks_heal_waits_fo
 run_test 'auxiliary timer drift does not touch healthy backends' test_heal_ignores_auxiliary_timer_drift
 run_test 'health timer failure does not block the data plane' test_health_timer_failure_does_not_block_data_plane
 run_test 'uninstall clears both rule backends and keeps custom WireGuard paths' test_uninstall_cleans_both_rule_backends_and_keeps_custom_wg_path
+run_test 'precise WireGuard uninstall does not require nftables' test_uninstall_precise_wireguard_does_not_require_nft
 run_test 'uninstall quiesces health before backend teardown' test_uninstall_quiesces_health_before_backends
 run_test 'uninstall scopes are explicit and VNC safe' test_uninstall_scope_is_explicit_and_vnc_safe
 run_test 'uninstall deactivation reaches inactive state' test_uninstall_deactivation_reaches_inactive_state
