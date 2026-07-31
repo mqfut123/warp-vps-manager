@@ -1680,6 +1680,90 @@ test_wireguard_uses_runtime_capability() {
     'WireGuard must keep the real interface preflight'
 }
 
+test_wgcf_fixed_binary_replaces_old_copy_atomically() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root request_log output rc=0 download_target
+  root="$(mktemp -d)"
+  request_log="$root/requests"
+  DEFAULT_WGCF_BIN="$root/bin/wgcf"
+  WGCF_BIN="$DEFAULT_WGCF_BIN"
+  uname() { printf 'x86_64\n'; }
+  mkdir -p "$(dirname "$WGCF_BIN")"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "wgcf v2.2.31\\n"' \
+    > "$WGCF_BIN"
+  chmod 0755 "$WGCF_BIN"
+  : > "$request_log"
+
+  curl() {
+    local destination='' url='' arg
+    while [ "$#" -gt 0 ]; do
+      arg="$1"
+      shift
+      case "$arg" in
+        -o)
+          destination="$1"
+          shift
+          ;;
+        https://*) url="$arg" ;;
+      esac
+    done
+    printf '%s\t%s\n' "$url" "$destination" >> "$request_log"
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'printf "wgcf v2.2.32\\n"' \
+      > "$destination"
+    [ "${WGCF_TEST_CURL_FAIL:-0}" -eq 0 ]
+  }
+
+  WGCF_TEST_CURL_FAIL=1
+  output="$(install_wgcf_binary 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'a failed fixed-version download must fail setup' || return 1
+  assert_eq 'wgcf v2.2.31' "$("$WGCF_BIN" --version)" \
+    'a partial download must not replace the existing executable' || return 1
+
+  WGCF_TEST_CURL_FAIL=0
+  install_wgcf_binary >/dev/null || {
+    fail 'the fixed wgcf version should replace an executable old copy'
+    return 1
+  }
+  assert_eq 'wgcf v2.2.32' "$("$WGCF_BIN" --version)" \
+    'the live wgcf binary must become the pinned fixed version' || return 1
+  assert_contains "$(< "$request_log")" \
+    '/v2.2.32/wgcf_2.2.32_linux_amd64' \
+    'wgcf downloads must use the fixed release and matching asset name' || return 1
+  download_target="$(awk -F '\t' 'END { print $2 }' "$request_log")"
+  [ "$download_target" != "$WGCF_BIN" ] || {
+    fail 'wgcf must download beside the live path before atomic activation'
+    return 1
+  }
+  case "$download_target" in
+    "$(dirname "$WGCF_BIN")"/*) ;;
+    *)
+      fail 'wgcf must stage on the same filesystem as the live binary'
+      return 1
+      ;;
+  esac
+
+  WGCF_BIN="$root/custom/wgcf"
+  mkdir -p "$(dirname "$WGCF_BIN")"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "custom wgcf\\n"' \
+    > "$WGCF_BIN"
+  chmod 0755 "$WGCF_BIN"
+  : > "$request_log"
+  install_wgcf_binary || {
+    fail 'an executable custom wgcf path should remain reusable'
+    return 1
+  }
+  assert_eq 'custom wgcf' "$("$WGCF_BIN" --version)" \
+    'a custom wgcf binary must not be replaced by the project pin' || return 1
+  assert_eq '' "$(< "$request_log")" \
+    'a reusable custom wgcf binary must not trigger a project download'
+}
+
 test_wireguard_config_generation_is_retryable() {
   local body root event output wg_config_valid_definition
   body="$(function_body "$MANAGER_SCRIPT" generate_wg_config)"
@@ -5968,6 +6052,79 @@ test_active_wireguard_invalid_config_keeps_live_backend() {
   fi
 }
 
+test_untouched_wireguard_preparation_restores_files_without_runtime_cleanup() {
+  source_without_main "$INSTALL_SCRIPT"
+  local events=''
+  TARGET_MODE=wireguard
+  TARGET_PREP_STARTED=1
+  INSTALL_RUNTIME_TOUCHED=0
+  INSTALL_FILES_ACTIVATED=0
+  PROJECT_STAGE_DIR=/staged-but-not-live
+
+  systemctl() {
+    events="${events}runtime-systemctl:$*"$'\n'
+    return 1
+  }
+  project_wg_interface_present() {
+    events="${events}runtime-interface-probe"$'\n'
+    return 2
+  }
+  restore_prepared_target_files() {
+    events="${events}restore-prepared-files"$'\n'
+  }
+  restore_health_automation() {
+    events="${events}restore-health"$'\n'
+  }
+
+  restore_previous_runtime || {
+    fail 'a WireGuard setup failure before runtime mutation must preserve the old runtime'
+    return 1
+  }
+  assert_contains "$events" 'restore-prepared-files' \
+    'pre-runtime WireGuard artifacts must still be restored' || return 1
+  assert_contains "$events" 'restore-health' \
+    'the paused health timer must be restored after target preparation fails' || return 1
+  assert_not_contains "$events" 'runtime-systemctl:' \
+    'pre-runtime WireGuard failure must not stop a target service that never started' || return 1
+  assert_not_contains "$events" 'runtime-interface-probe' \
+    'pre-runtime WireGuard failure must not probe an interface that was never created'
+}
+
+test_touched_wireguard_rollback_still_runs_runtime_cleanup() {
+  source_without_main "$INSTALL_SCRIPT"
+  local events=''
+  TARGET_MODE=wireguard
+  TARGET_PREP_STARTED=1
+  INSTALL_RUNTIME_TOUCHED=1
+  INSTALL_FILES_ACTIVATED=0
+  PROJECT_BACKUP_DIR=/rollback-fixture-does-not-exist
+
+  cleanup_prepared_target() {
+    events="${events}cleanup-target-runtime"$'\n'
+    return 1
+  }
+  restore_project_files() {
+    events="${events}restore-project-files"$'\n'
+  }
+  systemctl() {
+    events="${events}systemctl:$*"$'\n'
+  }
+  restore_health_automation() {
+    events="${events}restore-health"$'\n'
+  }
+
+  if restore_previous_runtime; then
+    fail 'a real target-runtime cleanup failure must remain visible to rollback'
+    return 1
+  fi
+  assert_contains "$events" 'cleanup-target-runtime' \
+    'rollback must clean WireGuard runtime after the transition touched it' || return 1
+  assert_contains "$events" 'restore-project-files' \
+    'runtime rollback must still restore the previous project files' || return 1
+  assert_contains "$events" 'systemctl:daemon-reload' \
+    'runtime rollback must reload the restored service files'
+}
+
 test_target_preparation_failure_keeps_old_runtime_running() {
   source_without_main "$INSTALL_SCRIPT"
   require_root() { :; }
@@ -6332,15 +6489,15 @@ test_wgcf_mips_and_s390x_asset_mapping() {
   uname() { printf '%s\n' "$test_arch"; }
 
   test_arch=mips
-  assert_eq 'wgcf_2.2.31_linux_mips_softfloat' "$(wgcf_asset_spec)" 'mips wgcf asset' || return 1
+  assert_eq 'wgcf_2.2.32_linux_mips_softfloat' "$(wgcf_asset_spec)" 'mips wgcf asset' || return 1
   test_arch=mipsel
-  assert_eq 'wgcf_2.2.31_linux_mipsle_softfloat' "$(wgcf_asset_spec)" 'mipsel wgcf asset' || return 1
+  assert_eq 'wgcf_2.2.32_linux_mipsle_softfloat' "$(wgcf_asset_spec)" 'mipsel wgcf asset' || return 1
   test_arch=mips64
-  assert_eq 'wgcf_2.2.31_linux_mips64_softfloat' "$(wgcf_asset_spec)" 'mips64 wgcf asset' || return 1
+  assert_eq 'wgcf_2.2.32_linux_mips64_softfloat' "$(wgcf_asset_spec)" 'mips64 wgcf asset' || return 1
   test_arch=mips64el
-  assert_eq 'wgcf_2.2.31_linux_mips64le_softfloat' "$(wgcf_asset_spec)" 'mips64el wgcf asset' || return 1
+  assert_eq 'wgcf_2.2.32_linux_mips64le_softfloat' "$(wgcf_asset_spec)" 'mips64el wgcf asset' || return 1
   test_arch=s390x
-  assert_eq 'wgcf_2.2.31_linux_s390x' "$(wgcf_asset_spec)" 's390x wgcf asset'
+  assert_eq 'wgcf_2.2.32_linux_s390x' "$(wgcf_asset_spec)" 's390x wgcf asset'
 }
 
 test_main_is_the_single_public_update_source() {
@@ -6478,6 +6635,7 @@ run_test 'WARP reuse requires both CLI and service unit' test_warp_client_reuse_
 run_test 'RPM redsocks uses the Fedora package or source build path' test_rpm_redsocks_uses_fedora_package_or_source
 run_test 'iptables CLI is not an installation dependency' test_no_iptables_package_dependency
 run_test 'WireGuard support uses a real runtime preflight' test_wireguard_uses_runtime_capability
+run_test 'wgcf fixed release atomically replaces old executables' test_wgcf_fixed_binary_replaces_old_copy_atomically
 run_test 'WireGuard generation recovers from partial state' test_wireguard_config_generation_is_retryable
 run_test 'WireGuard route failures clean partial state' test_wireguard_route_failures_cleanup
 run_test 'WireGuard routes do not require native IPv6' test_wireguard_routes_work_without_native_ipv6
@@ -6564,6 +6722,8 @@ run_test 'healthy reinstall reuses its backend without external setup' test_rein
 run_test 'WireGuard reuse requires a real kernel device' test_wireguard_reuse_requires_real_kernel_device
 run_test 'WireGuard target preflight waits for old Socks teardown' test_wireguard_target_preflight_waits_for_old_socks_teardown
 run_test 'active WireGuard invalid config keeps the live backend' test_active_wireguard_invalid_config_keeps_live_backend
+run_test 'untouched WireGuard preparation restores files without runtime cleanup' test_untouched_wireguard_preparation_restores_files_without_runtime_cleanup
+run_test 'touched WireGuard rollback still runs runtime cleanup' test_touched_wireguard_rollback_still_runs_runtime_cleanup
 run_test 'target preparation failure keeps the old runtime running' test_target_preparation_failure_keeps_old_runtime_running
 run_test 'partial activation failure restores the old runtime' test_partial_activation_failure_invokes_old_runtime_restore
 run_test 'service activation failure restores the old runtime' test_service_activation_failure_invokes_old_runtime_restore

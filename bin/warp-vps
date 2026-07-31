@@ -21,7 +21,7 @@ WG_GLOBAL_RULE_PRIORITY=18001
 WG_GLOBAL_NFT_TABLE="warp_vps_global"
 WG_GLOBAL_SRC_VALID_MARK_PATH="/proc/sys/net/ipv4/conf/all/src_valid_mark"
 WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
-DEFAULT_WGCF_VERSION="v2.2.31"
+DEFAULT_WGCF_VERSION="v2.2.32"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 RUNTIME_LOCK_FILE="/run/${APP_NAME}.operation.lock"
 MANAGED_SWAP_FILE="/swapfile-warp-vps-manager"
@@ -452,30 +452,34 @@ protect_ssh_peer_route() {
 
 wgcf_asset_spec() {
   case "$(uname -m)" in
-    x86_64|amd64) printf 'wgcf_2.2.31_linux_amd64\n' ;;
-    aarch64|arm64) printf 'wgcf_2.2.31_linux_arm64\n' ;;
-    armv7l) printf 'wgcf_2.2.31_linux_armv7\n' ;;
-    armv6l) printf 'wgcf_2.2.31_linux_armv6\n' ;;
-    armv5*) printf 'wgcf_2.2.31_linux_armv5\n' ;;
-    i386|i486|i586|i686) printf 'wgcf_2.2.31_linux_386\n' ;;
-    mips) printf 'wgcf_2.2.31_linux_mips_softfloat\n' ;;
-    mipsel|mipsle) printf 'wgcf_2.2.31_linux_mipsle_softfloat\n' ;;
-    mips64) printf 'wgcf_2.2.31_linux_mips64_softfloat\n' ;;
-    mips64el|mips64le) printf 'wgcf_2.2.31_linux_mips64le_softfloat\n' ;;
-    s390x) printf 'wgcf_2.2.31_linux_s390x\n' ;;
+    x86_64|amd64) printf 'wgcf_2.2.32_linux_amd64\n' ;;
+    aarch64|arm64) printf 'wgcf_2.2.32_linux_arm64\n' ;;
+    armv7l) printf 'wgcf_2.2.32_linux_armv7\n' ;;
+    armv6l) printf 'wgcf_2.2.32_linux_armv6\n' ;;
+    armv5*) printf 'wgcf_2.2.32_linux_armv5\n' ;;
+    i386|i486|i586|i686) printf 'wgcf_2.2.32_linux_386\n' ;;
+    mips) printf 'wgcf_2.2.32_linux_mips_softfloat\n' ;;
+    mipsel|mipsle) printf 'wgcf_2.2.32_linux_mipsle_softfloat\n' ;;
+    mips64) printf 'wgcf_2.2.32_linux_mips64_softfloat\n' ;;
+    mips64el|mips64le) printf 'wgcf_2.2.32_linux_mips64le_softfloat\n' ;;
+    s390x) printf 'wgcf_2.2.32_linux_s390x\n' ;;
     *) die "WireGuard 模式暂不支持当前 CPU 架构：$(uname -m)" ;;
   esac
 }
 
 install_wgcf_binary() {
-  [ -x "$WGCF_BIN" ] && return 0
+  if [ "$WGCF_BIN" != "$DEFAULT_WGCF_BIN" ] && [ -x "$WGCF_BIN" ]; then
+    return 0
+  fi
   install -d -m 0755 "$(dirname "$WGCF_BIN")"
-  local asset_name url
+  local asset_name url staged
   asset_name="$(wgcf_asset_spec)"
   url="https://github.com/ViRb3/wgcf/releases/download/${DEFAULT_WGCF_VERSION}/${asset_name}"
-  curl -LfsS --connect-timeout 10 --max-time 120 "$url" -o "$WGCF_BIN" \
+  staged="${WGCF_BIN}.new.$$"
+  curl -LfsS --connect-timeout 10 --max-time 120 "$url" -o "$staged" \
     || die "wgcf 下载失败：$asset_name"
-  chmod 0755 "$WGCF_BIN"
+  chmod 0755 "$staged" || die "无法设置 wgcf 执行权限"
+  mv "$staged" "$WGCF_BIN" || die "无法激活 wgcf：$WGCF_BIN"
   log "已下载 wgcf：${DEFAULT_WGCF_VERSION} ${asset_name}"
 }
 

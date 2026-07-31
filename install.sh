@@ -1639,6 +1639,7 @@ cleanup_prepared_target() {
   [ "$TARGET_PREP_STARTED" -eq 1 ] || return 0
 
   if [ "$selected_mode" = "wireguard" ]; then
+    [ "$INSTALL_RUNTIME_TOUCHED" -eq 1 ] || return 0
     systemctl stop "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
     if [ -x "$PROJECT_STAGE_DIR/bin/warp-vps" ] && [ -r "$TARGET_CONFIG_FILE" ]; then
       WARP_VPS_CONFIG_FILE="$TARGET_CONFIG_FILE" \
