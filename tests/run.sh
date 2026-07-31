@@ -3193,6 +3193,10 @@ test_opposite_backend_checks_preserve_three_states() {
   socks_table_absent || rc=$?
   assert_eq '2' "$rc" \
     'an nftables query error must be distinct from a confirmed stale Socks table' || return 1
+  clear_socks_table_for_wireguard || {
+    fail 'an unreadable optional nftables query must not block precise WireGuard activation'
+    return 1
+  }
 
   command() {
     [ "$1" = '-v' ] || return 1

@@ -1047,15 +1047,14 @@ socks_table_absent() {
 clear_socks_table_for_wireguard() {
   command -v nft >/dev/null 2>&1 || return 0
   local tables rc
-  tables="$(nft list tables 2>/dev/null)" || return 1
+  tables="$(nft list tables 2>/dev/null)" || return 0
   rc=0
   grep -Fxq 'table inet warp_vps' <<< "$tables" || rc=$?
   case "$rc" in
-    0) nft delete table inet warp_vps || return 1 ;;
+    0) nft delete table inet warp_vps ;;
     1) return 0 ;;
-    *) return 1 ;;
+    *) return 0 ;;
   esac
-  socks_table_absent
 }
 
 apply_rules() {
