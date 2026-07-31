@@ -14,6 +14,12 @@ BIN_PATH="/usr/local/bin/warp-vps"
 DEFAULT_WG_IFACE="warp-vps-wg"
 DEFAULT_WGCF_BIN="${APP_DIR}/bin/wgcf"
 DEFAULT_WG_CONFIG="/etc/wireguard/${DEFAULT_WG_IFACE}.conf"
+WG_GLOBAL_TABLE=51888
+WG_GLOBAL_MARK=51888
+WG_GLOBAL_MAIN_RULE_PRIORITY=18000
+WG_GLOBAL_RULE_PRIORITY=18001
+WG_GLOBAL_NFT_TABLE="warp_vps_global"
+WG_GLOBAL_SRC_VALID_MARK_PATH="/proc/sys/net/ipv4/conf/all/src_valid_mark"
 WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
 DEFAULT_WGCF_VERSION="v2.2.31"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
@@ -138,7 +144,7 @@ run_with_runtime_lock() {
 load_config() {
   [ -r "$CONFIG_FILE" ] || die "找不到配置文件：$CONFIG_FILE"
   local line key value
-  unset WARP_MODE WARP_SOCKS_PORT REDSOCKS_PORT REDSOCKS_USER REDSOCKS_UID \
+  unset WARP_MODE WARP_SCOPE WARP_SOCKS_PORT REDSOCKS_PORT REDSOCKS_USER REDSOCKS_UID \
     REDSOCKS_GROUP REDSOCKS_BIN WG_IFACE WGCF_BIN WG_CONFIG \
     MANAGED_WARP_SVC MANAGED_REDSOCKS_BIN
   while IFS= read -r line || [ -n "$line" ]; do
@@ -153,6 +159,7 @@ load_config() {
       APP_VERSION) : ;;
       REPO_RAW_BASE) : ;;
       WARP_MODE) WARP_MODE="$value" ;;
+      WARP_SCOPE) WARP_SCOPE="$value" ;;
       WARP_SOCKS_PORT) WARP_SOCKS_PORT="$value" ;;
       REDSOCKS_PORT) REDSOCKS_PORT="$value" ;;
       REDSOCKS_USER) REDSOCKS_USER="$value" ;;
@@ -171,6 +178,11 @@ load_config() {
   case "$WARP_MODE" in
     socks|wireguard) ;;
     *) die "配置里的 WARP_MODE 无效：$WARP_MODE" ;;
+  esac
+  WARP_SCOPE="${WARP_SCOPE:-google}"
+  case "$WARP_SCOPE" in
+    google|global) ;;
+    *) die "配置里的 WARP_SCOPE 无效：$WARP_SCOPE" ;;
   esac
   WG_IFACE="${WG_IFACE:-$DEFAULT_WG_IFACE}"
   WGCF_BIN="${WGCF_BIN:-$DEFAULT_WGCF_BIN}"
@@ -330,13 +342,23 @@ EOF
 }
 
 render_nft_conf() {
-  local google4 google6
+  local google4 google6 redirect_rules
   validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4
   validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
   google4="$(join_rules "${RULES_DIR}/google_ipv4.txt")"
   google6="$(join_rules "${RULES_DIR}/google_ipv6.txt")"
   [ -n "$google4" ] || die "IPv4 规则为空"
   [ -n "$google6" ] || die "IPv6 规则为空"
+
+  if [ "$WARP_SCOPE" = "global" ]; then
+    redirect_rules="$(cat <<EOF
+add rule inet warp_vps output_nat ct direction reply return
+add rule inet warp_vps output_nat meta nfproto ipv4 meta l4proto tcp counter redirect to :${REDSOCKS_PORT}
+EOF
+)"
+  else
+    redirect_rules="add rule inet warp_vps output_nat ip daddr @google4 meta l4proto tcp counter redirect to :${REDSOCKS_PORT}"
+  fi
 
   local table_action
   if table_exists; then
@@ -353,7 +375,7 @@ add chain inet warp_vps output_nat { type nat hook output priority -100; policy 
 add rule inet warp_vps output_nat meta skuid ${REDSOCKS_UID} return
 add rule inet warp_vps output_nat oifname "lo" return
 add rule inet warp_vps output_nat ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 } return
-add rule inet warp_vps output_nat ip daddr @google4 meta l4proto tcp counter redirect to :${REDSOCKS_PORT}
+${redirect_rules}
 add chain inet warp_vps output_filter { type filter hook output priority filter; policy accept; }
 add rule inet warp_vps output_filter meta skuid ${REDSOCKS_UID} return
 add rule inet warp_vps output_filter oifname "lo" return
@@ -715,21 +737,219 @@ wg_default_routes_absent() {
   [ -z "$routes4" ] && [ -z "$routes6" ]
 }
 
+wg_global_nft_table_absent() {
+  if ! command -v nft >/dev/null 2>&1; then
+    [ "${WARP_MODE:-}" != "wireguard" ] || [ "${WARP_SCOPE:-google}" != "global" ]
+    return
+  fi
+  local tables
+  tables="$(nft list tables 2>/dev/null)" || return 1
+  ! grep -Fxq "table inet ${WG_GLOBAL_NFT_TABLE}" <<< "$tables"
+}
+
+wg_global_nft_rules_local_ok() {
+  local prerouting output postrouting mark_pattern
+  mark_pattern='(0x0*ca[bB]0|51888)'
+  prerouting="$(nft list chain inet "$WG_GLOBAL_NFT_TABLE" prerouting 2>/dev/null)" \
+    || return 1
+  output="$(nft list chain inet "$WG_GLOBAL_NFT_TABLE" output 2>/dev/null)" || return 1
+  postrouting="$(nft list chain inet "$WG_GLOBAL_NFT_TABLE" postrouting 2>/dev/null)" \
+    || return 1
+  grep -Eq 'type filter hook prerouting priority mangle; policy accept;' <<< "$prerouting" \
+    && grep -Eq "ct mark ${mark_pattern}.*meta mark set ct mark" <<< "$prerouting" \
+    && grep -Eq "iifname != \"lo\".*iifname != \"${WG_IFACE}\".*fib daddr type local.*ct direction original.*meta mark set ${mark_pattern}.*ct mark set meta mark" <<< "$prerouting" \
+    && grep -Eq 'type route hook output priority mangle; policy accept;' <<< "$output" \
+    && grep -Eq "ct mark ${mark_pattern}.*meta mark set ct mark" <<< "$output" \
+    && grep -Eq 'type filter hook postrouting priority mangle; policy accept;' <<< "$postrouting" \
+    && grep -Eq "meta l4proto udp.*meta mark ${mark_pattern}.*ct mark set meta mark" <<< "$postrouting"
+}
+
+render_wg_global_nft_conf() {
+  local table_action
+  if nft list table inet "$WG_GLOBAL_NFT_TABLE" >/dev/null 2>&1; then
+    table_action=$'delete table inet warp_vps_global\nadd table inet warp_vps_global'
+  else
+    table_action="add table inet ${WG_GLOBAL_NFT_TABLE}"
+  fi
+  cat > "$NFT_CONF" <<EOF
+${table_action}
+add chain inet ${WG_GLOBAL_NFT_TABLE} prerouting { type filter hook prerouting priority mangle; policy accept; }
+add chain inet ${WG_GLOBAL_NFT_TABLE} output { type route hook output priority mangle; policy accept; }
+add chain inet ${WG_GLOBAL_NFT_TABLE} postrouting { type filter hook postrouting priority mangle; policy accept; }
+add rule inet ${WG_GLOBAL_NFT_TABLE} prerouting ct mark ${WG_GLOBAL_MARK} meta mark set ct mark
+add rule inet ${WG_GLOBAL_NFT_TABLE} prerouting iifname != "lo" iifname != "${WG_IFACE}" fib daddr type local ct direction original meta mark set ${WG_GLOBAL_MARK} ct mark set meta mark
+add rule inet ${WG_GLOBAL_NFT_TABLE} output ct mark ${WG_GLOBAL_MARK} meta mark set ct mark
+add rule inet ${WG_GLOBAL_NFT_TABLE} postrouting meta l4proto udp meta mark ${WG_GLOBAL_MARK} ct mark set meta mark
+EOF
+  chmod 0644 "$NFT_CONF"
+}
+
+wg_global_src_valid_mark_ok() {
+  [ -r "$WG_GLOBAL_SRC_VALID_MARK_PATH" ] || return 1
+  [ "$(< "$WG_GLOBAL_SRC_VALID_MARK_PATH")" = "1" ]
+}
+
+enable_wg_global_src_valid_mark() {
+  wg_global_src_valid_mark_ok && return 0
+  if [ ! -w "$WG_GLOBAL_SRC_VALID_MARK_PATH" ]; then
+    die "WireGuard 全局模式无法启用入站连接回包标记"
+    return 1
+  fi
+  if ! printf '1\n' > "$WG_GLOBAL_SRC_VALID_MARK_PATH"; then
+    die "WireGuard 全局模式无法启用入站连接回包标记"
+    return 1
+  fi
+}
+
+wg_global_policy_rules_present() {
+  local family rules mark_pattern
+  mark_pattern='(0x0*ca[bB]0|51888)'
+  for family in 4 6; do
+    rules="$(ip -"$family" rule show 2>/dev/null)" || return 1
+    grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
+      <<< "$rules" || return 1
+    grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark ${mark_pattern}(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
+      <<< "$rules" || return 1
+  done
+}
+
+wg_global_policy_rules_absent() {
+  local family rules mark_pattern
+  mark_pattern='(0x0*ca[bB]0|51888)'
+  for family in 4 6; do
+    rules="$(ip -"$family" rule show 2>/dev/null)" || return 1
+    ! grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
+      <<< "$rules" || return 1
+    ! grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark ${mark_pattern}(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
+      <<< "$rules" || return 1
+  done
+}
+
+wg_global_default_routes_present() {
+  local routes4 routes6
+  routes4="$(ip -4 route show table "$WG_GLOBAL_TABLE" default dev "$WG_IFACE" 2>/dev/null)" \
+    || return 1
+  routes6="$(ip -6 route show table "$WG_GLOBAL_TABLE" default dev "$WG_IFACE" 2>/dev/null)" \
+    || return 1
+  [ -n "$routes4" ] && [ -n "$routes6" ]
+}
+
+wg_global_fwmark_present() {
+  local mark
+  mark="$(wg show "$WG_IFACE" fwmark 2>/dev/null)" || return 1
+  case "$mark" in
+    ''|off|*[!0-9A-Fa-fx]*) return 1 ;;
+  esac
+  [ "$((mark))" -eq "$WG_GLOBAL_MARK" ]
+}
+
+wg_global_routes_absent() {
+  local family routes
+  for family in 4 6; do
+    routes="$(ip -"$family" route show table all default 2>/dev/null)" || return 1
+    ! grep -Eq "(^|[[:space:]])table ${WG_GLOBAL_TABLE}([[:space:]]|$)" <<< "$routes" \
+      || return 1
+  done
+  wg_global_policy_rules_absent && wg_global_nft_table_absent
+}
+
+wireguard_global_routes_local_ok() {
+  route_uses_wg4 1.1.1.1 \
+    && route_uses_wg6 2606:4700:4700::1111 \
+    && wg_global_default_routes_present \
+    && wg_global_policy_rules_present \
+    && wg_global_fwmark_present \
+    && wg_global_nft_rules_local_ok \
+    && wg_global_src_valid_mark_ok
+}
+
 wireguard_routes_local_ok() {
   local probe4 probe6
+  if [ "$WARP_SCOPE" = "global" ]; then
+    wireguard_global_routes_local_ok
+    return
+  fi
   probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" || return 1
   probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" || return 1
   route_uses_wg4 "$probe4" || return 1
   route_uses_wg6 "$probe6" || return 1
-  wg_default_routes_absent
+  wg_default_routes_absent && wg_global_routes_absent
+}
+
+delete_wg_global_policy_rules() {
+  local family
+  for family in 4 6; do
+    while ip -"$family" rule del not fwmark "$WG_GLOBAL_MARK" \
+      table "$WG_GLOBAL_TABLE" priority "$WG_GLOBAL_RULE_PRIORITY" >/dev/null 2>&1; do
+      :
+    done
+    while ip -"$family" rule del table main suppress_prefixlength 0 \
+      priority "$WG_GLOBAL_MAIN_RULE_PRIORITY" >/dev/null 2>&1; do
+      :
+    done
+  done
+}
+
+stop_wg_global_routes() {
+  delete_wg_global_policy_rules
+  ip -4 route del default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" >/dev/null 2>&1 || true
+  ip -6 route del default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" >/dev/null 2>&1 || true
+  if command -v nft >/dev/null 2>&1 \
+    && nft list table inet "$WG_GLOBAL_NFT_TABLE" >/dev/null 2>&1; then
+    nft delete table inet "$WG_GLOBAL_NFT_TABLE" >/dev/null 2>&1 || true
+  fi
+  if wg_interface_is_wireguard; then
+    wg set "$WG_IFACE" fwmark off >/dev/null 2>&1 || true
+  fi
+}
+
+apply_wg_global_routes() {
+  local cleanup_message
+  command -v nft >/dev/null 2>&1 || die "WireGuard 全局模式需要 nftables"
+  stop_wg_global_routes
+  enable_wg_global_src_valid_mark || return 1
+  render_wg_global_nft_conf
+  nft -c -f "$NFT_CONF" || die "WireGuard 全局回包规则预检失败"
+  if ! nft -f "$NFT_CONF"; then
+    stop_wg_global_routes
+    die "WireGuard 全局回包规则加载失败，已清除本项目全局规则"
+    return 1
+  fi
+  if ! wg set "$WG_IFACE" fwmark "$WG_GLOBAL_MARK" \
+    || ! ip -4 route replace default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" \
+    || ! ip -6 route replace default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" \
+    || ! ip -4 rule add priority "$WG_GLOBAL_MAIN_RULE_PRIORITY" table main suppress_prefixlength 0 \
+    || ! ip -6 rule add priority "$WG_GLOBAL_MAIN_RULE_PRIORITY" table main suppress_prefixlength 0 \
+    || ! ip -4 rule add not fwmark "$WG_GLOBAL_MARK" table "$WG_GLOBAL_TABLE" priority "$WG_GLOBAL_RULE_PRIORITY" \
+    || ! ip -6 rule add not fwmark "$WG_GLOBAL_MARK" table "$WG_GLOBAL_TABLE" priority "$WG_GLOBAL_RULE_PRIORITY"; then
+    stop_wg_global_routes
+    die "WireGuard 全局路由写入失败，已清除本项目全局路由"
+    return 1
+  fi
+  if ! wireguard_global_routes_local_ok; then
+    if stop_wg_global_routes && wg_global_routes_absent; then
+      cleanup_message="已清除本项目全局路由"
+    else
+      cleanup_message="无法确认本项目全局路由已完整清除"
+    fi
+    die "WireGuard 全局路由边界检查失败，${cleanup_message}"
+    return 1
+  fi
 }
 
 apply_wg_routes() {
   local cidr cleanup_message
   load_config
-  validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4
-  validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
+  if [ "$WARP_SCOPE" = "google" ]; then
+    validate_rules_file "${RULES_DIR}/google_ipv4.txt" 4
+    validate_rules_file "${RULES_DIR}/google_ipv6.txt" 6
+  fi
   wg_interface_is_wireguard || die "同名网卡不存在或不是 WireGuard：$WG_IFACE"
+  stop_wg_routes
+  if [ "$WARP_SCOPE" = "global" ]; then
+    apply_wg_global_routes
+    return
+  fi
   protect_ssh_peer_route
   while IFS= read -r cidr; do
     if ! ip -4 route replace "$cidr" dev "$WG_IFACE"; then
@@ -782,6 +1002,7 @@ stop_wg_routes() {
       ip -6 route del "$cidr" dev "${WG_IFACE:-$DEFAULT_WG_IFACE}" 2>/dev/null || true
     done < <(route_file_lines "${RULES_DIR}/google_ipv6.txt")
   fi
+  stop_wg_global_routes
 }
 
 stop_wg_routes_strict() {
@@ -789,15 +1010,20 @@ stop_wg_routes_strict() {
   local failed=0
   local iface="${WG_IFACE:-$DEFAULT_WG_IFACE}"
 
+  stop_wg_global_routes
+  wg_global_routes_absent || failed=1
   interface_rc=0
   wg_interface_absent || interface_rc=$?
   case "$interface_rc" in
-    0) return 0 ;;
+    0) [ "$failed" -eq 0 ]; return ;;
     1) ;;
     *) return 1 ;;
   esac
   if ! wg_interface_exists; then
-    wg_interface_absent && return 0
+    if wg_interface_absent; then
+      [ "$failed" -eq 0 ]
+      return
+    fi
     return 1
   fi
 
@@ -845,6 +1071,7 @@ stop_wg_routes_strict() {
       failed=1
     fi
   done <<< "$cidrs6"
+  wg_global_routes_absent || failed=1
   [ "$failed" -eq 0 ]
 }
 
@@ -904,6 +1131,7 @@ apply_rules() {
     apply_wg_routes
     return
   fi
+  stop_wg_routes
   render_redsocks_conf
   render_nft_conf
   nft -c -f "$NFT_CONF"
@@ -917,6 +1145,7 @@ stop_rules() {
       stop_wg_routes
       return
     fi
+    stop_wg_routes
   fi
   if table_exists; then
     nft delete table inet warp_vps
@@ -930,11 +1159,11 @@ load_uninstall_config() {
   UNINSTALL_WG_CONFIG_EXPLICIT=0
   UNINSTALL_WIREGUARD_PRESENT=0
   UNINSTALL_RUNTIME_IDENTIFIED=0
-  unset WARP_MODE WG_IFACE WG_CONFIG MANAGED_WARP_SVC REDSOCKS_BIN MANAGED_REDSOCKS_BIN
+  unset WARP_MODE WARP_SCOPE WG_IFACE WG_CONFIG MANAGED_WARP_SVC REDSOCKS_BIN MANAGED_REDSOCKS_BIN
   if [ -r "$CONFIG_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
-        WARP_MODE=*|WG_IFACE=*|WG_CONFIG=*|MANAGED_WARP_SVC=*|REDSOCKS_BIN=*|MANAGED_REDSOCKS_BIN=*) ;;
+        WARP_MODE=*|WARP_SCOPE=*|WG_IFACE=*|WG_CONFIG=*|MANAGED_WARP_SVC=*|REDSOCKS_BIN=*|MANAGED_REDSOCKS_BIN=*) ;;
         *) continue ;;
       esac
       key="${line%%=*}"
@@ -946,6 +1175,11 @@ load_uninstall_config() {
               WARP_MODE="$value"
               mode_present=1
               ;;
+          esac
+          ;;
+        WARP_SCOPE)
+          case "$value" in
+            google|global) WARP_SCOPE="$value" ;;
           esac
           ;;
         WG_IFACE)
@@ -977,6 +1211,7 @@ load_uninstall_config() {
   fi
   WG_IFACE="${WG_IFACE:-$DEFAULT_WG_IFACE}"
   WG_CONFIG="${WG_CONFIG:-/etc/wireguard/${WG_IFACE}.conf}"
+  WARP_SCOPE="${WARP_SCOPE:-google}"
   if [ "${WARP_MODE:-}" = "wireguard" ]; then
     UNINSTALL_WIREGUARD_PRESENT=1
   fi
@@ -1035,11 +1270,12 @@ recover_uninstall_runtime_from_unit() {
 }
 
 uninstall_nft_table_exists() {
+  local table="${1:-warp_vps}"
   local tables rc
   tables="$(nft list tables 2>/dev/null)" \
     || die "无法读取 nftables 当前状态，不能确认分流规则已经失效"
   rc=0
-  grep -Fxq 'table inet warp_vps' <<< "$tables" || rc=$?
+  grep -Fxq "table inet ${table}" <<< "$tables" || rc=$?
   case "$rc" in
     0) return 0 ;;
     1) return 1 ;;
@@ -1078,8 +1314,18 @@ stop_rules_for_uninstall() {
     if uninstall_nft_table_exists; then
       die "本项目 nftables 分流规则仍在生效，卸载已中止"
     fi
-  elif [ "${WARP_MODE:-socks}" = "socks" ]; then
-    die "找不到 nft 命令，无法确认 Socks5 分流规则已经失效"
+    if uninstall_nft_table_exists "$WG_GLOBAL_NFT_TABLE"; then
+      nft delete table inet "$WG_GLOBAL_NFT_TABLE" \
+        || die "无法删除本项目 WireGuard 全局回包规则"
+    fi
+    if uninstall_nft_table_exists "$WG_GLOBAL_NFT_TABLE"; then
+      die "本项目 WireGuard 全局回包规则仍在生效，卸载已中止"
+    fi
+  elif [ "${WARP_MODE:-socks}" = "socks" ] || [ "${WARP_SCOPE:-google}" = "global" ]; then
+    die "找不到 nft 命令，无法确认本项目分流规则已经失效"
+  fi
+  if command -v ip >/dev/null 2>&1 && ! wg_global_routes_absent; then
+    die "本项目 WireGuard 全局路由仍在生效，卸载已中止"
   fi
 }
 
@@ -1122,7 +1368,7 @@ EOF
 
   cat > /etc/systemd/system/warp-vps.service <<EOF
 [Unit]
-Description=WARP VPS Manager Google 系统级分流
+Description=WARP VPS Manager 系统级路由
 After=${route_after}
 Wants=${route_wants}
 
@@ -1316,7 +1562,8 @@ socks_wireguard_routes_absent() {
   if route_output_uses_interface "$WG_IFACE" <<< "$defaults4"; then
     return 1
   fi
-  ! route_output_uses_interface "$WG_IFACE" <<< "$defaults6"
+  ! route_output_uses_interface "$WG_IFACE" <<< "$defaults6" \
+    && wg_global_routes_absent
 }
 
 clear_socks_wireguard_routes() {
@@ -1555,7 +1802,13 @@ socks_nft_rules_local_ok() {
   local nat_rules filter_rules
   nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null)" || return 1
   filter_rules="$(nft list chain inet warp_vps output_filter 2>/dev/null)" || return 1
-  grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" || return 1
+  if [ "$WARP_SCOPE" = "global" ]; then
+    grep -Eq 'ct direction reply.*return' <<< "$nat_rules" || return 1
+    grep -Eq 'meta nfproto ipv4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" || return 1
+    grep -Eq 'ip daddr @google4.*redirect to :' <<< "$nat_rules" && return 1
+  else
+    grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" || return 1
+  fi
   grep -Eq 'ip daddr @google4[[:space:]].*udp dport 443[[:space:]].*reject with icmpx type admin-prohibited' <<< "$filter_rules" || return 1
   grep -Eq 'ip6 daddr @google6.*reject' <<< "$filter_rules"
 }
@@ -1888,7 +2141,12 @@ run_self_check() {
 
   section "本地状态自检"
   if [ "$WARP_MODE" = "wireguard" ]; then
-    info_line "当前模式：WireGuard 默认模式"
+    info_line "当前模式：WireGuard"
+    if [ "$WARP_SCOPE" = "global" ]; then
+      info_line "路由范围：IPv4 / IPv6 全局走 WARP"
+    else
+      info_line "路由范围：精准分流 Google 服务"
+    fi
     info_line "WireGuard 网卡：${WG_IFACE}"
 
     if unit_ready "wg-quick@${WG_IFACE}.service"; then
@@ -1918,26 +2176,33 @@ run_self_check() {
       failed=1
     fi
 
-    if probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" \
-      && route_uses_wg4 "$probe4"; then
-      ok_line "代表性 Google IPv4 路由已走 WireGuard"
-    else
-      fail_line "代表性 Google IPv4 路由没有走 WireGuard"
-      failed=1
+    if [ "$WARP_SCOPE" = "google" ]; then
+      if probe4="$(rule_probe_ip "${RULES_DIR}/google_ipv4.txt" 4)" \
+        && route_uses_wg4 "$probe4"; then
+        ok_line "代表性 Google IPv4 路由已走 WireGuard"
+      else
+        fail_line "代表性 Google IPv4 路由没有走 WireGuard"
+        failed=1
+      fi
+
+      if probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" \
+        && route_uses_wg6 "$probe6"; then
+        ok_line "代表性 Google IPv6 路由已走 WireGuard"
+      else
+        fail_line "代表性 Google IPv6 路由没有走 WireGuard"
+        failed=1
+      fi
     fi
 
-    if probe6="$(rule_probe_ip "${RULES_DIR}/google_ipv6.txt" 6)" \
-      && route_uses_wg6 "$probe6"; then
-      ok_line "代表性 Google IPv6 路由已走 WireGuard"
-    else
-      fail_line "代表性 Google IPv6 路由没有走 WireGuard"
+    if [ "$WARP_SCOPE" = "global" ] && wireguard_global_routes_local_ok; then
+      ok_line "非 Google IPv4 / IPv6 与入站连接回包策略已加载"
+    elif [ "$WARP_SCOPE" = "global" ]; then
+      fail_line "WireGuard 全局路由或入站连接回包策略异常"
       failed=1
-    fi
-
-    if wg_default_routes_absent; then
+    elif wg_default_routes_absent && wg_global_routes_absent; then
       ok_line "项目 WireGuard 网卡没有接管默认路由"
     else
-      fail_line "项目 WireGuard 网卡接管了默认路由，或无法读取默认路由状态"
+      fail_line "精准分流模式发现了项目全局路由，或无法读取默认路由状态"
       failed=1
     fi
 
@@ -1959,6 +2224,11 @@ run_self_check() {
   fi
 
   info_line "当前模式：Socks5 兼容模式"
+  if [ "$WARP_SCOPE" = "global" ]; then
+    info_line "路由范围：VPS 主动发起的公网 IPv4 TCP 全局走 WARP"
+  else
+    info_line "路由范围：精准分流 Google 服务"
+  fi
   info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
   info_line "本地转发端口：${REDSOCKS_PORT}"
 
@@ -2011,7 +2281,15 @@ run_self_check() {
   fi
 
   nat_rules="$(nft list chain inet warp_vps output_nat 2>/dev/null || true)"
-  if grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules"; then
+  if [ "$WARP_SCOPE" = "global" ] \
+    && grep -Eq 'ct direction reply.*return' <<< "$nat_rules" \
+    && grep -Eq 'meta nfproto ipv4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules" \
+    && ! grep -Eq 'ip daddr @google4.*redirect to :' <<< "$nat_rules"; then
+    ok_line "VPS 主动发起的公网 IPv4 TCP 全局重定向与入站回包直连规则已加载"
+  elif [ "$WARP_SCOPE" = "global" ]; then
+    fail_line "未找到完整的 VPS 公网 IPv4 TCP 全局重定向规则"
+    failed=1
+  elif grep -Eq 'ip daddr @google4.*meta l4proto tcp.*redirect to :' <<< "$nat_rules"; then
     ok_line "Google IPv4 TCP 重定向规则已加载"
   else
     fail_line "未找到 Google IPv4 TCP 重定向规则"
@@ -2042,7 +2320,11 @@ run_self_check() {
 
   section "结论"
   if [ "$failed" -eq 0 ]; then
-    ok_line "本地运行态正常。Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）被拒绝，Google IPv6 继续拒绝。"
+    if [ "$WARP_SCOPE" = "global" ]; then
+      ok_line "本地运行态正常。VPS 主动发起的公网 IPv4 TCP 全局走 WARP，入站连接回包保持原生路径；Google IPv4 UDP/443（QUIC）和 Google IPv6 继续拒绝。"
+    else
+      ok_line "本地运行态正常。Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）被拒绝，Google IPv6 继续拒绝。"
+    fi
     return 0
   fi
 
@@ -2065,10 +2347,18 @@ cmd_status() {
   load_config
   section "当前配置"
   if [ "$WARP_MODE" = "wireguard" ]; then
-    info_line "工作模式：WireGuard 默认模式，Google IPv4、IPv6、TCP、UDP 和 QUIC 走 WARP"
+    if [ "$WARP_SCOPE" = "global" ]; then
+      info_line "工作模式：WireGuard，IPv4、IPv6、TCP、UDP 和 QUIC 全局走 WARP"
+    else
+      info_line "工作模式：WireGuard，Google IPv4、IPv6、TCP、UDP 和 QUIC 精准走 WARP"
+    fi
     info_line "WireGuard 网卡：${WG_IFACE}"
   else
-    info_line "工作模式：Socks5 兼容模式，Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝"
+    if [ "$WARP_SCOPE" = "global" ]; then
+      info_line "工作模式：Socks5，VPS 主动发起的公网 IPv4 TCP 全局走 WARP，入站连接回包保持原生路径；Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝"
+    else
+      info_line "工作模式：Socks5，Google IPv4 TCP 精准走 WARP；Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝"
+    fi
     info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
     info_line "本地转发端口：${REDSOCKS_PORT}"
   fi
@@ -2765,6 +3055,10 @@ deactivate_runtime_for_uninstall() {
   if command -v nft >/dev/null 2>&1 && uninstall_nft_table_exists; then
     die "本项目 nftables 分流规则仍在生效，卸载已中止"
   fi
+  if command -v nft >/dev/null 2>&1 \
+    && uninstall_nft_table_exists "$WG_GLOBAL_NFT_TABLE"; then
+    die "本项目 WireGuard 全局回包规则仍在生效，卸载已中止"
+  fi
   if [ "$ip_available" -eq 1 ] && uninstall_wg_interface_exists; then
     die "本项目 WireGuard 网卡仍在运行，卸载已中止：$WG_IFACE"
   fi
@@ -2978,7 +3272,7 @@ usage() {
   update          更新脚本和固定规则快照
   reinstall       非交互重装并保持当前模式
   reinstall [安装选项]
-                  非交互重装；支持 --mode、--swap、--socks-port
+                  非交互重装；支持 --mode、--scope、--swap、--socks-port
   switch wireguard|socks [安装选项]
                   非交互切换模式；复用同一安装事务
   logs            查看最近日志

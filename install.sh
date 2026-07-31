@@ -16,6 +16,11 @@ WG_IFACE="warp-vps-wg"
 WGCF_BIN="${APP_DIR}/bin/wgcf"
 WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
 WG_CONFIG="/etc/wireguard/${WG_IFACE}.conf"
+WG_GLOBAL_TABLE=51888
+WG_GLOBAL_MARK=51888
+WG_GLOBAL_MAIN_RULE_PRIORITY=18000
+WG_GLOBAL_RULE_PRIORITY=18001
+WG_GLOBAL_NFT_TABLE="warp_vps_global"
 SWAP_FILE="/swapfile-warp-vps-manager"
 DEFAULT_REPO_RAW_BASE="https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main"
 REPO_RAW_BASE="${WARP_VPS_REPO_BASE:-$DEFAULT_REPO_RAW_BASE}"
@@ -55,6 +60,7 @@ OPERATION_LOCK_HELD=0
 MENU_ACTION_RC=0
 INSTALL_NONINTERACTIVE=0
 INSTALL_MODE_OPTION=""
+INSTALL_SCOPE_OPTION=""
 INSTALL_SWAP_OPTION=""
 INSTALL_SOCKS_PORT_OPTION=""
 
@@ -382,13 +388,18 @@ apply_swap_choice() {
 
 pkg_install_apt() {
   local mode="$1"
+  local scope="${2:-google}"
   local install_rc
   export DEBIAN_FRONTEND=noninteractive
   log "如果系统自动更新正在占用 apt/dpkg，最多等待 20 分钟"
   apt_get update -y
 
   if [ "$mode" = "wireguard" ]; then
-    apt_get install -y curl ca-certificates coreutils iproute2 python3 wireguard-tools
+    if [ "$scope" = "global" ]; then
+      apt_get install -y curl ca-certificates coreutils nftables iproute2 python3 wireguard-tools
+    else
+      apt_get install -y curl ca-certificates coreutils iproute2 python3 wireguard-tools
+    fi
     return
   fi
 
@@ -536,9 +547,14 @@ rpm_install_redsocks() {
 pkg_install_rpm() {
   local mode="$1"
   local manager="$2"
+  local scope="${3:-google}"
   local key_file key_tmp repo_file repo_tmp
   if [ "$mode" = "wireguard" ]; then
-    "$manager" install -y curl ca-certificates coreutils iproute python3 wireguard-tools
+    if [ "$scope" = "global" ]; then
+      "$manager" install -y curl ca-certificates coreutils nftables iproute python3 wireguard-tools
+    else
+      "$manager" install -y curl ca-certificates coreutils iproute python3 wireguard-tools
+    fi
     return
   fi
 
@@ -576,20 +592,21 @@ pkg_install_rpm() {
 
 install_dependencies() {
   local mode="$1"
+  local scope="${2:-google}"
   local manager
-  if mode_dependencies_complete "$mode"; then
+  if mode_dependencies_complete "$mode" "$scope"; then
     log "目标模式所需依赖已齐全，直接复用现有安装"
     return 0
   fi
   load_os_release
   if command -v apt-get >/dev/null 2>&1; then
-    pkg_install_apt "$mode"
+    pkg_install_apt "$mode" "$scope"
   elif command -v dnf >/dev/null 2>&1; then
     manager="dnf"
-    pkg_install_rpm "$mode" "$manager"
+    pkg_install_rpm "$mode" "$manager" "$scope"
   elif command -v yum >/dev/null 2>&1; then
     manager="yum"
-    pkg_install_rpm "$mode" "$manager"
+    pkg_install_rpm "$mode" "$manager" "$scope"
   else
     die "找不到 apt-get、dnf 或 yum，无法安装依赖"
   fi
@@ -602,6 +619,9 @@ install_dependencies() {
     command -v wg >/dev/null 2>&1 || die "依赖安装后仍找不到 wg"
     command -v wg-quick >/dev/null 2>&1 || die "依赖安装后仍找不到 wg-quick"
     unit_file_exists 'wg-quick@.service' || die "wireguard-tools 已安装但找不到 wg-quick@.service"
+    if [ "$scope" = "global" ]; then
+      command -v nft >/dev/null 2>&1 || die "WireGuard 全局模式依赖安装后仍找不到 nftables"
+    fi
   else
     command -v ss >/dev/null 2>&1 || die "依赖安装后仍找不到 ss"
     command -v nft >/dev/null 2>&1 || die "依赖安装后仍找不到 nftables"
@@ -612,6 +632,7 @@ install_dependencies() {
 
 mode_dependencies_complete() {
   local mode="$1"
+  local scope="${2:-google}"
   command -v curl >/dev/null 2>&1 \
     && command -v ip >/dev/null 2>&1 \
     && command -v python3 >/dev/null 2>&1 \
@@ -621,7 +642,8 @@ mode_dependencies_complete() {
     wireguard)
       command -v wg >/dev/null 2>&1 \
         && command -v wg-quick >/dev/null 2>&1 \
-        && unit_file_exists 'wg-quick@.service'
+        && unit_file_exists 'wg-quick@.service' \
+        && { [ "$scope" != "global" ] || command -v nft >/dev/null 2>&1; }
       ;;
     socks)
       command -v ss >/dev/null 2>&1 \
@@ -737,8 +759,59 @@ read_project_mode() {
   esac
 }
 
+read_project_scope() {
+  [ -r "$CONFIG_FILE" ] || return 1
+  local line scope=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      WARP_SCOPE=*) scope="${line#*=}" ;;
+    esac
+  done < "$CONFIG_FILE"
+  case "$scope" in
+    '') printf 'google\n' ;;
+    google|global) printf '%s\n' "$scope" ;;
+    *) return 1 ;;
+  esac
+}
+
+prompt_route_scope() {
+  local choice
+  printf '\n请选择 WARP 路由范围：\n' >&2
+  printf '  1. 精准分流 Google 服务（默认）\n' >&2
+  printf '  2. 全局走 WARP（WireGuard 支持双栈全协议；Socks5 接管 VPS 主动发起的公网 IPv4 TCP）\n' >&2
+  printf '直接回车默认选择：精准分流 Google\n' >&2
+  while true; do
+    printf '请输入选项：' >&2
+    read_input choice || die "无法读取输入，已退出安装"
+    case "$choice" in
+      ''|1) printf 'google\n'; return 0 ;;
+      2) printf 'global\n'; return 0 ;;
+      *) printf '输入无效，请输入 1、2，或直接回车。\n' >&2 ;;
+    esac
+  done
+}
+
+select_route_scope() {
+  local current_scope="${1:-google}"
+  if [ "$INSTALL_NONINTERACTIVE" -eq 0 ]; then
+    prompt_route_scope
+    return
+  fi
+
+  case "$INSTALL_SCOPE_OPTION" in
+    '') printf '%s\n' "$current_scope" ;;
+    keep)
+      [ -e "$CONFIG_FILE" ] \
+        || { installer_cli_error "全新安装不能使用 --scope keep"; return 2; }
+      printf '%s\n' "$current_scope"
+      ;;
+    google|global) printf '%s\n' "$INSTALL_SCOPE_OPTION" ;;
+    *) installer_cli_error "内部错误：未识别的路由范围选项" ;;
+  esac
+}
+
 prompt_install_mode() {
-  local recommended choice current_mode
+  local recommended choice current_mode scope="${2:-google}"
   if [ "$#" -gt 0 ]; then
     current_mode="$1"
   else
@@ -747,8 +820,13 @@ prompt_install_mode() {
   recommended="${current_mode:-wireguard}"
 
   printf '\n请选择 WARP 分流方案：\n' >&2
-  printf '  1. Socks5 方案：Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝。\n' >&2
-  printf '  2. WireGuard 方案：Google IPv4、IPv6、TCP、UDP 和 QUIC 都按 Google CIDR 走 WARP。\n' >&2
+  if [ "$scope" = "global" ]; then
+    printf '  1. Socks5 方案：VPS 主动发起的公网 IPv4 TCP 走 WARP；UDP 和 IPv6 不由 Socks5 承载。\n' >&2
+    printf '  2. WireGuard 方案：公网 IPv4、IPv6、TCP、UDP 和 QUIC 全局走 WARP。\n' >&2
+  else
+    printf '  1. Socks5 方案：Google IPv4 TCP 走 WARP，Google IPv4 UDP/443（QUIC）和 Google IPv6 拒绝。\n' >&2
+    printf '  2. WireGuard 方案：Google IPv4、IPv6、TCP、UDP 和 QUIC 都按 Google CIDR 走 WARP。\n' >&2
+  fi
   printf '  3. 退出安装\n' >&2
   printf '普通用户推荐 WireGuard；只需要兼容本地代理模式时再选 Socks5。\n' >&2
   if [ -n "$current_mode" ]; then
@@ -771,8 +849,9 @@ prompt_install_mode() {
 
 select_install_mode() {
   local current_mode="${1:-}"
+  local scope="${2:-google}"
   if [ "$INSTALL_NONINTERACTIVE" -eq 0 ]; then
-    prompt_install_mode "$current_mode"
+    prompt_install_mode "$current_mode" "$scope"
     return
   fi
 
@@ -1213,9 +1292,10 @@ project_unit_disabled() {
 }
 
 project_nft_table_absent() {
+  local table="${1:-warp_vps}"
   local tables
   tables="$(nft list tables 2>/dev/null)" || return 1
-  ! grep -Fxq 'table inet warp_vps' <<< "$tables"
+  ! grep -Fxq "table inet ${table}" <<< "$tables"
 }
 
 project_wg_interface_absent() {
@@ -1240,10 +1320,12 @@ write_config_file() {
   local redsocks_uid="$4"
   local redsocks_group="$5"
   local redsocks_bin="$6"
+  local scope="${7:-google}"
   local config_tmp="${destination}.new.$$"
   cat > "$config_tmp" <<EOF || die "无法写入临时配置文件：$config_tmp"
 REPO_RAW_BASE=${REPO_RAW_BASE}
 WARP_MODE=${mode}
+WARP_SCOPE=${scope}
 WARP_SOCKS_PORT=${warp_port}
 REDSOCKS_PORT=${redsocks_port}
 REDSOCKS_USER=${REDSOCKS_USER}
@@ -1379,7 +1461,8 @@ quiesce_health_automation() {
 }
 
 previous_wg_routes_absent() {
-  local cidr routes
+  local cidr family routes rules mark_pattern
+  mark_pattern='(0x0*ca[bB]0|51888)'
   [ -r "${APP_DIR}/rules/google_ipv4.txt" ] || return 1
   [ -r "${APP_DIR}/rules/google_ipv6.txt" ] || return 1
   while IFS= read -r cidr; do
@@ -1390,6 +1473,21 @@ previous_wg_routes_absent() {
     routes="$(ip -6 route show exact "$cidr" dev "$PREVIOUS_WG_IFACE" 2>/dev/null)" || return 1
     [ -z "$routes" ] || return 1
   done < <(awk 'NF && $1 !~ /^#/ { print $1 }' "${APP_DIR}/rules/google_ipv6.txt")
+  for family in 4 6; do
+    routes="$(ip -"$family" route show table all default 2>/dev/null)" || return 1
+    ! grep -Eq "(^|[[:space:]])table ${WG_GLOBAL_TABLE}([[:space:]]|$)" <<< "$routes" \
+      || return 1
+    rules="$(ip -"$family" rule show 2>/dev/null)" || return 1
+    ! grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
+      <<< "$rules" || return 1
+    ! grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark ${mark_pattern}(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
+      <<< "$rules" || return 1
+  done
+  if command -v nft >/dev/null 2>&1; then
+    project_nft_table_absent "$WG_GLOBAL_NFT_TABLE"
+  else
+    [ "$(read_project_scope 2>/dev/null || printf 'google\n')" != "global" ]
+  fi
 }
 
 pause_project_routing() {
@@ -1729,15 +1827,26 @@ menu_mode_label() {
   esac
 }
 
+menu_scope_label() {
+  local scope
+  scope="$(read_project_scope 2>/dev/null || true)"
+  case "$scope" in
+    google) printf '精准分流 Google\n' ;;
+    global) printf '全局走 WARP\n' ;;
+    *) printf '配置需要检查\n' ;;
+  esac
+}
+
 print_installer_menu() {
   printf '\nWARP VPS Manager 管理菜单\n'
   printf '当前模式：%s\n' "$(menu_mode_label)"
+  printf '路由范围：%s\n' "$(menu_scope_label)"
   printf '  1. 查看本地运行状态\n'
   printf '  2. 运行完整诊断\n'
   printf '  3. 检测 Gemini / YouTube Premium 解锁\n'
   printf '  4. 重启分流链路\n'
   printf '  5. 更新脚本和 Google IP 规则\n'
-  printf '  6. 重装或切换 Socks5 / WireGuard 模式\n'
+  printf '  6. 重装或切换路由范围 / 运行模式\n'
   printf '  7. 查看最近日志\n'
   printf '  8. 卸载\n'
   printf '  0. 退出\n'
@@ -1804,7 +1913,7 @@ installer_menu() {
         finish_menu_action "更新" || return 0
         ;;
       6)
-        printf '\n即将进入现有安装事务；直接回车保持当前模式，也可选择另一模式。\n'
+        printf '\n即将进入现有安装事务；可重新选择路由范围和 Socks5 / WireGuard 模式。\n'
         set +e
         (
           set -Eeuo pipefail
@@ -1813,10 +1922,10 @@ installer_menu() {
         MENU_ACTION_RC=$?
         set -e
         if [ "$MENU_ACTION_RC" -eq 0 ]; then
-          printf '\n[warp-vps] 重装或模式切换已完成。请重新运行 warp-vps。\n'
+          printf '\n[warp-vps] 重装或切换已完成。请重新运行 warp-vps。\n'
           return 0
         fi
-        finish_menu_action "重装或模式切换" || return 0
+        finish_menu_action "重装或切换" || return 0
         ;;
       7)
         run_menu_manager_action logs
@@ -1847,12 +1956,14 @@ installer_usage() {
   install.sh --menu
   install.sh --install
   install.sh --install --non-interactive [--mode keep|wireguard|socks]
-             [--swap auto|none|N] [--socks-port auto|PORT]
+             [--scope keep|google|global] [--swap auto|none|N]
+             [--socks-port auto|PORT]
 
   无参数 / --menu  需要终端；未安装时开始安装，已有安装时进入管理菜单
   --install         需要终端；进入安装、重装或模式切换流程
-  --non-interactive 禁止读取输入；全新默认 WireGuard、无 Swap 时创建 1G
+  --non-interactive 禁止读取输入；全新默认 Google 精准分流、WireGuard、无 Swap 时创建 1G
   --mode             选择模式；keep 仅适用于已有安装
+  --scope            选择路由范围；keep 仅适用于已有安装
   --swap             auto 默认按需创建 1G；N 为 GiB；none 明确跳过
   --socks-port       Socks5 使用自动空闲端口或指定端口
 EOF
@@ -1864,9 +1975,10 @@ installer_cli_error() {
 }
 
 parse_install_options() {
-  local seen_noninteractive=0 seen_mode=0 seen_swap=0 seen_port=0 value
+  local seen_noninteractive=0 seen_mode=0 seen_scope=0 seen_swap=0 seen_port=0 value
   INSTALL_NONINTERACTIVE=0
   INSTALL_MODE_OPTION=""
+  INSTALL_SCOPE_OPTION=""
   INSTALL_SWAP_OPTION=""
   INSTALL_SOCKS_PORT_OPTION=""
 
@@ -1889,6 +2001,18 @@ parse_install_options() {
         esac
         INSTALL_MODE_OPTION="$value"
         seen_mode=1
+        shift 2
+        ;;
+      --scope)
+        [ "$seen_scope" -eq 0 ] || { installer_cli_error "--scope 不能重复"; return 2; }
+        [ "$#" -ge 2 ] || { installer_cli_error "--scope 缺少参数"; return 2; }
+        value="$2"
+        case "$value" in
+          keep|google|global) ;;
+          *) installer_cli_error "--scope 只接受 keep、google 或 global"; return 2 ;;
+        esac
+        INSTALL_SCOPE_OPTION="$value"
+        seen_scope=1
         shift 2
         ;;
       --swap)
@@ -1927,8 +2051,9 @@ parse_install_options() {
   done
 
   if [ "$INSTALL_NONINTERACTIVE" -eq 0 ] \
-    && { [ "$seen_mode" -eq 1 ] || [ "$seen_swap" -eq 1 ] || [ "$seen_port" -eq 1 ]; }; then
-    installer_cli_error "--mode、--swap 和 --socks-port 必须与 --non-interactive 一起使用"
+    && { [ "$seen_mode" -eq 1 ] || [ "$seen_scope" -eq 1 ] \
+      || [ "$seen_swap" -eq 1 ] || [ "$seen_port" -eq 1 ]; }; then
+    installer_cli_error "--mode、--scope、--swap 和 --socks-port 必须与 --non-interactive 一起使用"
     return 2
   fi
 }
@@ -1985,25 +2110,29 @@ main() {
   require_systemd
   validate_repo_raw_base "$REPO_RAW_BASE"
 
-  local selected_mode warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
+  local selected_mode selected_scope warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
   local reusable_warp_port=""
   local reusable_redsocks_port=""
-  local prompted_mode locked_mode locked_warp_port locked_redsocks_port
+  local prompted_mode prompted_scope locked_mode locked_scope locked_warp_port locked_redsocks_port
   local preserve_warp_service=0
   if [ -e "$CONFIG_FILE" ]; then
     [ -r "$CONFIG_FILE" ] || die "现有配置无法读取，未修改当前运行态：$CONFIG_FILE"
     prompted_mode="$(read_project_mode)" \
       || die "现有配置缺少有效的 WARP_MODE，未修改当前运行态：$CONFIG_FILE"
+    prompted_scope="$(read_project_scope)" \
+      || die "现有配置包含无效的 WARP_SCOPE，未修改当前运行态：$CONFIG_FILE"
   else
     prompted_mode=""
+    prompted_scope="google"
   fi
-  selected_mode="$(select_install_mode "$prompted_mode")"
+  collect_swap_choice
+  selected_scope="$(select_route_scope "$prompted_scope")"
+  selected_mode="$(select_install_mode "$prompted_mode" "$selected_scope")"
   TARGET_MODE="$selected_mode"
   if [ "$selected_mode" = "wireguard" ] && [ -n "$INSTALL_SOCKS_PORT_OPTION" ]; then
     installer_cli_error "WireGuard 模式不能使用 --socks-port"
     return 2
   fi
-  collect_swap_choice
   if [ "$prompted_mode" = "socks" ]; then
     reusable_warp_port="$(read_project_warp_port || true)"
     reusable_redsocks_port="$(read_project_redsocks_port || true)"
@@ -2028,8 +2157,15 @@ main() {
 
   acquire_operation_lock
   locked_mode="$(read_project_mode || true)"
+  if [ -e "$CONFIG_FILE" ]; then
+    locked_scope="$(read_project_scope || true)"
+  else
+    locked_scope="google"
+  fi
   [ "$locked_mode" = "$prompted_mode" ] \
     || die "等待输入期间安装模式已被其他管理操作修改，请重新运行安装器"
+  [ "$locked_scope" = "$prompted_scope" ] \
+    || die "等待输入期间路由范围已被其他管理操作修改，请重新运行安装器"
   if [ "$prompted_mode" = "socks" ]; then
     locked_warp_port="$(read_project_warp_port || true)"
     locked_redsocks_port="$(read_project_redsocks_port || true)"
@@ -2058,7 +2194,7 @@ main() {
   apply_swap_choice
 
   log "正在安装依赖"
-  install_dependencies "$selected_mode"
+  install_dependencies "$selected_mode" "$selected_scope"
   validate_staged_rules "$PROJECT_STAGE_DIR" || die "下载的规则快照校验失败"
 
   if [ "$selected_mode" = "socks" ]; then
@@ -2085,7 +2221,7 @@ main() {
 
   TARGET_CONFIG_FILE="$PROJECT_STAGE_DIR/config.env"
   write_config_file "$TARGET_CONFIG_FILE" "$selected_mode" "$warp_port" "$redsocks_port" \
-    "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
+    "$redsocks_uid" "$redsocks_group" "$redsocks_bin" "$selected_scope"
   if current_backend_reusable "$selected_mode" "$warp_port" "$reusable_warp_port"; then
     INSTALL_BACKEND_REUSED=1
     log "当前 ${selected_mode} 后端本地运行正常，重装期间保持运行"
@@ -2114,7 +2250,8 @@ main() {
   log "正在安装项目文件和管理命令"
   INSTALL_FILES_ACTIVATED=1
   activate_project_files || die "项目文件写入失败"
-  write_config "$selected_mode" "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" "$redsocks_bin"
+  write_config "$selected_mode" "$warp_port" "$redsocks_port" "$redsocks_uid" "$redsocks_group" \
+    "$redsocks_bin" "$selected_scope"
   if [ "$selected_mode" = "socks" ] && [ "$INSTALL_BACKEND_REUSED" -eq 0 ] \
     && [ "$TARGET_BACKEND_PREPARED" -eq 0 ]; then
     log "正在应用新的 Cloudflare WARP SOCKS 端口：$warp_port"
@@ -2158,10 +2295,19 @@ main() {
   if [ "$selected_mode" = "socks" ]; then
     printf 'WARP SOCKS 端口：%s\n' "$warp_port"
   fi
+  if [ "$selected_scope" = "global" ]; then
+    printf '路由范围：全局走 WARP\n'
+  else
+    printf '路由范围：精准分流 Google 服务\n'
+  fi
   printf '交互菜单：warp-vps\n'
   printf '显式命令：warp-vps {status|test|restart|unlock-check|update|reinstall|switch|logs|uninstall}\n'
-  if [ "$selected_mode" = "socks" ]; then
+  if [ "$selected_mode" = "socks" ] && [ "$selected_scope" = "global" ]; then
+    printf 'Socks5 全局模式会把 VPS 主动发起的公网 IPv4 TCP 透明转发到 WARP；入站连接回包保持原生路径，Google IPv4 UDP/443（QUIC）和 Google IPv6 继续拒绝。\n'
+  elif [ "$selected_mode" = "socks" ]; then
     printf 'Google IPv4 UDP/443（QUIC）已拒绝，支持回落的客户端会改用经 WARP 的 TCP；Google 目标 IPv6 继续拒绝。\n'
+  elif [ "$selected_scope" = "global" ]; then
+    printf 'WireGuard 全局模式会把 IPv4、IPv6、TCP、UDP 和 QUIC 流量路由到 WARP。\n'
   else
     printf 'WireGuard 模式会把命中 Google CIDR 的 IPv4、IPv6、TCP、UDP 和 QUIC 流量路由到 WARP。\n'
   fi

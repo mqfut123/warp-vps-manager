@@ -41,8 +41,129 @@ jobs:
       - name: Install ShellCheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y iproute2 iputils-ping nftables shellcheck
       - name: Run ShellCheck
         run: shellcheck install.sh bin/warp-vps tests/*.sh
       - name: Run regression tests
         run: bash tests/run.sh
+      - name: Validate Linux global routing primitives
+        run: |
+          sudo env REPO_ROOT="$PWD" RUNNER_TEMP="$RUNNER_TEMP" bash <<'BASH'
+          set -Eeuo pipefail
+          source "$REPO_ROOT/bin/warp-vps"
+
+          RULES_DIR="$REPO_ROOT/rules"
+          WARP_SCOPE=global
+          REDSOCKS_UID=65534
+          REDSOCKS_PORT=23456
+          NFT_CONF="$RUNNER_TEMP/warp-vps-socks-global.nft"
+          table_exists() { return 1; }
+          render_nft_conf
+
+          NFT_CONF="$RUNNER_TEMP/warp-vps-wireguard-global.nft"
+          render_wg_global_nft_conf
+
+          server="warp-vps-server-$$"
+          router="warp-vps-router-$$"
+          client="warp-vps-client-$$"
+          echo_pid=""
+          cleanup() {
+            [ -z "$echo_pid" ] || kill "$echo_pid" >/dev/null 2>&1 || true
+            ip netns del "$server" >/dev/null 2>&1 || true
+            ip netns del "$router" >/dev/null 2>&1 || true
+            ip netns del "$client" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          ip netns add "$server"
+          ip netns add "$router"
+          ip netns add "$client"
+
+          ip link add ws0 type veth peer name wr0
+          ip link set ws0 netns "$server"
+          ip link set wr0 netns "$router"
+          ip link add wc0 type veth peer name wr1
+          ip link set wc0 netns "$client"
+          ip link set wr1 netns "$router"
+          ip -n "$server" link set ws0 name eth0
+          ip -n "$router" link set wr0 name eth0
+          ip -n "$client" link set wc0 name eth0
+          ip -n "$router" link set wr1 name eth1
+
+          for namespace in "$server" "$router" "$client"; do
+            ip -n "$namespace" link set lo up
+          done
+          ip -n "$server" address add 192.0.2.2/24 dev eth0
+          ip -n "$router" address add 192.0.2.1/24 dev eth0
+          ip -n "$router" address add 198.51.100.1/24 dev eth1
+          ip -n "$client" address add 198.51.100.2/24 dev eth0
+          ip -n "$server" link set eth0 up
+          ip -n "$router" link set eth0 up
+          ip -n "$router" link set eth1 up
+          ip -n "$client" link set eth0 up
+          ip -n "$server" route add default via 192.0.2.1
+          ip -n "$client" route add default via 198.51.100.1
+          ip netns exec "$router" sysctl -qw net.ipv4.ip_forward=1
+
+          ip -n "$server" link add warp-vps-wg type dummy
+          ip -n "$server" link set warp-vps-wg up
+          ip netns exec "$server" nft -f "$RUNNER_TEMP/warp-vps-socks-global.nft"
+          ip netns exec "$server" nft -f "$RUNNER_TEMP/warp-vps-wireguard-global.nft"
+          ip netns exec "$server" nft list chain inet warp_vps_global prerouting \
+            | grep -Eq 'fib daddr type local.*ct direction original.*meta mark set (0x0*ca[bB]0|51888).*ct mark set meta mark'
+          ip netns exec "$server" nft list chain inet warp_vps_global output \
+            | grep -Eq 'ct mark (0x0*ca[bB]0|51888).*meta mark set ct mark'
+          ip netns exec "$server" nft list chain inet warp_vps_global postrouting \
+            | grep -Eq 'meta l4proto udp.*meta mark (0x0*ca[bB]0|51888).*ct mark set meta mark'
+
+          ip netns exec "$server" ip -4 route replace default dev warp-vps-wg table 51888
+          ip netns exec "$server" ip -6 route replace default dev warp-vps-wg table 51888
+          ip netns exec "$server" ip -4 rule add priority 18000 table main suppress_prefixlength 0
+          ip netns exec "$server" ip -6 rule add priority 18000 table main suppress_prefixlength 0
+          ip netns exec "$server" ip -4 rule add not fwmark 51888 table 51888 priority 18001
+          ip netns exec "$server" ip -6 rule add not fwmark 51888 table 51888 priority 18001
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.all.src_valid_mark=1
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.all.rp_filter=1
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.eth0.rp_filter=1
+
+          ip netns exec "$server" ip -4 route get 198.51.100.2 \
+            | grep -Fq 'dev warp-vps-wg'
+          ip netns exec "$server" ip -4 route get 198.51.100.2 mark 51888 \
+            | grep -Fq 'via 192.0.2.1 dev eth0'
+          ip netns exec "$client" ping -c 3 -W 1 192.0.2.2
+
+          endpoint_ready="$RUNNER_TEMP/warp-vps-endpoint-ready"
+          ip netns exec "$client" env ENDPOINT_READY="$endpoint_ready" python3 - <<'PY' &
+          import os
+          import pathlib
+          import socket
+
+          sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          sock.bind(("198.51.100.2", 51888))
+          pathlib.Path(os.environ["ENDPOINT_READY"]).touch()
+          data, peer = sock.recvfrom(1024)
+          sock.sendto(data, peer)
+          PY
+          echo_pid=$!
+          for _ in $(seq 1 50); do
+            [ -e "$endpoint_ready" ] && break
+            sleep 0.1
+          done
+          [ -e "$endpoint_ready" ]
+          ip netns exec "$server" python3 - <<'PY'
+          import socket
+
+          sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, 51888)
+          sock.bind(("192.0.2.2", 0))
+          sock.settimeout(3)
+          sock.sendto(b"warp-vps-endpoint", ("198.51.100.2", 51888))
+          assert sock.recv(1024) == b"warp-vps-endpoint"
+          PY
+          wait "$echo_pid"
+          echo_pid=""
+
+          ip netns exec "$server" ip -4 rule del not fwmark 51888 table 51888 priority 18001
+          ip netns exec "$server" ip -6 rule del not fwmark 51888 table 51888 priority 18001
+          ip netns exec "$server" ip -4 rule del table main suppress_prefixlength 0 priority 18000
+          ip netns exec "$server" ip -6 rule del table main suppress_prefixlength 0 priority 18000
+          BASH

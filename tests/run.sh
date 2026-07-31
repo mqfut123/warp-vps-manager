@@ -153,6 +153,81 @@ test_reinstall_keeps_current_mode_by_default() {
     'reinstalling an existing WireGuard setup must keep WireGuard on empty input'
 }
 
+test_route_scope_prompt_and_defaults() {
+  source_without_main "$INSTALL_SCRIPT"
+  CONFIG_FILE="${FIXTURE_DIR}/config/missing.env"
+
+  local answer_index=0
+  local answers=('invalid' '')
+  read_input() {
+    printf -v "$1" '%s' "${answers[$answer_index]}"
+    answer_index=$((answer_index + 1))
+  }
+  local output prompt_log
+  prompt_log="$(mktemp)"
+  output="$(prompt_route_scope 2> "$prompt_log")" || {
+    fail 'prompt_route_scope exited instead of asking again'
+    return 1
+  }
+  assert_contains "$(< "$prompt_log")" '输入无效' \
+    'an invalid scope choice must be asked again' || return 1
+  output="${output##*$'\n'}"
+  assert_eq 'google' "$output" \
+    'empty scope input after an invalid choice must select precise Google routing' || return 1
+
+  local answer='1'
+  read_input() { printf -v "$1" '%s' "$answer"; }
+  assert_eq 'google' "$(prompt_route_scope 2>/dev/null)" \
+    'explicit scope option 1 must select precise Google routing' || return 1
+
+  answer='2'
+  assert_eq 'global' "$(prompt_route_scope 2>/dev/null)" \
+    'explicit scope option 2 must select global routing'
+}
+
+test_route_scope_config_is_backward_compatible() {
+  source_without_main "$INSTALL_SCRIPT"
+  source_without_main "$MANAGER_SCRIPT"
+  local root output rc=0
+  root="$(mktemp -d)"
+  CONFIG_FILE="$root/config.env"
+  printf '%s\n' \
+    'WARP_MODE=wireguard' \
+    'WARP_SOCKS_PORT=0' \
+    'REDSOCKS_PORT=0' \
+    'REDSOCKS_USER=warp-vps-redsocks' \
+    'REDSOCKS_UID=991' \
+    'REDSOCKS_GROUP=warp-vps-redsocks' \
+    'REDSOCKS_BIN=/usr/sbin/redsocks' \
+    'WG_IFACE=warp-vps-wg' \
+    'WGCF_BIN=/opt/warp-vps-manager/bin/wgcf' \
+    'WG_CONFIG=/etc/wireguard/warp-vps-wg.conf' \
+    'MANAGED_WARP_SVC=0' \
+    'MANAGED_REDSOCKS_BIN=0' \
+    > "$CONFIG_FILE"
+
+  load_config
+  assert_eq 'google' "$WARP_SCOPE" \
+    'a legacy config without WARP_SCOPE must retain precise Google routing' || return 1
+  assert_eq 'google' "$(read_project_scope)" \
+    'the installer must read a missing legacy scope as Google' || return 1
+
+  printf 'WARP_SCOPE=global\n' >> "$CONFIG_FILE"
+  load_config
+  assert_eq 'global' "$WARP_SCOPE" 'an explicit global scope must survive config loading' || return 1
+  assert_eq 'global' "$(read_project_scope)" \
+    'the installer must preserve the explicit scope during reinstall' || return 1
+
+  sed -i.bak 's/^WARP_SCOPE=global$/WARP_SCOPE=invalid/' "$CONFIG_FILE"
+  rc=0
+  output="$(load_config 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'an invalid WARP_SCOPE must not be accepted'
+    return 1
+  }
+  assert_contains "$output" 'WARP_SCOPE' 'the invalid scope error must name its config field'
+}
+
 test_existing_config_validation_precedes_runtime_mutation() {
   source_without_main "$INSTALL_SCRIPT"
   local root event_log output rc=0
@@ -323,8 +398,8 @@ test_stdin_execution_without_bash_source() {
 
   guard="$(tail -n 3 "$INSTALL_SCRIPT")"
   output="$(printf 'dispatch_installer() { printf "%%s" "$*"; }\n%s\n' "$guard" \
-    | bash -s -- --install --non-interactive --mode wireguard)"
-  assert_eq '--install --non-interactive --mode wireguard' "$output" \
+    | bash -s -- --install --non-interactive --scope global --mode wireguard)"
+  assert_eq '--install --non-interactive --scope global --mode wireguard' "$output" \
     'bash -s -- must deliver noninteractive installer arguments through the stdin entrypoint'
 }
 
@@ -374,8 +449,9 @@ test_installer_noninteractive_option_contract() {
   source_without_main "$INSTALL_SCRIPT"
   local rc=0 output
 
-  parse_install_options --non-interactive --mode socks --swap 2 --socks-port 24567
+  parse_install_options --non-interactive --scope global --mode socks --swap 2 --socks-port 24567
   assert_eq '1' "$INSTALL_NONINTERACTIVE" 'noninteractive parsing must set its execution mode' || return 1
+  assert_eq 'global' "$INSTALL_SCOPE_OPTION" 'the requested routing scope must be retained' || return 1
   assert_eq 'socks' "$INSTALL_MODE_OPTION" 'the requested mode must be retained' || return 1
   assert_eq '2' "$INSTALL_SWAP_OPTION" 'the requested Swap size must be retained' || return 1
   assert_eq '24567' "$INSTALL_SOCKS_PORT_OPTION" 'the requested Socks port must be retained' || return 1
@@ -385,7 +461,11 @@ test_installer_noninteractive_option_contract() {
 
   for args in \
     '--mode socks' \
+    '--scope global' \
     '--non-interactive --non-interactive' \
+    '--non-interactive --scope' \
+    '--non-interactive --scope invalid' \
+    '--non-interactive --scope google --scope global' \
     '--non-interactive --mode' \
     '--non-interactive --mode invalid' \
     '--non-interactive --mode socks --mode wireguard' \
@@ -416,7 +496,29 @@ test_installer_noninteractive_option_contract() {
   output="$(select_install_mode '' 2>&1)" || rc=$?
   assert_eq '2' "$rc" 'explicit keep on a fresh host must be a usage error' || return 1
   assert_contains "$output" '全新安装不能使用 --mode keep' \
-    'fresh keep rejection must explain the conflict'
+    'fresh keep rejection must explain the conflict' || return 1
+
+  INSTALL_SCOPE_OPTION=''
+  assert_eq 'google' "$(select_route_scope '')" \
+    'fresh noninteractive installation must default to precise Google routing' || return 1
+  assert_eq 'global' "$(select_route_scope global)" \
+    'noninteractive reinstall without --scope must retain the current global scope' || return 1
+  assert_eq 'google' "$(select_route_scope google)" \
+    'noninteractive reinstall without --scope must retain the current Google scope' || return 1
+
+  INSTALL_SCOPE_OPTION=keep
+  rc=0
+  output="$(select_route_scope '' 2>&1)" || rc=$?
+  assert_eq '2' "$rc" 'explicit scope keep on a fresh host must be a usage error' || return 1
+  assert_contains "$output" '全新安装不能使用 --scope keep' \
+    'fresh scope keep rejection must explain the conflict' || return 1
+
+  INSTALL_SCOPE_OPTION=google
+  assert_eq 'google' "$(select_route_scope global)" \
+    'an explicit Google scope must override the current global scope' || return 1
+  INSTALL_SCOPE_OPTION=global
+  assert_eq 'global' "$(select_route_scope google)" \
+    'an explicit global scope must override the current Google scope'
 }
 
 test_installer_rejects_semantic_conflicts_before_side_effects() {
@@ -485,7 +587,7 @@ test_installer_noninteractive_entry_never_reads_tty() {
   installer_menu() { calls="${calls}menu "; }
   read_input() { calls="${calls}read "; return 1; }
   main() {
-    calls="${calls}install:${INSTALL_NONINTERACTIVE}:${INSTALL_MODE_OPTION}:${INSTALL_SWAP_OPTION} "
+    calls="${calls}install:${INSTALL_NONINTERACTIVE}:${INSTALL_SCOPE_OPTION}:${INSTALL_MODE_OPTION}:${INSTALL_SWAP_OPTION} "
   }
 
   dispatch_installer >/dev/null 2>&1 || rc=$?
@@ -502,8 +604,8 @@ test_installer_noninteractive_entry_never_reads_tty() {
   assert_eq '2' "$rc" 'interactive install without a TTY must return usage status' || return 1
   assert_eq '' "$calls" 'an interactive no-TTY install must not start main' || return 1
 
-  dispatch_installer --install --non-interactive --mode wireguard --swap none
-  assert_eq 'install:1:wireguard:none ' "$calls" \
+  dispatch_installer --install --non-interactive --scope global --mode wireguard --swap none
+  assert_eq 'install:1:global:wireguard:none ' "$calls" \
     'the explicit noninteractive entry must reach main without reading input'
 }
 
@@ -795,20 +897,30 @@ test_menu_contract_is_documented_without_a_second_switch_path() {
     'the menu must not add a second manager lock' || return 1
   assert_file_matches "$README_FILE" 'warp-vps` 或 `warp-vps menu`' \
     'README should document both interactive menu entries' || return 1
-  assert_file_matches "$README_FILE" '检测到已有项目安装时.*进入全局管理菜单' \
+  assert_file_matches "$README_FILE" '检测到已有项目安装时.*进入管理菜单' \
     'README should distinguish fresh installation from the installed curl entry'
 }
 
 test_inputs_precede_side_effects() {
-  local body mode_line port_line marker marker_line
+  local body swap_line scope_line mode_line port_line marker marker_line
   body="$(function_body "$INSTALL_SCRIPT" main)"
   [ -n "$body" ] || {
     fail 'could not extract install.sh main()'
     return 1
   }
 
+  swap_line="$(line_number "$body" 'collect_swap_choice')"
+  scope_line="$(line_number "$body" 'select_route_scope')"
   mode_line="$(line_number "$body" 'select_install_mode')"
   port_line="$(awk '/select_noninteractive_warp_port|prompt_warp_port/ { line=NR } END { print line }' <<< "$body")"
+  [ -n "$swap_line" ] || {
+    fail 'main() does not collect the Swap choice'
+    return 1
+  }
+  [ -n "$scope_line" ] || {
+    fail 'main() does not collect the routing scope'
+    return 1
+  }
   [ -n "$mode_line" ] || {
     fail 'main() does not collect the install mode'
     return 1
@@ -817,6 +929,11 @@ test_inputs_precede_side_effects() {
     fail 'main() does not collect the Socks port'
     return 1
   }
+  if [ "$swap_line" -ge "$scope_line" ] || [ "$scope_line" -ge "$mode_line" ] \
+    || [ "$mode_line" -ge "$port_line" ]; then
+    fail 'interactive choices must be collected in Swap, scope, backend, Socks-port order'
+    return 1
+  fi
 
   for marker in apply_swap_choice install_dependencies preflight_nft_nat ensure_redsocks_user stage_project_files backup_project_files activate_project_files write_config configure-warp; do
     marker_line="$(line_number "$body" "$marker")"
@@ -1689,6 +1806,7 @@ test_wireguard_config_generation_is_retryable() {
 
 test_wireguard_route_failures_cleanup() {
   source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   RULES_DIR="${ROOT_DIR}/rules"
   local fail_on die_message ip_calls ip_log routes4 routes6 route_del_calls
@@ -1707,6 +1825,8 @@ test_wireguard_route_failures_cleanup() {
   wg_interface_absent() { return 1; }
   protect_ssh_peer_route() { :; }
   wireguard_routes_local_ok() { return 0; }
+  stop_wg_global_routes() { :; }
+  wg_global_routes_absent() { return 0; }
   route_file_lines() {
     case "$1" in
       *google_ipv4.txt) printf '%s\n' 8.8.8.0/24 8.8.4.0/24 8.34.208.0/20 ;;
@@ -1742,11 +1862,16 @@ test_wireguard_route_failures_cleanup() {
         fi
         ;;
       del)
-        route_del_calls=$((route_del_calls + 1))
         if [ "$1" = -4 ]; then
-          remove_mock_route routes4 "$4"
+          if grep -Fxq "$4" <<< "$routes4"; then
+            route_del_calls=$((route_del_calls + 1))
+            remove_mock_route routes4 "$4"
+          fi
         else
-          remove_mock_route routes6 "$4"
+          if grep -Fxq "$4" <<< "$routes6"; then
+            route_del_calls=$((route_del_calls + 1))
+            remove_mock_route routes6 "$4"
+          fi
         fi
         ;;
       *) return 1 ;;
@@ -1803,6 +1928,7 @@ test_wireguard_route_failures_cleanup() {
 
 test_wireguard_routes_work_without_native_ipv6() {
   source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   RULES_DIR=/unused
   local routes4='' routes6='' ip_calls=''
@@ -1811,6 +1937,8 @@ test_wireguard_routes_work_without_native_ipv6() {
   validate_rules_file() { :; }
   wg_interface_is_wireguard() { return 0; }
   protect_ssh_peer_route() { :; }
+  stop_wg_global_routes() { :; }
+  wg_global_routes_absent() { return 0; }
   socks_table_absent() { return 0; }
   route_file_lines() {
     case "$1" in
@@ -1854,6 +1982,7 @@ test_wireguard_route_cleanup_is_dual_stack_independent() {
   temp_rules="$(mktemp -d)"
   WG_IFACE=warp-vps-wg
   RULES_DIR="$temp_rules"
+  stop_wg_global_routes() { :; }
 
   ip() { route_calls="${route_calls}$*\n"; }
   printf '2001:4860::/32\n' > "${RULES_DIR}/google_ipv6.txt"
@@ -1877,6 +2006,8 @@ test_wireguard_strict_cleanup_checks_actual_route_state() {
   temp_rules="$(mktemp -d)"
   RULES_DIR="$temp_rules"
   WG_IFACE=warp-vps-wg
+  stop_wg_global_routes() { :; }
+  wg_global_routes_absent() { return 0; }
   printf '8.8.8.0/24\n' > "$RULES_DIR/google_ipv4.txt"
   printf '2001:4860::/32\n' > "$RULES_DIR/google_ipv6.txt"
   wg_interface_absent() {
@@ -1972,6 +2103,7 @@ test_wireguard_strict_cleanup_checks_actual_route_state() {
 
 test_wireguard_local_route_boundary_is_fail_closed() {
   source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   RULES_DIR=/unused
 
@@ -1997,6 +2129,7 @@ test_wireguard_local_route_boundary_is_fail_closed() {
   route_uses_wg4() { return 0; }
   route_uses_wg6() { return 0; }
   wg_default_routes_absent() { return 0; }
+  wg_global_routes_absent() { return 0; }
   socks_table_absent() { return 0; }
   wireguard_routes_local_ok || {
     fail 'representative dual-stack routes without a project default route should pass'
@@ -2010,8 +2143,282 @@ test_wireguard_local_route_boundary_is_fail_closed() {
   fi
 }
 
+test_wireguard_scope_selects_precise_or_global_routes() {
+  source_without_main "$MANAGER_SCRIPT"
+  local trace_file trace
+  trace_file="$(mktemp)"
+  : > "$trace_file"
+  rule_probe_ip() {
+    printf 'probe:%s\n' "$2" >> "$trace_file"
+    case "$2" in
+      4) printf '8.8.8.0\n' ;;
+      6) printf '2001:4860::\n' ;;
+    esac
+  }
+  route_uses_wg4() { printf 'route4\n' >> "$trace_file"; return 0; }
+  route_uses_wg6() { printf 'route6\n' >> "$trace_file"; return 0; }
+  wg_default_routes_absent() { return 0; }
+  wg_global_routes_absent() { return 0; }
+  wireguard_global_routes_local_ok() { printf 'global\n' >> "$trace_file"; return 0; }
+  WG_IFACE=warp-vps-wg
+  RULES_DIR=/unused
+
+  WARP_SCOPE=google
+  wireguard_routes_local_ok || {
+    fail 'precise Google WireGuard routing should retain its existing local check'
+    return 1
+  }
+  trace="$(< "$trace_file")"
+  assert_contains "$trace" 'probe:4' \
+    'precise WireGuard routing must still probe Google IPv4' || return 1
+  assert_contains "$trace" 'probe:6' \
+    'precise WireGuard routing must still probe Google IPv6' || return 1
+  assert_contains "$trace" 'route4' \
+    'precise WireGuard routing must still check the Google IPv4 route' || return 1
+  assert_contains "$trace" 'route6' \
+    'precise WireGuard routing must still check the Google IPv6 route' || return 1
+  assert_not_contains "$trace" 'global' \
+    'precise WireGuard routing must not accept the global policy check' || return 1
+
+  : > "$trace_file"
+  WARP_SCOPE=global
+  wireguard_routes_local_ok || {
+    fail 'global WireGuard routing should use its global policy check'
+    return 1
+  }
+  trace="$(< "$trace_file")"
+  assert_contains "$trace" 'global' \
+    'global WireGuard routing must run the global check' || return 1
+  assert_not_contains "$trace" 'probe:' \
+    'global WireGuard routing must not fall back to the Google-only probes' || return 1
+
+  wireguard_global_routes_local_ok() { return 1; }
+  if wireguard_routes_local_ok; then
+    fail 'an incomplete global WireGuard policy must fail the scope-aware local check'
+    return 1
+  fi
+}
+
+test_wireguard_global_apply_uses_owned_policy_state() {
+  source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=global
+  WG_IFACE=warp-vps-wg
+  NFT_CONF=/tmp/warp-vps-test-global.nft
+  local events=''
+  stop_wg_global_routes() { events="${events}stop-global"$'\n'; }
+  enable_wg_global_src_valid_mark() { events="${events}enable-src-valid-mark"$'\n'; }
+  render_wg_global_nft_conf() { events="${events}render-global-nft"$'\n'; }
+  nft() { events="${events}nft:$*"$'\n'; }
+  wg() { events="${events}wg:$*"$'\n'; }
+  ip() { events="${events}ip:$*"$'\n'; }
+  wireguard_global_routes_local_ok() { return 0; }
+
+  apply_wg_global_routes || {
+    fail 'the complete global WireGuard policy should apply successfully'
+    return 1
+  }
+  assert_contains "$events" 'stop-global' \
+    'global WireGuard apply must first clear its previous owned policy state' || return 1
+  assert_contains "$events" 'enable-src-valid-mark' \
+    'global WireGuard apply must include packet marks in strict reverse-path checks' || return 1
+  assert_contains "$events" 'render-global-nft' \
+    'global WireGuard apply must render its reply-mark table' || return 1
+  assert_contains "$events" 'nft:-c -f /tmp/warp-vps-test-global.nft' \
+    'global WireGuard apply must syntax-check its nftables state before activation' || return 1
+  assert_contains "$events" 'nft:-f /tmp/warp-vps-test-global.nft' \
+    'global WireGuard apply must activate the checked nftables state' || return 1
+  assert_contains "$events" 'wg:set warp-vps-wg fwmark 51888' \
+    'global WireGuard apply must assign the project fwmark' || return 1
+  assert_contains "$events" 'ip:-4 route replace default dev warp-vps-wg table 51888' \
+    'global WireGuard apply must own its IPv4 default in table 51888' || return 1
+  assert_contains "$events" 'ip:-6 route replace default dev warp-vps-wg table 51888' \
+    'global WireGuard apply must own its IPv6 default in table 51888' || return 1
+  assert_contains "$events" \
+    'ip:-4 rule add priority 18000 table main suppress_prefixlength 0' \
+    'global IPv4 policy must consult non-default main routes first' || return 1
+  assert_contains "$events" \
+    'ip:-6 rule add priority 18000 table main suppress_prefixlength 0' \
+    'global IPv6 policy must consult non-default main routes first' || return 1
+  assert_contains "$events" \
+    'ip:-4 rule add not fwmark 51888 table 51888 priority 18001' \
+    'unmarked IPv4 traffic must use the project global table' || return 1
+  assert_contains "$events" \
+    'ip:-6 rule add not fwmark 51888 table 51888 priority 18001' \
+    'unmarked IPv6 traffic must use the project global table'
+}
+
+test_wireguard_global_reply_mark_and_stop_contract() {
+  source_without_main "$MANAGER_SCRIPT"
+  WG_IFACE=warp-vps-wg
+  NFT_CONF=/dev/stdout
+  local rendered events=''
+  nft() {
+    case "$*" in
+      'list table inet warp_vps_global') return 1 ;;
+      *) events="${events}nft:$*"$'\n' ;;
+    esac
+  }
+  chmod() { :; }
+  rendered="$(render_wg_global_nft_conf)"
+  assert_contains "$rendered" 'add table inet warp_vps_global' \
+    'global WireGuard must use its dedicated nftables table' || return 1
+  assert_contains "$rendered" \
+    'add chain inet warp_vps_global prerouting { type filter hook prerouting priority mangle; policy accept; }' \
+    'global WireGuard must restore bypass marks before reverse-path filtering' || return 1
+  assert_contains "$rendered" \
+    'add chain inet warp_vps_global output { type route hook output priority mangle; policy accept; }' \
+    'global WireGuard must mark replies in an output route chain' || return 1
+  assert_contains "$rendered" \
+    'add chain inet warp_vps_global postrouting { type filter hook postrouting priority mangle; policy accept; }' \
+    'global WireGuard must save the tunnel endpoint mark after route selection' || return 1
+  assert_contains "$rendered" \
+    'add rule inet warp_vps_global prerouting ct mark 51888 meta mark set ct mark' \
+    'global WireGuard must restore saved marks on incoming packets' || return 1
+  assert_contains "$rendered" \
+    'iifname != "lo" iifname != "warp-vps-wg" fib daddr type local ct direction original meta mark set 51888 ct mark set meta mark' \
+    'new native inbound connections must save the bypass mark before reverse-path filtering' || return 1
+  assert_contains "$rendered" \
+    'add rule inet warp_vps_global output ct mark 51888 meta mark set ct mark' \
+    'replies to native inbound connections must restore the bypass mark' || return 1
+  assert_contains "$rendered" \
+    'add rule inet warp_vps_global postrouting meta l4proto udp meta mark 51888 ct mark set meta mark' \
+    'WireGuard endpoint packets must save their fwmark in conntrack' || return 1
+
+  events=''
+  command() {
+    if [ "${1:-}" = '-v' ] && [ "${2:-}" = nft ]; then return 0; fi
+    builtin command "$@"
+  }
+  ip() { events="${events}ip:$*"$'\n'; return 1; }
+  nft() {
+    events="${events}nft:$*"$'\n'
+    [ "$*" != 'list table inet warp_vps_global' ] || return 0
+  }
+  wg_interface_is_wireguard() { return 0; }
+  wg() { events="${events}wg:$*"$'\n'; }
+  stop_wg_global_routes
+  assert_contains "$events" \
+    'ip:-4 rule del not fwmark 51888 table 51888 priority 18001' \
+    'global stop must delete the owned IPv4 global rule' || return 1
+  assert_contains "$events" \
+    'ip:-6 rule del not fwmark 51888 table 51888 priority 18001' \
+    'global stop must delete the owned IPv6 global rule' || return 1
+  assert_contains "$events" \
+    'ip:-4 rule del table main suppress_prefixlength 0 priority 18000' \
+    'global stop must delete the owned IPv4 main-suppression rule' || return 1
+  assert_contains "$events" \
+    'ip:-6 rule del table main suppress_prefixlength 0 priority 18000' \
+    'global stop must delete the owned IPv6 main-suppression rule' || return 1
+  assert_contains "$events" 'ip:-4 route del default dev warp-vps-wg table 51888' \
+    'global stop must delete the owned IPv4 table default' || return 1
+  assert_contains "$events" 'ip:-6 route del default dev warp-vps-wg table 51888' \
+    'global stop must delete the owned IPv6 table default' || return 1
+  assert_contains "$events" 'nft:delete table inet warp_vps_global' \
+    'global stop must remove its dedicated nftables table' || return 1
+  assert_contains "$events" 'wg:set warp-vps-wg fwmark off' \
+    'global stop must clear the project WireGuard fwmark'
+}
+
+test_wireguard_global_src_valid_mark_boundary() {
+  source_without_main "$MANAGER_SCRIPT"
+  local temp_mark
+  temp_mark="$(mktemp)"
+  WG_GLOBAL_SRC_VALID_MARK_PATH="$temp_mark"
+  printf '0\n' > "$temp_mark"
+
+  if wg_global_src_valid_mark_ok; then
+    fail 'a disabled src_valid_mark must fail the global WireGuard boundary check'
+    return 1
+  fi
+  enable_wg_global_src_valid_mark || {
+    fail 'global WireGuard should enable src_valid_mark through the kernel control file'
+    return 1
+  }
+  wg_global_src_valid_mark_ok || {
+    fail 'the enabled src_valid_mark must pass the global WireGuard boundary check'
+    return 1
+  }
+  chmod 0444 "$temp_mark"
+  enable_wg_global_src_valid_mark || {
+    fail 'an already enabled read-only src_valid_mark must not block global WireGuard'
+    return 1
+  }
+}
+
+test_wireguard_global_policy_ownership_is_exact() {
+  source_without_main "$MANAGER_SCRIPT"
+  local rules4 rules6
+  rules4=$'18000: from all lookup 100\n18001: from all lookup 101'
+  rules6="$rules4"
+  ip() {
+    case "$*" in
+      '-4 rule show') printf '%s\n' "$rules4" ;;
+      '-6 rule show') printf '%s\n' "$rules6" ;;
+      *) return 1 ;;
+    esac
+  }
+
+  wg_global_policy_rules_absent || {
+    fail 'unrelated policy rules that reuse the priorities must not count as project state'
+    return 1
+  }
+
+  rules4=$'18000: from all lookup main suppress_prefixlength 0\n18001: not from all fwmark 0xcab0 lookup 51888'
+  rules6=$'18000: from all lookup main suppress_prefixlength 0\n18001: not from all fwmark 51888 lookup 51888'
+  wg_global_policy_rules_present || {
+    fail 'the exact project policy rules must pass the global WireGuard check'
+    return 1
+  }
+  if wg_global_policy_rules_absent; then
+    fail 'the exact project policy rules must not pass the absence check'
+    return 1
+  fi
+
+  rules6=$'18000: from all lookup main suppress_prefixlength 0\n18001: from all fwmark 51888 lookup 51888'
+  if wg_global_policy_rules_present; then
+    fail 'a positive fwmark rule must not be accepted in place of the required not-fwmark rule'
+    return 1
+  fi
+}
+
+test_status_reports_backend_and_route_scope() {
+  source_without_main "$MANAGER_SCRIPT"
+  local lines=''
+  require_root() { :; }
+  load_config() { :; }
+  section() { :; }
+  info_line() { lines="${lines}$1"$'\n'; }
+  print_rule_summary() { :; }
+  run_self_check() { :; }
+  mask_repo_url() { printf 'https://example.invalid/project\n'; }
+  REPO_RAW_BASE=https://example.invalid/project
+  WG_IFACE=warp-vps-wg
+  WARP_SOCKS_PORT=24000
+  REDSOCKS_PORT=24001
+
+  WARP_MODE=wireguard
+  WARP_SCOPE=global
+  cmd_status >/dev/null
+  assert_contains "$lines" 'WireGuard' 'status must identify the WireGuard backend' || return 1
+  assert_contains "$lines" '全局' 'status must identify the global routing scope' || return 1
+
+  lines=''
+  WARP_SCOPE=google
+  cmd_status >/dev/null
+  assert_contains "$lines" 'Google' 'status must identify precise Google routing' || return 1
+
+  lines=''
+  WARP_MODE=socks
+  WARP_SCOPE=global
+  cmd_status >/dev/null
+  assert_contains "$lines" 'Socks5' 'status must identify the Socks5 backend' || return 1
+  assert_contains "$lines" '公网 IPv4 TCP' \
+    'global Socks status must state its actual traffic boundary'
+}
+
 test_socks_nft_render_blocks_google_quic_only() {
   source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=google
   RULES_DIR=/unused
   NFT_CONF=/dev/stdout
   REDSOCKS_UID=987
@@ -2044,6 +2451,7 @@ test_socks_nft_render_blocks_google_quic_only() {
 
 test_socks_nft_runtime_requires_scoped_quic_reject() {
   source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=google
   local mock_nat_rules mock_filter_rules
   mock_nat_rules='ip daddr @google4 meta l4proto tcp counter packets 0 bytes 0 redirect to :23456'
   mock_filter_rules=$'ip daddr @google4 udp dport 443 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\nip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
@@ -2081,6 +2489,94 @@ test_socks_nft_runtime_requires_scoped_quic_reject() {
   mock_filter_rules=$'ip daddr @google4 udp dport 443 counter packets 0 bytes 0 drop\nip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
   if socks_nft_rules_local_ok; then
     fail 'a non-reject verdict must fail the Socks runtime check'
+    return 1
+  fi
+}
+
+test_socks_global_nft_redirects_public_ipv4_tcp() {
+  source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=global
+  RULES_DIR=/unused
+  NFT_CONF=/dev/stdout
+  REDSOCKS_UID=987
+  REDSOCKS_PORT=23456
+  validate_rules_file() { :; }
+  join_rules() {
+    case "$1" in
+      *google_ipv4.txt) printf '8.8.8.0/24' ;;
+      *google_ipv6.txt) printf '2001:4860::/32' ;;
+    esac
+  }
+  table_exists() { return 1; }
+  chmod() { :; }
+
+  local rendered uid_line loopback_line private_line reply_line redirect_line
+  rendered="$(render_nft_conf)"
+  assert_contains "$rendered" 'meta skuid 987 return' \
+    'global Socks rules must keep the redsocks loop exclusion' || return 1
+  assert_contains "$rendered" 'oifname "lo" return' \
+    'global Socks rules must keep loopback traffic native' || return 1
+  assert_contains "$rendered" \
+    'ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8' \
+    'global Socks rules must keep the existing private and special IPv4 exclusion' || return 1
+  assert_contains "$rendered" 'ct direction reply return' \
+    'global Socks rules must keep replies to inbound connections on the native path' || return 1
+  if ! grep -Eq \
+    'add rule inet warp_vps output_nat (meta nfproto ipv4|ip daddr 0\.0\.0\.0/0) meta l4proto tcp counter redirect to :23456' \
+    <<< "$rendered"; then
+    fail 'global Socks rules must redirect all remaining public IPv4 TCP traffic'
+    return 1
+  fi
+  assert_not_contains "$rendered" \
+    'ip daddr @google4 meta l4proto tcp counter redirect to :23456' \
+    'global Socks redirect must not remain limited to Google IPv4' || return 1
+  assert_contains "$rendered" \
+    'ip daddr @google4 udp dport 443 counter reject with icmpx type admin-prohibited' \
+    'global Socks must retain the existing Google QUIC rejection' || return 1
+  assert_contains "$rendered" 'ip6 daddr @google6 counter reject' \
+    'global Socks must retain the existing Google IPv6 rejection' || return 1
+
+  uid_line="$(line_number "$rendered" 'meta skuid 987 return')"
+  loopback_line="$(line_number "$rendered" 'oifname "lo" return')"
+  private_line="$(line_number "$rendered" 'ip daddr { 0.0.0.0/8')"
+  reply_line="$(line_number "$rendered" 'ct direction reply return')"
+  redirect_line="$(awk '/add rule inet warp_vps output_nat (meta nfproto ipv4|ip daddr 0\.0\.0\.0\/0) meta l4proto tcp/ { print NR; exit }' <<< "$rendered")"
+  if [ -z "$redirect_line" ] || [ "$uid_line" -ge "$redirect_line" ] \
+    || [ "$loopback_line" -ge "$redirect_line" ] || [ "$private_line" -ge "$redirect_line" ] \
+    || [ "$reply_line" -ge "$redirect_line" ]; then
+    fail 'every global Socks bypass must precede the catch-all IPv4 TCP redirect'
+    return 1
+  fi
+}
+
+test_socks_global_runtime_requires_global_reply_safe_rules() {
+  source_without_main "$MANAGER_SCRIPT"
+  WARP_SCOPE=global
+  local mock_nat_rules mock_filter_rules
+  mock_nat_rules=$'meta skuid 987 return\noifname "lo" return\nip daddr { 10.0.0.0/8 } return\nct direction reply return\nmeta nfproto ipv4 meta l4proto tcp counter packets 0 bytes 0 redirect to :23456'
+  mock_filter_rules=$'ip daddr @google4 udp dport 443 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\nip6 daddr @google6 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+  nft() {
+    case "$*" in
+      'list chain inet warp_vps output_nat') printf '%s\n' "$mock_nat_rules" ;;
+      'list chain inet warp_vps output_filter') printf '%s\n' "$mock_filter_rules" ;;
+      *) return 1 ;;
+    esac
+  }
+
+  socks_nft_rules_local_ok || {
+    fail 'the complete global Socks runtime rules should pass the local check'
+    return 1
+  }
+
+  mock_nat_rules=$'meta skuid 987 return\noifname "lo" return\nip daddr { 10.0.0.0/8 } return\nip daddr @google4 meta l4proto tcp counter packets 0 bytes 0 redirect to :23456'
+  if socks_nft_rules_local_ok; then
+    fail 'Google-only TCP routing must not satisfy a global Socks runtime check'
+    return 1
+  fi
+
+  mock_nat_rules=$'meta skuid 987 return\noifname "lo" return\nip daddr { 10.0.0.0/8 } return\nmeta nfproto ipv4 meta l4proto tcp counter packets 0 bytes 0 redirect to :23456'
+  if socks_nft_rules_local_ok; then
+    fail 'a global Socks redirect without the inbound-reply bypass must fail the runtime check'
     return 1
   fi
 }
@@ -2140,6 +2636,7 @@ test_mode_switch_rejects_live_opposite_backend() {
 
   WG_IFACE=warp-vps-wg
   WARP_MODE=wireguard
+  WARP_SCOPE=google
   wg_interface_is_wireguard() { return 0; }
   rule_probe_ip() {
     case "$2" in
@@ -2150,6 +2647,7 @@ test_mode_switch_rejects_live_opposite_backend() {
   route_uses_wg4() { return 0; }
   route_uses_wg6() { return 0; }
   wg_default_routes_absent() { return 0; }
+  wg_global_routes_absent() { return 0; }
   socks_table_absent() { return 1; }
   if test_quiet; then
     fail 'WireGuard local state must reject a live old Socks nft table'
@@ -2847,6 +3345,7 @@ test_external_probe_failures_do_not_block_local_operations() {
   local external_calls=0 handshake_calls=0 repair_calls=0 manager_calls=''
 
   WARP_MODE=wireguard
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   require_root() { :; }
   load_config() { :; }
@@ -2861,6 +3360,7 @@ test_external_probe_failures_do_not_block_local_operations() {
   route_uses_wg4() { return 0; }
   route_uses_wg6() { return 0; }
   wg_default_routes_absent() { return 0; }
+  wg_global_routes_absent() { return 0; }
   socks_table_absent() { return 0; }
   google_http_probe() { external_calls=$((external_calls + 1)); return 6; }
   socks_ok() { external_calls=$((external_calls + 1)); return 1; }
@@ -3283,6 +3783,7 @@ test_restart_reuses_healthy_backends() {
   systemctl() { systemctl_calls="${systemctl_calls}$*\n"; return 0; }
 
   WARP_MODE=wireguard
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   cmd_restart >/dev/null || return 1
   assert_eq '0' "$restart_wg_calls" \
@@ -3321,6 +3822,7 @@ test_restart_repairs_wireguard_unit_interface_mismatch() {
   systemctl() { return 0; }
 
   WARP_MODE=wireguard
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   cmd_restart >/dev/null || {
     fail 'restart should repair an inactive WireGuard unit with a stale interface'
@@ -3369,6 +3871,7 @@ test_wireguard_identity_rejects_dummy_and_heals() {
       "$name must verify the interface type instead of trusting a same-name link" || return 1
   done
   WARP_MODE=wireguard
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   require_root() { :; }
   load_config() { :; }
@@ -3386,6 +3889,7 @@ test_wireguard_identity_rejects_dummy_and_heals() {
   route_uses_wg4() { return 0; }
   route_uses_wg6() { return 0; }
   wg_default_routes_absent() { return 0; }
+  wg_global_routes_absent() { return 0; }
   socks_table_absent() { return 0; }
   wireguard_routes_local_ok() { return 0; }
   systemctl() { return 0; }
@@ -3530,6 +4034,7 @@ test_health_timer_failure_does_not_block_data_plane() {
   source_without_main "$MANAGER_SCRIPT"
   local output
   WARP_MODE=wireguard
+  WARP_SCOPE=google
   WG_IFACE=warp-vps-wg
   unit_ready() { [ "$1" != 'warp-vps-health.timer' ]; }
   wg_interface_is_wireguard() { return 0; }
@@ -3539,6 +4044,7 @@ test_health_timer_failure_does_not_block_data_plane() {
   route_uses_wg4() { return 0; }
   route_uses_wg6() { return 0; }
   wg_default_routes_absent() { return 0; }
+  wg_global_routes_absent() { return 0; }
   socks_table_absent() { return 0; }
 
   output="$(run_self_check)" || {
@@ -4447,6 +4953,21 @@ test_readme_documents_all_uninstall_modes() {
     'CLI help should document permanent all uninstall'
 }
 
+test_readme_documents_route_scope_contract() {
+  assert_file_matches "$README_FILE" '默认.*精准分流 Google|精准分流 Google.*默认' \
+    'README must state that fresh installation defaults to precise Google routing' || return 1
+  assert_file_matches "$README_FILE" 'WARP_SCOPE|--scope (google|global)' \
+    'README must document how to select a routing scope noninteractively' || return 1
+  assert_file_matches "$README_FILE" '全局走 WARP.*WireGuard.*公网 IPv4、IPv6 与全部协议' \
+    'README must describe the full-protocol WireGuard global scope' || return 1
+  assert_file_matches "$README_FILE" '全局走 WARP.*Socks5.*公网 IPv4 TCP' \
+    'README must describe the actual Socks5 global traffic boundary' || return 1
+  assert_file_matches "$README_FILE" 'Google IPv4 UDP/443（QUIC）.*拒绝' \
+    'README must retain the Google QUIC behavior in Socks5 mode' || return 1
+  assert_file_matches "$README_FILE" 'Google IPv6.*拒绝' \
+    'README must retain the Google IPv6 behavior in Socks5 mode'
+}
+
 test_reinstall_rejects_residual_socks_rules() {
   source_without_main "$INSTALL_SCRIPT"
   PREVIOUS_MODE=socks
@@ -5027,11 +5548,11 @@ test_reinstall_mode_switch_uses_the_main_install_path() {
     'WireGuard target preparation must create and locally validate the interface' || return 1
   assert_contains "$prepare_body" 'configure-warp' \
     'Socks target preparation must happen before an opposite backend is stopped' || return 1
-  assert_file_matches "$README_FILE" '直接回车保持当前模式' \
+  assert_file_matches "$README_FILE" 'warp-vps reinstall --scope (global|google)` \| 保持运行模式' \
     'README should document the safe reinstall default' || return 1
-  assert_file_matches "$README_FILE" '输入 `2` 可从 Socks5 切换到 WireGuard' \
+  assert_file_matches "$README_FILE" 'warp-vps switch wireguard` \| 切换到 WireGuard' \
     'README should document the supported Socks-to-WireGuard switch' || return 1
-  assert_file_matches "$README_FILE" '输入 `1` 可从 WireGuard 切换到 Socks5' \
+  assert_file_matches "$README_FILE" 'warp-vps switch socks.*` \| 切换到 Socks5' \
     'README should document the supported reverse switch'
 }
 
@@ -5639,6 +6160,8 @@ test_public_install_contract_and_downloads_are_bounded() {
 run_test 'install mode retries after invalid input' test_install_mode_reprompts
 run_test 'explicit install mode numbers remain stable' test_install_mode_keeps_explicit_numbers
 run_test 'reinstall keeps the current mode by default' test_reinstall_keeps_current_mode_by_default
+run_test 'route scope prompt defaults to precise Google routing' test_route_scope_prompt_and_defaults
+run_test 'route scope config remains backward compatible' test_route_scope_config_is_backward_compatible
 run_test 'existing config validation precedes runtime mutation' test_existing_config_validation_precedes_runtime_mutation
 run_test 'SOCKS port retries after a stray backslash' test_warp_port_reprompts
 run_test 'reinstall can reuse its current SOCKS port' test_existing_project_port_is_reusable
@@ -5690,8 +6213,16 @@ run_test 'WireGuard routes do not require native IPv6' test_wireguard_routes_wor
 run_test 'WireGuard route cleanup handles each IP family independently' test_wireguard_route_cleanup_is_dual_stack_independent
 run_test 'WireGuard strict cleanup verifies actual dual-stack route state' test_wireguard_strict_cleanup_checks_actual_route_state
 run_test 'WireGuard local route boundaries fail closed' test_wireguard_local_route_boundary_is_fail_closed
+run_test 'WireGuard scope selects precise or global routes' test_wireguard_scope_selects_precise_or_global_routes
+run_test 'WireGuard global apply uses owned policy state' test_wireguard_global_apply_uses_owned_policy_state
+run_test 'WireGuard global reply mark and stop are symmetric' test_wireguard_global_reply_mark_and_stop_contract
+run_test 'WireGuard global enables marked reverse-path checks' test_wireguard_global_src_valid_mark_boundary
+run_test 'WireGuard global policy ownership is exact' test_wireguard_global_policy_ownership_is_exact
+run_test 'status reports backend and route scope' test_status_reports_backend_and_route_scope
 run_test 'Socks nft output blocks only Google QUIC' test_socks_nft_render_blocks_google_quic_only
 run_test 'Socks nft runtime requires the scoped QUIC reject' test_socks_nft_runtime_requires_scoped_quic_reject
+run_test 'Socks global nft redirects public IPv4 TCP' test_socks_global_nft_redirects_public_ipv4_tcp
+run_test 'Socks global runtime requires reply-safe global rules' test_socks_global_runtime_requires_global_reply_safe_rules
 run_test 'WireGuard apply clears stale Socks nft state' test_wireguard_apply_clears_stale_socks_table
 run_test 'mode switches reject a live opposite backend' test_mode_switch_rejects_live_opposite_backend
 run_test 'SSH peer protection preserves the rule-check status' test_ssh_peer_route_uses_rule_check_status
@@ -5749,6 +6280,7 @@ run_test 'RPM dependency postcondition parsing fails closed' test_rpm_dependency
 run_test 'uninstall scope controls dependency and fallback cleanup' test_uninstall_scope_controls_dependency_and_fallback_cleanup
 run_test 'dependency failure stops before file deletion' test_dependency_failure_stops_before_file_deletion
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
+run_test 'README documents route scope behavior' test_readme_documents_route_scope_contract
 run_test 'reinstall rejects residual Socks rules' test_reinstall_rejects_residual_socks_rules
 run_test 'reinstall quiesces health and optional backends' test_reinstall_quiesces_health_and_optional_backends
 run_test 'main executes both mode switches and ignores unlock failures' test_main_executes_bidirectional_mode_switches
