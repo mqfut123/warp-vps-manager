@@ -793,10 +793,14 @@ enable_wg_global_src_valid_mark() {
   wg_global_src_valid_mark_ok && return 0
   if [ ! -w "$WG_GLOBAL_SRC_VALID_MARK_PATH" ]; then
     die "WireGuard 全局模式无法启用入站连接回包标记"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
     return 1
   fi
   if ! printf '1\n' > "$WG_GLOBAL_SRC_VALID_MARK_PATH"; then
     die "WireGuard 全局模式无法启用入站连接回包标记"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
     return 1
   fi
 }
@@ -913,6 +917,8 @@ apply_wg_global_routes() {
   if ! nft -f "$NFT_CONF"; then
     stop_wg_global_routes
     die "WireGuard 全局回包规则加载失败，已清除本项目全局规则"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
     return 1
   fi
   if ! wg set "$WG_IFACE" fwmark "$WG_GLOBAL_MARK" \
@@ -924,6 +930,8 @@ apply_wg_global_routes() {
     || ! ip -6 rule add not fwmark "$WG_GLOBAL_MARK" table "$WG_GLOBAL_TABLE" priority "$WG_GLOBAL_RULE_PRIORITY"; then
     stop_wg_global_routes
     die "WireGuard 全局路由写入失败，已清除本项目全局路由"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
     return 1
   fi
   if ! wireguard_global_routes_local_ok; then
@@ -933,6 +941,8 @@ apply_wg_global_routes() {
       cleanup_message="无法确认本项目全局路由已完整清除"
     fi
     die "WireGuard 全局路由边界检查失败，${cleanup_message}"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
     return 1
   fi
 }
