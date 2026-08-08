@@ -904,8 +904,8 @@ select_route_scope() {
 }
 
 probe_outbound_udp() {
-  local probe_host="${1:-stun.cloudflare.com}"
-  local probe_port="${2:-3478}"
+  local probe_host="$1"
+  local probe_port="$2"
   local udp_python_rc=0
   command -v python3 >/dev/null 2>&1 || return 2
   python3 - "$probe_host" "$probe_port" >/dev/null 2>&1 <<'PY' || udp_python_rc=$?
@@ -1013,7 +1013,7 @@ prompt_install_mode() {
 
   if [ -z "$current_mode" ]; then
     printf '\n正在检测出站 UDP 回包能力...\n' >&2
-    probe_outbound_udp || udp_probe_rc=$?
+    probe_outbound_udp stun.cloudflare.com 3478 || udp_probe_rc=$?
     [ "$udp_probe_rc" -ne 1 ] || recommended="socks"
   fi
 

@@ -327,7 +327,7 @@ PY
   probe_rc=0
   (
     export PATH=/path-without-python
-    probe_outbound_udp
+    probe_outbound_udp 127.0.0.1 3478
   ) || probe_rc=$?
   assert_eq '2' "$probe_rc" \
     'a missing probe runtime must remain indeterminate instead of unsupported'
