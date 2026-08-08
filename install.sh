@@ -903,14 +903,119 @@ select_route_scope() {
   esac
 }
 
+probe_outbound_udp() {
+  local probe_host="${1:-stun.cloudflare.com}"
+  local probe_port="${2:-3478}"
+  local udp_python_rc=0
+  command -v python3 >/dev/null 2>&1 || return 2
+  python3 - "$probe_host" "$probe_port" >/dev/null 2>&1 <<'PY' || udp_python_rc=$?
+import os
+import signal
+import socket
+import struct
+import sys
+
+MAGIC_COOKIE = 0x2112A442
+
+
+def alarm_handler(_signum, _frame):
+    raise TimeoutError
+
+
+def valid_binding_response(data, transaction_id):
+    if len(data) < 20:
+        return False
+    message_type, message_length, cookie, response_id = struct.unpack(
+        "!HHI12s", data[:20]
+    )
+    if (
+        message_type != 0x0101
+        or cookie != MAGIC_COOKIE
+        or response_id != transaction_id
+        or message_length % 4 != 0
+        or 20 + message_length != len(data)
+    ):
+        return False
+
+    found_xor_mapped_address = False
+    offset = 20
+    message_end = 20 + message_length
+    while offset + 4 <= message_end:
+        attribute_type, attribute_length = struct.unpack("!HH", data[offset : offset + 4])
+        value_end = offset + 4 + attribute_length
+        if value_end > message_end:
+            return False
+        if attribute_type == 0x0020:
+            reserved = data[offset + 4] if attribute_length >= 2 else 1
+            family = data[offset + 5] if attribute_length >= 2 else 0
+            if reserved != 0 or not (
+                (attribute_length == 8 and family == 0x01)
+                or (attribute_length == 20 and family == 0x02)
+            ):
+                return False
+            found_xor_mapped_address = True
+        offset += 4 + ((attribute_length + 3) // 4) * 4
+    return offset == message_end and found_xor_mapped_address
+
+
+signal.signal(signal.SIGALRM, alarm_handler)
+signal.alarm(6)
+try:
+    addresses = socket.getaddrinfo(
+        sys.argv[1], int(sys.argv[2]), socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+    )
+except (OSError, TimeoutError, ValueError):
+    raise SystemExit(2)
+
+attempted = False
+seen = set()
+for family, socktype, protocol, _canonical_name, address in addresses:
+    if address in seen:
+        continue
+    seen.add(address)
+    transaction_id = os.urandom(12)
+    request = struct.pack("!HHI12s", 0x0001, 0, MAGIC_COOKIE, transaction_id)
+    sock = socket.socket(family, socktype, protocol)
+    try:
+        sock.connect(address)
+        for probe_timeout in (0.75, 1.5):
+            sock.settimeout(probe_timeout)
+            attempted = True
+            sock.send(request)
+            try:
+                response = sock.recv(2048)
+            except socket.timeout:
+                continue
+            if valid_binding_response(response, transaction_id):
+                raise SystemExit(0)
+    except (OSError, TimeoutError):
+        pass
+    finally:
+        sock.close()
+    break
+
+raise SystemExit(1 if attempted else 2)
+PY
+  case "$udp_python_rc" in
+    0|1|2) return "$udp_python_rc" ;;
+    *) return 2 ;;
+  esac
+}
+
 prompt_install_mode() {
-  local recommended choice current_mode scope="${2:-google}"
+  local recommended choice current_mode scope="${2:-google}" udp_probe_rc=0
   if [ "$#" -gt 0 ]; then
     current_mode="$1"
   else
     current_mode="$(read_project_mode || true)"
   fi
   recommended="${current_mode:-wireguard}"
+
+  if [ -z "$current_mode" ]; then
+    printf '\n正在检测出站 UDP 回包能力...\n' >&2
+    probe_outbound_udp || udp_probe_rc=$?
+    [ "$udp_probe_rc" -ne 1 ] || recommended="socks"
+  fi
 
   printf '\n请选择 WARP 分流方案：\n' >&2
   if [ "$scope" = "global" ]; then
@@ -921,11 +1026,20 @@ prompt_install_mode() {
     printf '  2. WireGuard 方案：Google IPv4、IPv6、TCP、UDP 和 QUIC 都按 Google CIDR 走 WARP。\n' >&2
   fi
   printf '  3. 退出安装\n' >&2
-  printf '普通用户推荐 WireGuard；只需要兼容本地代理模式时再选 Socks5。\n' >&2
   if [ -n "$current_mode" ]; then
     printf '当前模式：%s；直接回车保持当前模式。\n' "$current_mode" >&2
   else
-    printf '直接回车默认选择：WireGuard\n' >&2
+    case "$udp_probe_rc" in
+      0)
+        printf '[通过] 已收到 Cloudflare STUN UDP/3478 有效响应；直接回车默认选择：WireGuard\n' >&2
+        ;;
+      1)
+        printf '[注意] 未收到 Cloudflare STUN UDP/3478 有效响应；WireGuard 只使用 UDP 且不会回退 TCP，直接回车默认选择：Socks5；仍可输入 2 选择 WireGuard\n' >&2
+        ;;
+      *)
+        printf '[信息] 暂时无法完成出站 UDP 探测；直接回车默认选择：WireGuard\n' >&2
+        ;;
+    esac
   fi
   while true; do
     printf '请输入选项：' >&2
@@ -2330,7 +2444,7 @@ main() {
   if [ "$selected_mode" = "socks" ]; then
     printf '安装模式：Socks5 兼容模式\n'
   else
-    printf '安装模式：WireGuard 默认模式\n'
+    printf '安装模式：WireGuard 模式\n'
   fi
   if [ "$selected_mode" = "socks" ]; then
     printf 'WARP SOCKS 端口：%s\n' "$warp_port"

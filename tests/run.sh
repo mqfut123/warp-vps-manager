@@ -111,6 +111,9 @@ test_install_mode_reprompts() {
   source_without_main "$INSTALL_SCRIPT"
   CONFIG_FILE="${FIXTURE_DIR}/config/missing.env"
 
+  local mock_udp_probe_log
+  mock_udp_probe_log="$(mktemp)"
+  probe_outbound_udp() { printf 'probe\n' >> "$mock_udp_probe_log"; return 0; }
   local answer_index=0
   local answers=('invalid' '')
   read_input() {
@@ -123,26 +126,77 @@ test_install_mode_reprompts() {
     return 1
   fi
   output="${output##*$'\n'}"
-  assert_eq 'wireguard' "$output" 'empty retry should select the default WireGuard mode'
+  assert_eq 'wireguard' "$output" 'empty retry should select the UDP-backed WireGuard default' || return 1
+  assert_eq '1' "$(wc -l < "$mock_udp_probe_log" | tr -d ' ')" \
+    'an invalid answer retry must not repeat the UDP probe'
 }
 
 test_install_mode_keeps_explicit_numbers() {
   source_without_main "$INSTALL_SCRIPT"
   CONFIG_FILE="${FIXTURE_DIR}/config/missing.env"
 
+  local mock_udp_probe_result=0
+  probe_outbound_udp() { return "$mock_udp_probe_result"; }
   local answer='1'
   read_input() { printf -v "$1" '%s' "$answer"; }
   assert_eq 'socks' "$(prompt_install_mode 2>/dev/null)" \
     'explicit option 1 should remain Socks' || return 1
 
+  mock_udp_probe_result=1
   answer='2'
   assert_eq 'wireguard' "$(prompt_install_mode 2>/dev/null)" \
-    'explicit option 2 should remain WireGuard'
+    'explicit option 2 should remain WireGuard when the UDP probe changes the default'
+}
+
+test_fresh_install_mode_default_follows_udp_probe() {
+  source_without_main "$INSTALL_SCRIPT"
+  CONFIG_FILE="${FIXTURE_DIR}/config/missing.env"
+
+  local mock_udp_probe_result=0
+  local output prompt_log
+  prompt_log="$(mktemp)"
+  read_input() { printf -v "$1" '%s' ''; }
+  probe_outbound_udp() { return "$mock_udp_probe_result"; }
+
+  output="$(prompt_install_mode 2> "$prompt_log")" || return 1
+  assert_eq 'wireguard' "$output" \
+    'a valid outbound UDP response should keep WireGuard as the fresh default' || return 1
+  assert_contains "$(< "$prompt_log")" 'Cloudflare STUN UDP/3478 有效响应' \
+    'the WireGuard recommendation must name the successful UDP evidence' || return 1
+  assert_contains "$(< "$prompt_log")" '直接回车默认选择：WireGuard' \
+    'the successful UDP prompt must state the WireGuard default' || return 1
+
+  mock_udp_probe_result=1
+  : > "$prompt_log"
+  output="$(prompt_install_mode 2> "$prompt_log")" || return 1
+  assert_eq 'socks' "$output" \
+    'a completed UDP probe without a valid response should default to Socks5' || return 1
+  assert_contains "$(< "$prompt_log")" '未收到 Cloudflare STUN UDP/3478 有效响应' \
+    'the Socks5 recommendation must name the missing UDP evidence' || return 1
+  assert_contains "$(< "$prompt_log")" 'WireGuard 只使用 UDP 且不会回退 TCP' \
+    'the failed UDP prompt must explain why Socks5 is safer' || return 1
+  assert_contains "$(< "$prompt_log")" '直接回车默认选择：Socks5' \
+    'the failed UDP prompt must state the Socks5 default' || return 1
+  assert_contains "$(< "$prompt_log")" '仍可输入 2 选择 WireGuard' \
+    'the UDP recommendation must not block an explicit WireGuard choice' || return 1
+
+  mock_udp_probe_result=2
+  : > "$prompt_log"
+  output="$(prompt_install_mode 2> "$prompt_log")" || return 1
+  assert_eq 'wireguard' "$output" \
+    'an indeterminate probe must not be mislabeled as unsupported UDP' || return 1
+  assert_contains "$(< "$prompt_log")" '暂时无法完成出站 UDP 探测' \
+    'an indeterminate probe must explain that no UDP conclusion was reached' || return 1
+  assert_contains "$(< "$prompt_log")" '直接回车默认选择：WireGuard' \
+    'an indeterminate probe should retain the established fresh default'
 }
 
 test_reinstall_keeps_current_mode_by_default() {
   source_without_main "$INSTALL_SCRIPT"
+  local mock_udp_probe_log
+  mock_udp_probe_log="$(mktemp)"
   read_input() { printf -v "$1" '%s' ''; }
+  probe_outbound_udp() { printf 'probe\n' >> "$mock_udp_probe_log"; return 1; }
 
   CONFIG_FILE="${FIXTURE_DIR}/config/socks-mode.env"
   assert_eq 'socks' "$(prompt_install_mode 2>/dev/null)" \
@@ -150,7 +204,133 @@ test_reinstall_keeps_current_mode_by_default() {
 
   CONFIG_FILE="${FIXTURE_DIR}/config/custom-wireguard.env"
   assert_eq 'wireguard' "$(prompt_install_mode 2>/dev/null)" \
-    'reinstalling an existing WireGuard setup must keep WireGuard on empty input'
+    'reinstalling an existing WireGuard setup must keep WireGuard on empty input' || return 1
+  assert_eq '' "$(< "$mock_udp_probe_log")" \
+    'an existing installation must not run the fresh UDP probe'
+}
+
+test_outbound_udp_probe_requires_valid_stun_response() {
+  source_without_main "$INSTALL_SCRIPT"
+  local root server_info server_pid probe_port probe_rc=0
+  root="$(mktemp -d)"
+  server_info="${root}/server-port"
+
+  python3 - "$server_info" <<'PY' &
+import pathlib
+import socket
+import struct
+import sys
+
+cookie = 0x2112A442
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", 0))
+sock.settimeout(5)
+pathlib.Path(sys.argv[1]).write_text(str(sock.getsockname()[1]), encoding="ascii")
+request, peer = sock.recvfrom(2048)
+transaction_id = request[8:20]
+xor_port = peer[1] ^ (cookie >> 16)
+xor_address = int.from_bytes(socket.inet_aton(peer[0]), "big") ^ cookie
+value = struct.pack("!BBHI", 0, 1, xor_port, xor_address)
+attribute = struct.pack("!HH", 0x0020, len(value)) + value
+response = struct.pack("!HHI12s", 0x0101, len(attribute), cookie, transaction_id) + attribute
+sock.sendto(response, peer)
+sock.close()
+PY
+  server_pid=$!
+  for _attempt in $(seq 1 100); do
+    [ -s "$server_info" ] && break
+    sleep 0.02
+  done
+  [ -s "$server_info" ] || {
+    fail 'the local STUN fixture did not become ready'
+    return 1
+  }
+  probe_port="$(< "$server_info")"
+  probe_outbound_udp 127.0.0.1 "$probe_port" || probe_rc=$?
+  wait "$server_pid" || {
+    fail 'the valid STUN fixture exited unsuccessfully'
+    return 1
+  }
+  assert_eq '0' "$probe_rc" \
+    'the UDP probe should accept a valid STUN Binding response' || return 1
+
+  server_info="${root}/invalid-server-port"
+  python3 - "$server_info" <<'PY' &
+import pathlib
+import socket
+import struct
+import sys
+
+cookie = 0x2112A442
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", 0))
+sock.settimeout(5)
+pathlib.Path(sys.argv[1]).write_text(str(sock.getsockname()[1]), encoding="ascii")
+for _attempt in range(2):
+    request, peer = sock.recvfrom(2048)
+    transaction_id = request[8:20]
+    sock.sendto(struct.pack("!HHI12s", 0x0101, 0, cookie, transaction_id), peer)
+sock.close()
+PY
+  server_pid=$!
+  for _attempt in $(seq 1 100); do
+    [ -s "$server_info" ] && break
+    sleep 0.02
+  done
+  [ -s "$server_info" ] || {
+    fail 'the invalid STUN fixture did not become ready'
+    return 1
+  }
+  probe_port="$(< "$server_info")"
+  probe_rc=0
+  probe_outbound_udp 127.0.0.1 "$probe_port" || probe_rc=$?
+  wait "$server_pid" || {
+    fail 'the invalid STUN fixture exited unsuccessfully'
+    return 1
+  }
+  assert_eq '1' "$probe_rc" \
+    'a UDP datagram without a valid STUN mapping must not prove UDP support' || return 1
+
+  server_info="${root}/silent-server-port"
+  python3 - "$server_info" <<'PY' &
+import pathlib
+import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", 0))
+sock.settimeout(5)
+pathlib.Path(sys.argv[1]).write_text(str(sock.getsockname()[1]), encoding="ascii")
+for _attempt in range(2):
+    sock.recvfrom(2048)
+sock.close()
+PY
+  server_pid=$!
+  for _attempt in $(seq 1 100); do
+    [ -s "$server_info" ] && break
+    sleep 0.02
+  done
+  [ -s "$server_info" ] || {
+    fail 'the silent STUN fixture did not become ready'
+    return 1
+  }
+  probe_port="$(< "$server_info")"
+  probe_rc=0
+  probe_outbound_udp 127.0.0.1 "$probe_port" || probe_rc=$?
+  wait "$server_pid" || {
+    fail 'the silent STUN fixture exited unsuccessfully'
+    return 1
+  }
+  assert_eq '1' "$probe_rc" \
+    'two UDP requests without a response must report unavailable UDP' || return 1
+
+  probe_rc=0
+  (
+    export PATH=/path-without-python
+    probe_outbound_udp
+  ) || probe_rc=$?
+  assert_eq '2' "$probe_rc" \
+    'a missing probe runtime must remain indeterminate instead of unsupported'
 }
 
 test_route_scope_prompt_and_defaults() {
@@ -474,7 +654,8 @@ test_installer_entrypoint_routes_fresh_and_installed_hosts() {
 
 test_installer_noninteractive_option_contract() {
   source_without_main "$INSTALL_SCRIPT"
-  local rc=0 output
+  local rc=0 output mock_udp_probe_log
+  mock_udp_probe_log="$(mktemp)"
 
   parse_install_options --non-interactive --scope global --mode socks --swap 2 --socks-port 24567
   assert_eq '1' "$INSTALL_NONINTERACTIVE" 'noninteractive parsing must set its execution mode' || return 1
@@ -514,6 +695,7 @@ test_installer_noninteractive_option_contract() {
   INSTALL_NONINTERACTIVE=1
   INSTALL_MODE_OPTION=''
   read_input() { fail 'noninteractive mode selection must not read input'; }
+  probe_outbound_udp() { printf 'probe\n' >> "$mock_udp_probe_log"; return 1; }
   assert_eq 'wireguard' "$(select_install_mode '')" \
     'fresh noninteractive installation must default to WireGuard' || return 1
   assert_eq 'socks' "$(select_install_mode socks)" \
@@ -524,6 +706,8 @@ test_installer_noninteractive_option_contract() {
   assert_eq '2' "$rc" 'explicit keep on a fresh host must be a usage error' || return 1
   assert_contains "$output" '全新安装不能使用 --mode keep' \
     'fresh keep rejection must explain the conflict' || return 1
+  assert_eq '' "$(< "$mock_udp_probe_log")" \
+    'noninteractive mode selection must not probe UDP' || return 1
 
   INSTALL_SCOPE_OPTION=''
   assert_eq 'google' "$(select_route_scope '')" \
@@ -613,6 +797,7 @@ test_installer_noninteractive_entry_never_reads_tty() {
   project_installation_present() { return 0; }
   installer_menu() { calls="${calls}menu "; }
   read_input() { calls="${calls}read "; return 1; }
+  probe_outbound_udp() { calls="${calls}probe "; return 1; }
   main() {
     calls="${calls}install:${INSTALL_NONINTERACTIVE}:${INSTALL_SCOPE_OPTION}:${INSTALL_MODE_OPTION}:${INSTALL_SWAP_OPTION} "
   }
@@ -5880,7 +6065,15 @@ test_readme_documents_route_scope_contract() {
   assert_file_matches "$README_FILE" 'Google IPv4 UDP/443（QUIC）.*拒绝' \
     'README must retain the Google QUIC behavior in Socks5 mode' || return 1
   assert_file_matches "$README_FILE" 'Google IPv6.*拒绝' \
-    'README must retain the Google IPv6 behavior in Socks5 mode'
+    'README must retain the Google IPv6 behavior in Socks5 mode' || return 1
+  assert_file_matches "$README_FILE" 'Cloudflare STUN UDP/3478' \
+    'README must name the evidence used for the interactive mode recommendation' || return 1
+  assert_file_matches "$README_FILE" '未收到.*有效回包.*默认.*Socks5' \
+    'README must document the fresh Socks5 default when the UDP probe gets no valid response' || return 1
+  assert_file_matches "$README_FILE" 'WireGuard.*不会回退 TCP' \
+    'README must explain why a failed UDP probe changes the default' || return 1
+  assert_file_matches "$README_FILE" '全新非交互安装.*默认 WireGuard' \
+    'README must preserve the noninteractive mode contract'
 }
 
 test_reinstall_accepts_legacy_socks_rule_cleanup() {
@@ -6209,13 +6402,14 @@ test_reinstall_quiesces_health_and_optional_backends() {
 
 test_main_executes_bidirectional_mode_switches() {
   source_without_main "$INSTALL_SCRIPT"
-  local target_mode previous_mode unlock_rc events backend_reusable prepare_calls
+  local target_mode previous_mode unlock_rc events backend_reusable prepare_calls udp_probe_log
   target_mode=wireguard
   previous_mode=socks
   unlock_rc=124
   events=''
   backend_reusable=0
   prepare_calls=0
+  udp_probe_log="$(mktemp)"
   record_main_event() { events="${events}$1"$'\n'; }
   INSTALL_NONINTERACTIVE=1
   INSTALL_MODE_OPTION="$target_mode"
@@ -6230,6 +6424,7 @@ test_main_executes_bidirectional_mode_switches() {
   release_operation_lock() { record_main_event 'lock:release'; }
   read_input() { fail 'the noninteractive main transaction must not read input'; }
   prompt_install_mode() { fail 'the noninteractive main transaction must not prompt for a mode'; }
+  probe_outbound_udp() { printf 'probe\n' >> "$udp_probe_log"; return 1; }
   collect_swap_choice() { :; }
   read_project_warp_port() {
     [ "$previous_mode" = socks ] || return 1
@@ -6427,7 +6622,9 @@ test_main_executes_bidirectional_mode_switches() {
   assert_contains "$events" 'systemctl:restart warp-vps-redsocks.service' \
     'same-mode Socks reinstall must reload the newly activated redsocks unit and config' || return 1
   assert_not_contains "$events" 'manager:configure-warp' \
-    'same-mode Socks reuse must not reconnect or re-register warp-svc'
+    'same-mode Socks reuse must not reconnect or re-register warp-svc' || return 1
+  assert_eq '' "$(< "$udp_probe_log")" \
+    'noninteractive main transactions must not run the interactive UDP probe'
 }
 
 test_reinstall_mode_switch_uses_the_main_install_path() {
@@ -7294,7 +7491,9 @@ test_public_install_contract_and_downloads_are_bounded() {
 
 run_test 'install mode retries after invalid input' test_install_mode_reprompts
 run_test 'explicit install mode numbers remain stable' test_install_mode_keeps_explicit_numbers
+run_test 'fresh install mode default follows UDP evidence' test_fresh_install_mode_default_follows_udp_probe
 run_test 'reinstall keeps the current mode by default' test_reinstall_keeps_current_mode_by_default
+run_test 'outbound UDP probe requires a valid STUN response' test_outbound_udp_probe_requires_valid_stun_response
 run_test 'route scope prompt defaults to precise Google routing' test_route_scope_prompt_and_defaults
 run_test 'route scope config remains backward compatible' test_route_scope_config_is_backward_compatible
 run_test 'existing config validation precedes runtime mutation' test_existing_config_validation_precedes_runtime_mutation

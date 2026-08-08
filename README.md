@@ -14,7 +14,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh)
 ```
 
-全新安装默认选择 **Google 精准分流 + WireGuard + 1G Swap**。v1.1.3 将路由范围和运行模式分开选择：安装器先处理 Swap，再选择 Google 精准分流或全局 WARP，最后选择 WireGuard 或 Socks5；路由范围输入 `1` 或直接回车即使用默认的 Google 精准分流，输入 `2` 使用全局 WARP。检测到已有项目安装时，再运行同一命令会进入管理菜单。
+全新交互安装默认选择 **Google 精准分流 + 1G Swap**。安装器先处理 Swap，再选择 Google 精准分流或全局 WARP，最后根据出站 UDP 探测结果建议 WireGuard 或 Socks5。检测到已有项目安装时，再运行同一命令会进入管理菜单。
 
 ## 和其他方案对比
 
@@ -49,11 +49,13 @@ WireGuard 全局模式让公网 IPv4、IPv6、TCP、UDP 和 QUIC 全部走 WARP�
 
 Socks5 会让支持回落的客户端从 QUIC 改用经 WARP 转发的 TCP；其他 Google IPv4 UDP 端口和非 Google 目标 UDP 不受影响。
 
+全新交互安装会向 Cloudflare STUN UDP/3478 发出有界探测。收到有效回包时，直接回车默认选择 WireGuard；已完成探测但未收到有效回包时，直接回车默认选择 Socks5，并提示 WireGuard 只使用 UDP、不会回退 TCP。检测无法完成时保留 WireGuard 默认；显式输入 `1` 或 `2` 始终按所选模式安装。该探测用于判断默认建议，只证明 Cloudflare STUN UDP/3478 能否往返，不能代替安装后的 WARP WireGuard 握手检测。
+
 ## 运行条件
 
 - 使用 `systemd` 的 Linux VPS
 - 使用 APT、DNF 或 YUM，并能从当前配置的软件源取得所选模式的依赖
-- WireGuard 模式需要系统能够通过 `wg-quick` 创建项目网卡；全局范围同时需要 nftables
+- WireGuard 模式需要系统能够通过 `wg-quick` 创建项目网卡并允许出站 UDP；WireGuard 不会回退 TCP；全局范围同时需要 nftables
 - Socks5 模式需要 nftables `OUTPUT` NAT，并且系统与架构有可用的 Cloudflare WARP 软件包
 
 安装器按系统实际提供的包管理器和网络能力选择安装路径，不依赖固定发行版版本表。
@@ -79,7 +81,7 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 | `warp-vps switch socks --socks-port auto` | 切换到 Socks5 并自动选择端口 |
 | `warp-vps logs` | 查看最近的服务日志 |
 
-进入“重装或切换”后，可重新选择路由范围和 Socks5 / WireGuard 模式；运行模式直接回车保持当前模式。非交互重装未指定 `--scope` 时保留当前范围；全新非交互安装默认使用 Google 精准分流。
+进入“重装或切换”后，可重新选择路由范围和 Socks5 / WireGuard 模式；运行模式直接回车保持当前模式。非交互重装未指定 `--scope` 时保留当前范围；全新非交互安装的路由范围默认使用 Google 精准分流，运行模式默认 WireGuard，可用 `--scope` 与 `--mode` 显式指定。
 
 ## 卸载
 
