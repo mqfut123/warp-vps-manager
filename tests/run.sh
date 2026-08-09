@@ -2741,10 +2741,11 @@ test_wireguard_start_rules_is_the_lifecycle_boundary() {
     'WireGuard route startup must select a real working endpoint' || return 1
   resolve_line="$(line_number "$start_body" 'candidates="$(wireguard_endpoint_candidates)"')"
   apply_line="$(line_number "$start_body" 'apply_rules')"
-  [ -n "$resolve_line" ] && [ -n "$apply_line" ] && [ "$resolve_line" -lt "$apply_line" ] || {
+  if [ -z "$resolve_line" ] || [ -z "$apply_line" ] \
+    || [ "$resolve_line" -ge "$apply_line" ]; then
     fail 'WireGuard endpoint candidates must resolve before project routes can affect DNS'
     return 1
-  }
+  fi
   assert_contains "$start_body" 'select_working_wireguard_endpoint "$candidates"' \
     'startup must validate the frozen pre-route candidate list' || return 1
   assert_contains "$fail_body" 'stop_wg_routes_strict' \
