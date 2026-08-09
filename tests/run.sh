@@ -1795,30 +1795,75 @@ test_cloudflare_apt_repo_refresh_is_new_source_only() {
 
 test_cloudflare_apt_candidate_requires_downloadable_record() {
   source_without_main "$INSTALL_SCRIPT"
-  local cache_record=''
+  local mock_policy_text='' mock_madison_text=''
+  local mock_policy_rc=0 mock_madison_rc=0
+  local call_file
+  call_file="$(mktemp)"
 
   command() {
     [ "$1" = '-v' ] && [ "$2" = 'apt-cache' ]
   }
   apt-cache() {
-    [ "$*" = '--no-all-versions --full show cloudflare-warp' ] || return 2
-    printf '%s' "$cache_record"
+    printf '%s:%s\n' "${LC_ALL-}" "$*" >> "$call_file"
+    case "$1" in
+      policy)
+        [ "$*" = 'policy cloudflare-warp' ] || return 2
+        printf '%s' "$mock_policy_text"
+        return "$mock_policy_rc"
+        ;;
+      madison)
+        [ "$*" = 'madison cloudflare-warp' ] || return 2
+        printf '%s' "$mock_madison_text"
+        return "$mock_madison_rc"
+        ;;
+      *) return 2 ;;
+    esac
   }
 
-  cache_record=$'Package: cloudflare-warp\nVersion: 1.0\nStatus: install ok installed\n'
+  mock_policy_text=$'cloudflare-warp:\n  Installed: 3.0\n  Candidate: 3.0\n'
+  mock_madison_text=''
   if cloudflare_apt_candidate_available; then
-    fail 'an installed-only dpkg status record must not count as a downloadable candidate'
+    fail 'an installed-only APT candidate must not count as downloadable'
     return 1
   fi
-  cache_record=$'Package: cloudflare-warp\nVersion: 2.0\nFilename: pool/cloudflare-warp_2.0_amd64.deb\n'
+  assert_eq $'C:policy cloudflare-warp\nC:madison cloudflare-warp' \
+    "$(< "$call_file")" \
+    'APT candidate checks should use locale-stable policy and madison queries' || return 1
+
+  : > "$call_file"
+  mock_madison_text=' cloudflare-warp | 2.0 | https://pkg.cloudflareclient.com jammy/main amd64 Packages'
+  if cloudflare_apt_candidate_available; then
+    fail 'an installed candidate must not borrow a different downloadable version'
+    return 1
+  fi
+
+  : > "$call_file"
+  mock_madison_text=' cloudflare-warp | 3.0 | https://pkg.cloudflareclient.com jammy/main amd64 Packages'
   cloudflare_apt_candidate_available || {
-    fail 'a candidate record backed by a repository Filename should be reusable'
+    fail 'an exact downloadable APT candidate should be reusable'
     return 1
   }
 
-  cache_record=$'Package: cloudflare-warp\nVersion: 3.0\nStatus: install ok installed\nVersion: 2.0\nFilename-old: pool/cloudflare-warp_2.0_amd64.deb\n'
+  : > "$call_file"
+  mock_policy_text=$'cloudflare-warp:\n  Installed: 3.0\n  Candidate: (none)\n'
   if cloudflare_apt_candidate_available; then
-    fail 'an unavailable installed candidate must not borrow a Filename from another version'
+    fail 'APT Candidate none must not be considered downloadable'
+    return 1
+  fi
+  assert_eq 'C:policy cloudflare-warp' "$(< "$call_file")" \
+    'APT Candidate none should not issue a madison query' || return 1
+
+  mock_policy_text=$'cloudflare-warp:\n  Installed: (none)\n  Candidate: 3.0\n'
+  mock_policy_rc=1
+  if cloudflare_apt_candidate_available; then
+    fail 'an APT policy query failure must reject the candidate'
+    return 1
+  fi
+
+  mock_policy_rc=0
+  mock_madison_rc=1
+  if cloudflare_apt_candidate_available; then
+    fail 'an APT madison query failure must reject the candidate'
     return 1
   fi
 }
@@ -3307,6 +3352,7 @@ test_wireguard_global_apply_uses_owned_policy_state() {
   stop_wg_global_routes() { events="${events}stop-global"$'\n'; }
   enable_wg_global_src_valid_mark() { events="${events}enable-src-valid-mark"$'\n'; }
   render_wg_global_nft_conf() { events="${events}render-global-nft"$'\n'; }
+  install_wg_global_native_source_rules() { events="${events}install-native-source-rules"$'\n'; }
   nft() { events="${events}nft:$*"$'\n'; }
   wg() { events="${events}wg:$*"$'\n'; }
   ip() { events="${events}ip:$*"$'\n'; }
@@ -3329,6 +3375,8 @@ test_wireguard_global_apply_uses_owned_policy_state() {
     'global WireGuard apply must syntax-check its nftables state before activation' || return 1
   assert_contains "$events" 'nft:-f /tmp/warp-vps-test-global.nft' \
     'global WireGuard apply must activate the checked nftables state' || return 1
+  assert_contains "$events" 'install-native-source-rules' \
+    'global WireGuard apply must preserve replies from native addresses' || return 1
   assert_contains "$events" 'wg:set warp-vps-wg fwmark 51888' \
     'global WireGuard apply must assign the project fwmark' || return 1
   assert_contains "$events" 'ip:-4 route replace default dev warp-vps-wg table 51888' \
@@ -3366,6 +3414,9 @@ test_wireguard_global_apply_write_failures_cleanup() {
       }
       enable_wg_global_src_valid_mark() { return 0; }
       render_wg_global_nft_conf() { :; }
+      install_wg_global_native_source_rules() {
+        [ "$failed_write" != native-rule ]
+      }
       nft() {
         if [ "$failed_write" = nft ] && [ "$*" = '-f /tmp/warp-vps-test-global.nft' ]; then
           return 1
@@ -3394,6 +3445,15 @@ test_wireguard_global_apply_write_failures_cleanup() {
     'a failed nft activation must clean partial global state' || return 1
 
   rc=0
+  output="$(run_failure native-rule 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a failed native-source rule write must fail global WireGuard apply'
+    return 1
+  }
+  assert_contains "$output" 'EVENT:cleanup:2' \
+    'a failed native-source rule write must clean partial global state' || return 1
+
+  rc=0
   output="$(run_failure ip-rule 2>&1)" || rc=$?
   [ "$rc" -ne 0 ] || {
     fail 'a failed ip-rule write must fail global WireGuard apply'
@@ -3403,11 +3463,11 @@ test_wireguard_global_apply_write_failures_cleanup() {
     'a failed ip-rule write must clean partial global state'
 }
 
-test_wireguard_global_reply_mark_and_stop_contract() {
+test_wireguard_global_native_source_and_stop_contract() {
   source_without_main "$MANAGER_SCRIPT"
   WG_IFACE=warp-vps-wg
   NFT_CONF=/dev/stdout
-  local rendered events=''
+  local rendered events='' sources source4_present=1 source6_present=1
   nft() {
     case "$*" in
       'list table inet warp_vps_global') return 1 ;;
@@ -3433,9 +3493,8 @@ test_wireguard_global_reply_mark_and_stop_contract() {
   assert_contains "$rendered" \
     'iifname != "lo" iifname != "warp-vps-wg" fib daddr type local ct direction original meta mark set 51888 ct mark set meta mark' \
     'new native inbound connections must save the bypass mark before reverse-path filtering' || return 1
-  assert_contains "$rendered" \
-    'add rule inet warp_vps_global output ct direction reply meta mark set 51888 ct mark set meta mark' \
-    'replies on connections established before global routing must bypass the tunnel immediately' \
+  assert_not_contains "$rendered" 'output ct direction reply' \
+    'preexisting inbound replies must use native-source policy instead of a late conntrack direction rule' \
     || return 1
   assert_contains "$rendered" \
     'add rule inet warp_vps_global output ct mark 51888 meta mark set ct mark' \
@@ -3444,12 +3503,79 @@ test_wireguard_global_reply_mark_and_stop_contract() {
     'add rule inet warp_vps_global postrouting meta l4proto udp meta mark 51888 ct mark set meta mark' \
     'WireGuard endpoint packets must save their fwmark in conntrack' || return 1
 
+  ip() {
+    case "$*" in
+      '-o -4 address show scope global')
+        printf '%s\n' \
+          '2: eth0    inet 149.7.2.130/24 brd 149.7.2.255 scope global eth0' \
+          '3: warp-vps-wg    inet 172.16.0.2/32 scope global warp-vps-wg'
+        ;;
+      '-o -6 address show scope global')
+        printf '%s\n' \
+          '2: eth0    inet6 2001:db8::10/64 scope global' \
+          '3: eth1@if9    inet6 2001:db8:1::10/64 scope global' \
+          '4: warp-vps-wg    inet6 2606:4700:110::2/128 scope global'
+        ;;
+      '-4 rule add priority 17999 from 149.7.2.130/32 table main'|\
+      '-6 rule add priority 17999 from 2001:db8::10/128 table main'|\
+      '-6 rule add priority 17999 from 2001:db8:1::10/128 table main')
+        events="${events}ip:$*"$'\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  sources="$(wg_global_native_sources)" || return 1
+  assert_eq $'4|149.7.2.130\n6|2001:db8::10\n6|2001:db8:1::10' "$sources" \
+    'native-source discovery must include every non-WireGuard global address' || return 1
+  install_wg_global_native_source_rules || return 1
+  assert_contains "$events" \
+    'ip:-4 rule add priority 17999 from 149.7.2.130/32 table main' \
+    'native IPv4 replies must use the main table before global policy' || return 1
+  assert_contains "$events" \
+    'ip:-6 rule add priority 17999 from 2001:db8::10/128 table main' \
+    'native IPv6 replies must use the main table before global policy' || return 1
+
+  ip() {
+    case "$*" in
+      '-o -4 address show scope global') return 1 ;;
+      '-o -6 address show scope global')
+        printf '%s\n' '2: eth0    inet6 2001:db8::10/64 scope global'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  if wg_global_native_sources >/dev/null; then
+    fail 'a failed address query must not install a partial native-source policy'
+    return 1
+  fi
+
   events=''
   command() {
     if [ "${1:-}" = '-v' ] && [ "${2:-}" = nft ]; then return 0; fi
     builtin command "$@"
   }
-  ip() { events="${events}ip:$*"$'\n'; return 1; }
+  ip() {
+    events="${events}ip:$*"$'\n'
+    case "$*" in
+      '-4 rule show')
+        [ "$source4_present" -eq 0 ] || printf '17999: from 149.7.2.130 lookup main\n'
+        return 0
+        ;;
+      '-6 rule show')
+        [ "$source6_present" -eq 0 ] || printf '17999: from 2001:db8::10 lookup main\n'
+        return 0
+        ;;
+      '-4 rule del priority 17999 from 149.7.2.130 table main')
+        [ "$source4_present" -eq 1 ] || return 1
+        source4_present=0
+        ;;
+      '-6 rule del priority 17999 from 2001:db8::10 table main')
+        [ "$source6_present" -eq 1 ] || return 1
+        source6_present=0
+        ;;
+      *) return 1 ;;
+    esac
+  }
   nft() {
     events="${events}nft:$*"$'\n'
     [ "$*" != 'list table inet warp_vps_global' ] || return 0
@@ -3469,6 +3595,12 @@ test_wireguard_global_reply_mark_and_stop_contract() {
   assert_contains "$events" \
     'ip:-6 rule del table main suppress_prefixlength 0 priority 18000' \
     'global stop must delete the owned IPv6 main-suppression rule' || return 1
+  assert_contains "$events" \
+    'ip:-4 rule del priority 17999 from 149.7.2.130 table main' \
+    'global stop must delete the owned native IPv4 source rule' || return 1
+  assert_contains "$events" \
+    'ip:-6 rule del priority 17999 from 2001:db8::10 table main' \
+    'global stop must delete the owned native IPv6 source rule' || return 1
   assert_contains "$events" 'ip:-4 route del default dev warp-vps-wg table 51888' \
     'global stop must delete the owned IPv4 table default' || return 1
   assert_contains "$events" 'ip:-6 route del default dev warp-vps-wg table 51888' \
@@ -3476,7 +3608,34 @@ test_wireguard_global_reply_mark_and_stop_contract() {
   assert_contains "$events" 'nft:delete table inet warp_vps_global' \
     'global stop must remove its dedicated nftables table' || return 1
   assert_contains "$events" 'wg:set warp-vps-wg fwmark off' \
-    'global stop must clear the project WireGuard fwmark'
+    'global stop must clear the project WireGuard fwmark' || return 1
+
+  events=''
+  ip() {
+    events="${events}ip:$*"$'\n'
+    case "$*" in
+      '-4 rule show')
+        printf '%s\n' \
+          '17999: from 149.7.2.130 lookup main' \
+          '18001: not from all fwmark 0xcab0 lookup 51888'
+        ;;
+      '-6 rule show') printf '32766: from all lookup main\n' ;;
+      '-4 route del default dev warp-vps-wg table 51888'|\
+      '-6 route del default dev warp-vps-wg table 51888') return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  if stop_wg_global_routes; then
+    fail 'global stop must report a catchall policy rule that could not be removed'
+    return 1
+  fi
+  assert_not_contains "$events" \
+    'ip:-4 rule del priority 17999 from 149.7.2.130 table main' \
+    'a surviving catchall rule must keep its native-source guard' || return 1
+  assert_contains "$events" 'ip:-4 route del default dev warp-vps-wg table 51888' \
+    'a surviving catchall rule must have its global table neutralized' || return 1
+  assert_not_contains "$events" 'nft:delete table inet warp_vps_global' \
+    'unsafe policy cleanup must retain the packet-mark guards'
 }
 
 test_wireguard_global_src_valid_mark_boundary() {
@@ -3522,6 +3681,41 @@ test_wireguard_global_cleanup_ownership_is_exact() {
     fail 'unrelated policy rules that reuse the priorities must not count as project state'
     return 1
   }
+
+  rules4='17999: from 203.0.113.9 lookup 100'
+  rules6="$rules4"
+  wg_global_policy_rules_absent || {
+    fail 'an unrelated native-source priority using another table must not count as project state'
+    return 1
+  }
+
+  rules4='17999: from 203.0.113.9 iif eth0 lookup main'
+  rules6="$rules4"
+  wg_global_policy_rules_absent || {
+    fail 'a native-source rule with an extra selector must not count as project state'
+    return 1
+  }
+
+  rules4='17999: from all lookup main'
+  rules6="$rules4"
+  wg_global_policy_rules_absent || {
+    fail 'a from-all main rule must not count as a project native-source guard'
+    return 1
+  }
+
+  rules4='17999: from 203.0.113.0/24 lookup main'
+  rules6='17999: from 2001:db8::/64 lookup main'
+  wg_global_policy_rules_absent || {
+    fail 'non-host source prefixes must not count as project native-source guards'
+    return 1
+  }
+
+  rules4='17999: from 203.0.113.9 lookup main'
+  rules6="$rules4"
+  if wg_global_policy_rules_absent; then
+    fail 'the exact native-source main rule must be found during cleanup'
+    return 1
+  fi
 
   rules4='18001: not from all fwmark 0xcab0 lookup 51888'
   rules6='18001: not from all fwmark 51888 lookup 51888'
@@ -8521,7 +8715,7 @@ run_test 'WireGuard runtime avoids route readback gates' test_wireguard_runtime_
 run_test 'WireGuard scope selects precise or global writes' test_wireguard_scope_selects_precise_or_global_writes
 run_test 'WireGuard global apply uses owned policy state' test_wireguard_global_apply_uses_owned_policy_state
 run_test 'WireGuard global write failures clean partial state' test_wireguard_global_apply_write_failures_cleanup
-run_test 'WireGuard global reply mark and stop are symmetric' test_wireguard_global_reply_mark_and_stop_contract
+run_test 'WireGuard global native-source rules and stop are symmetric' test_wireguard_global_native_source_and_stop_contract
 run_test 'WireGuard global enables marked reverse-path checks' test_wireguard_global_src_valid_mark_boundary
 run_test 'WireGuard global cleanup ownership is exact' test_wireguard_global_cleanup_ownership_is_exact
 run_test 'status reports backend and route scope' test_status_reports_backend_and_route_scope

@@ -470,9 +470,21 @@ EOF
 }
 
 cloudflare_apt_candidate_available() {
+  local policy_output madison_output candidate
   command -v apt-cache >/dev/null 2>&1 || return 1
-  apt-cache --no-all-versions --full show cloudflare-warp 2>/dev/null \
-    | awk '$1 == "Filename:" { found=1 } END { exit !found }'
+  policy_output="$(LC_ALL=C apt-cache policy cloudflare-warp 2>/dev/null)" || return 1
+  candidate="$(awk '$1 == "Candidate:" { print $2; exit }' <<< "$policy_output")"
+  [ -n "$candidate" ] && [ "$candidate" != '(none)' ] || return 1
+  madison_output="$(LC_ALL=C apt-cache madison cloudflare-warp 2>/dev/null)" || return 1
+  awk -F '|' -v wanted="$candidate" '
+    {
+      version=$2
+      sub(/^[[:space:]]+/, "", version)
+      sub(/[[:space:]]+$/, "", version)
+      if (version == wanted) found=1
+    }
+    END { exit !found }
+  ' <<< "$madison_output"
 }
 
 refresh_cloudflare_apt_metadata() {

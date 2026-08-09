@@ -16,6 +16,7 @@ DEFAULT_WGCF_BIN="${APP_DIR}/bin/wgcf"
 DEFAULT_WG_CONFIG="/etc/wireguard/${DEFAULT_WG_IFACE}.conf"
 WG_GLOBAL_TABLE=51888
 WG_GLOBAL_MARK=51888
+WG_GLOBAL_NATIVE_RULE_PRIORITY=17999
 WG_GLOBAL_MAIN_RULE_PRIORITY=18000
 WG_GLOBAL_RULE_PRIORITY=18001
 WG_GLOBAL_NFT_TABLE="warp_vps_global"
@@ -909,7 +910,6 @@ add chain inet ${WG_GLOBAL_NFT_TABLE} output { type route hook output priority m
 add chain inet ${WG_GLOBAL_NFT_TABLE} postrouting { type filter hook postrouting priority mangle; policy accept; }
 add rule inet ${WG_GLOBAL_NFT_TABLE} prerouting ct mark ${WG_GLOBAL_MARK} meta mark set ct mark
 add rule inet ${WG_GLOBAL_NFT_TABLE} prerouting iifname != "lo" iifname != "${WG_IFACE}" fib daddr type local ct direction original meta mark set ${WG_GLOBAL_MARK} ct mark set meta mark
-add rule inet ${WG_GLOBAL_NFT_TABLE} output ct direction reply meta mark set ${WG_GLOBAL_MARK} ct mark set meta mark
 add rule inet ${WG_GLOBAL_NFT_TABLE} output ct mark ${WG_GLOBAL_MARK} meta mark set ct mark
 add rule inet ${WG_GLOBAL_NFT_TABLE} postrouting meta l4proto udp meta mark ${WG_GLOBAL_MARK} ct mark set meta mark
 EOF
@@ -944,9 +944,22 @@ wg_global_policy_rules_absent() {
     rules="$(ip -"$family" rule show 2>/dev/null)" || return 2
     ! grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
       <<< "$rules" || return 1
+    [ -z "$(wg_global_owned_native_sources "$family" <<< "$rules")" ] || return 1
     ! grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark ${mark_pattern}(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
       <<< "$rules" || return 1
   done
+}
+
+wg_global_owned_native_sources() {
+  local family="$1"
+  awk -v family="$family" -v priority="${WG_GLOBAL_NATIVE_RULE_PRIORITY}:" '
+    $1 == priority && $2 == "from" && $3 != "all" \
+      && $4 == "lookup" && $5 == "main" && NF == 5 {
+      if ($3 !~ /\// \
+        || (family == 4 && $3 ~ /\/32$/) \
+        || (family == 6 && $3 ~ /\/128$/)) print $3
+    }
+  '
 }
 
 wg_global_routes_absent() {
@@ -960,23 +973,86 @@ wg_global_routes_absent() {
 }
 
 delete_wg_global_policy_rules() {
-  local family
+  local family rules source failed=0
   for family in 4 6; do
     while ip -"$family" rule del not fwmark "$WG_GLOBAL_MARK" \
       table "$WG_GLOBAL_TABLE" priority "$WG_GLOBAL_RULE_PRIORITY" >/dev/null 2>&1; do
       :
     done
+    rules="$(ip -"$family" rule show 2>/dev/null)" || {
+      failed=1
+      continue
+    }
+    if grep -Eq "^${WG_GLOBAL_RULE_PRIORITY}:.*not .*fwmark (0x0*ca[bB]0|51888)(/0x[fF]{8})?.*lookup ${WG_GLOBAL_TABLE}([[:space:]]|$)" \
+      <<< "$rules"; then
+      failed=1
+      continue
+    fi
     while ip -"$family" rule del table main suppress_prefixlength 0 \
       priority "$WG_GLOBAL_MAIN_RULE_PRIORITY" >/dev/null 2>&1; do
       :
     done
+    while IFS= read -r source; do
+      [ -n "$source" ] || continue
+      while ip -"$family" rule del priority "$WG_GLOBAL_NATIVE_RULE_PRIORITY" \
+        from "$source" table main >/dev/null 2>&1; do
+        :
+      done
+    done < <(wg_global_owned_native_sources "$family" <<< "$rules")
+    rules="$(ip -"$family" rule show 2>/dev/null)" || {
+      failed=1
+      continue
+    }
+    if grep -Eq "^${WG_GLOBAL_MAIN_RULE_PRIORITY}:.*lookup main.*suppress_prefixlength 0([[:space:]]|$)" \
+      <<< "$rules" || [ -n "$(wg_global_owned_native_sources "$family" <<< "$rules")" ]; then
+      failed=1
+    fi
   done
+  [ "$failed" -eq 0 ]
+}
+
+wg_global_native_sources() {
+  local family raw parsed sources=""
+  for family in 4 6; do
+    raw="$(ip -o -"$family" address show scope global 2>/dev/null)" || return 1
+    parsed="$(awk -v family="$family" -v excluded="$WG_IFACE" '
+        {
+          iface=$2
+          sub(/@.*/, "", iface)
+          if (iface == excluded) next
+          split($4, address, "/")
+          if (address[1] != "") print family "|" address[1]
+        }
+      ' <<< "$raw")" || return 1
+    [ -z "$parsed" ] || sources="${sources}${sources:+$'\n'}${parsed}"
+  done
+  [ -n "$sources" ] || return 1
+  awk '!seen[$0]++ { print }' <<< "$sources"
+}
+
+install_wg_global_native_source_rules() {
+  local sources family address prefix
+  sources="$(wg_global_native_sources)" || return 1
+  while IFS='|' read -r family address; do
+    [ -n "$family" ] && [ -n "$address" ] || return 1
+    if [ "$family" = 4 ]; then
+      prefix=32
+    elif [ "$family" = 6 ]; then
+      prefix=128
+    else
+      return 1
+    fi
+    ip -"$family" rule add priority "$WG_GLOBAL_NATIVE_RULE_PRIORITY" \
+      from "${address}/${prefix}" table main || return 1
+  done <<< "$sources"
 }
 
 stop_wg_global_routes() {
-  delete_wg_global_policy_rules
+  local policy_rc=0
+  delete_wg_global_policy_rules || policy_rc=$?
   ip -4 route del default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" >/dev/null 2>&1 || true
   ip -6 route del default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" >/dev/null 2>&1 || true
+  [ "$policy_rc" -eq 0 ] || return "$policy_rc"
   if command -v nft >/dev/null 2>&1 \
     && nft list table inet "$WG_GLOBAL_NFT_TABLE" >/dev/null 2>&1; then
     nft delete table inet "$WG_GLOBAL_NFT_TABLE" >/dev/null 2>&1 || true
@@ -988,7 +1064,12 @@ stop_wg_global_routes() {
 
 apply_wg_global_routes() {
   command -v nft >/dev/null 2>&1 || die "WireGuard 全局模式需要 nftables"
-  stop_wg_global_routes
+  if ! stop_wg_global_routes; then
+    die "无法安全清除旧 WireGuard 全局策略，未写入新的全局路由"
+    # Tests replace die() to inspect this failure path.
+    # shellcheck disable=SC2317
+    return 1
+  fi
   enable_wg_global_src_valid_mark || return 1
   render_wg_global_nft_conf
   nft -c -f "$NFT_CONF" || die "WireGuard 全局回包规则预检失败"
@@ -999,7 +1080,8 @@ apply_wg_global_routes() {
     # shellcheck disable=SC2317
     return 1
   fi
-  if ! wg set "$WG_IFACE" fwmark "$WG_GLOBAL_MARK" \
+  if ! install_wg_global_native_source_rules \
+    || ! wg set "$WG_IFACE" fwmark "$WG_GLOBAL_MARK" \
     || ! ip -4 route replace default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" \
     || ! ip -6 route replace default dev "$WG_IFACE" table "$WG_GLOBAL_TABLE" \
     || ! ip -4 rule add priority "$WG_GLOBAL_MAIN_RULE_PRIORITY" table main suppress_prefixlength 0 \
@@ -1076,7 +1158,7 @@ stop_wg_routes_strict() {
   local failed=0
   local iface="${WG_IFACE:-$DEFAULT_WG_IFACE}"
 
-  stop_wg_global_routes
+  stop_wg_global_routes || failed=1
   wg_global_routes_absent || failed=1
   interface_rc=0
   wg_interface_absent || interface_rc=$?

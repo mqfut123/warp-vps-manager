@@ -135,6 +135,8 @@ jobs:
           ip netns exec "$router" sysctl -qw net.ipv6.conf.all.forwarding=1
 
           ip -n "$server" link add warp-vps-wg type dummy
+          ip -n "$server" address add 172.16.0.2/32 dev warp-vps-wg
+          ip -n "$server" -6 address add 2606:4700:110::2/128 dev warp-vps-wg nodad
           ip -n "$server" link set warp-vps-wg up
 
           for scope in google global; do
@@ -298,11 +300,11 @@ jobs:
           ip netns exec "$server" ip -4 route replace "$google4_cidr" dev warp-vps-wg
           ip netns exec "$server" ip -6 route replace "$google6_cidr" dev warp-vps-wg
           ip netns exec "$server" ip -4 route get "$google4_probe" \
-            | grep -Fq 'dev warp-vps-wg'
+            | grep -F 'dev warp-vps-wg' >/dev/null
           ip netns exec "$server" ip -6 route get "$google6_probe" \
-            | grep -Fq 'dev warp-vps-wg'
+            | grep -F 'dev warp-vps-wg' >/dev/null
           ip netns exec "$server" ip -4 route get 198.51.100.2 \
-            | grep -Fq 'via 192.0.2.1 dev eth0'
+            | grep -F 'via 192.0.2.1 dev eth0' >/dev/null
           assert_native_https_path wireguard google '/native/wireguard-google'
           assert_ordinary_https_blocked '/ordinary/wireguard-google'
 
@@ -382,16 +384,16 @@ jobs:
 
           ip netns exec "$server" nft -f "$RUNNER_TEMP/warp-vps-wireguard-global.nft"
           ip netns exec "$server" nft list chain inet warp_vps_global prerouting \
-            | grep -Eq 'fib daddr type local.*ct direction original.*meta mark set (0x0*ca[bB]0|51888).*ct mark set meta mark'
+            | grep -E 'fib daddr type local.*ct direction original.*meta mark set (0x0*ca[bB]0|51888).*ct mark set meta mark' >/dev/null
           ip netns exec "$server" nft list chain inet warp_vps_global output \
-            | grep -Eq 'ct direction reply.*meta mark set (0x0*ca[bB]0|51888).*ct mark set meta mark'
-          ip netns exec "$server" nft list chain inet warp_vps_global output \
-            | grep -Eq 'ct mark (0x0*ca[bB]0|51888).*meta mark set ct mark'
+            | grep -E 'ct mark (0x0*ca[bB]0|51888).*meta mark set ct mark' >/dev/null
           ip netns exec "$server" nft list chain inet warp_vps_global postrouting \
-            | grep -Eq 'meta l4proto udp.*meta mark (0x0*ca[bB]0|51888).*ct mark set meta mark'
+            | grep -E 'meta l4proto udp.*meta mark (0x0*ca[bB]0|51888).*ct mark set meta mark' >/dev/null
 
           ip netns exec "$server" ip -4 route replace default dev warp-vps-wg table 51888
           ip netns exec "$server" ip -6 route replace default dev warp-vps-wg table 51888
+          ip netns exec "$server" ip -4 rule add priority 17999 from 192.0.2.2/32 table main
+          ip netns exec "$server" ip -6 rule add priority 17999 from 2001:db8:1::2/128 table main
           ip netns exec "$server" ip -4 rule add priority 18000 table main suppress_prefixlength 0
           ip netns exec "$server" ip -6 rule add priority 18000 table main suppress_prefixlength 0
           ip netns exec "$server" ip -4 rule add not fwmark 51888 table 51888 priority 18001
@@ -403,23 +405,27 @@ jobs:
           inbound_client_pid=""
           grep -Fxq 'preserved-inbound-reply' "$inbound_result"
           ip netns exec "$server" ip -4 route get "$google4_probe" \
-            | grep -Fq 'dev warp-vps-wg'
+            | grep -F 'dev warp-vps-wg' >/dev/null
           assert_ordinary_https_blocked '/ordinary/wireguard-global'
 
           # Make SO_MARK independently observable even though SO_BINDTODEVICE also
-          # constrains route lookup: unmarked eth0 traffic hits this dead policy route.
+          # constrains route lookup: unmarked native-source traffic hits this dead route.
           ip netns exec "$server" ip -4 route replace "$google4_probe/32" \
             via 192.0.2.254 dev eth0 table 51888
+          ip netns exec "$server" ip -4 rule add priority 17998 \
+            from 192.0.2.2/32 fwmark 0/0xffffffff table 51888
           assert_native_https_path wireguard global '/native/wireguard-global'
+          ip netns exec "$server" ip -4 rule del priority 17998 \
+            from 192.0.2.2/32 fwmark 0/0xffffffff table 51888
 
           ip netns exec "$server" sysctl -qw net.ipv4.conf.all.src_valid_mark=1
           ip netns exec "$server" sysctl -qw net.ipv4.conf.all.rp_filter=1
           ip netns exec "$server" sysctl -qw net.ipv4.conf.eth0.rp_filter=1
 
           ip netns exec "$server" ip -4 route get 198.51.100.2 \
-            | grep -Fq 'dev warp-vps-wg'
+            | grep -F 'dev warp-vps-wg' >/dev/null
           ip netns exec "$server" ip -4 route get 198.51.100.2 mark 51888 \
-            | grep -Fq 'via 192.0.2.1 dev eth0'
+            | grep -F 'via 192.0.2.1 dev eth0' >/dev/null
           ip netns exec "$client" ping -c 3 -W 1 192.0.2.2
 
           endpoint_ready="$RUNNER_TEMP/warp-vps-endpoint-ready"
@@ -457,4 +463,6 @@ jobs:
           ip netns exec "$server" ip -6 rule del not fwmark 51888 table 51888 priority 18001
           ip netns exec "$server" ip -4 rule del table main suppress_prefixlength 0 priority 18000
           ip netns exec "$server" ip -6 rule del table main suppress_prefixlength 0 priority 18000
+          ip netns exec "$server" ip -4 rule del priority 17999 from 192.0.2.2/32 table main
+          ip netns exec "$server" ip -6 rule del priority 17999 from 2001:db8:1::2/128 table main
           BASH

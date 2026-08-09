@@ -40,7 +40,7 @@ Google 精准分流和全局 WARP 都可以搭配 WireGuard 或 Socks5，切换�
 - **两种运行模式**：WireGuard 完整承载双栈与 UDP；Socks5 适合更轻量的 TCP 透明代理。
 - **自带管理工具**：状态、诊断、解锁检测、更新、切换模式、日志和卸载统一由 `warp-vps` 管理。
 
-WireGuard 全局模式让公网 IPv4、IPv6、TCP、UDP 和 QUIC 全部走 WARP，并保留现有入站连接回包和局域网路由的原生路径。Socks5 不承载 UDP 或 IPv6；其全局模式接管 VPS 主动发起的公网 IPv4 TCP，入站连接回包保持原生路径，并继续拒绝 Google IPv4 UDP/443（QUIC）和 Google IPv6；其他非 Google UDP 与 IPv6 仍使用 VPS 原生出口。
+WireGuard 全局模式让未绑定原生源地址的公网 IPv4、IPv6、TCP、UDP 和 QUIC 全部走 WARP；现有及新入站连接回包、显式绑定 VPS 原生源地址的流量和局域网路由保留原生路径。Socks5 不承载 UDP 或 IPv6；其全局模式接管 VPS 主动发起的公网 IPv4 TCP，入站连接回包保持原生路径，并继续拒绝 Google IPv4 UDP/443（QUIC）和 Google IPv6；其他非 Google UDP 与 IPv6 仍使用 VPS 原生出口。
 
 ## 选择运行模式
 
