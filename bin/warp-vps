@@ -909,6 +909,7 @@ add chain inet ${WG_GLOBAL_NFT_TABLE} output { type route hook output priority m
 add chain inet ${WG_GLOBAL_NFT_TABLE} postrouting { type filter hook postrouting priority mangle; policy accept; }
 add rule inet ${WG_GLOBAL_NFT_TABLE} prerouting ct mark ${WG_GLOBAL_MARK} meta mark set ct mark
 add rule inet ${WG_GLOBAL_NFT_TABLE} prerouting iifname != "lo" iifname != "${WG_IFACE}" fib daddr type local ct direction original meta mark set ${WG_GLOBAL_MARK} ct mark set meta mark
+add rule inet ${WG_GLOBAL_NFT_TABLE} output ct direction reply meta mark set ${WG_GLOBAL_MARK} ct mark set meta mark
 add rule inet ${WG_GLOBAL_NFT_TABLE} output ct mark ${WG_GLOBAL_MARK} meta mark set ct mark
 add rule inet ${WG_GLOBAL_NFT_TABLE} postrouting meta l4proto udp meta mark ${WG_GLOBAL_MARK} ct mark set meta mark
 EOF

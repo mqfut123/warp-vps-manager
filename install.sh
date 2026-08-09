@@ -449,6 +449,7 @@ apply_swap_choice() {
 }
 
 refresh_cloudflare_apt_repo() {
+  local repo_file="${1:-/etc/apt/sources.list.d/cloudflare-client.list}"
   local codename arch
   install -d -m 0755 /usr/share/keyrings || return 1
   curl -fsSL --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME" \
@@ -463,64 +464,101 @@ refresh_cloudflare_apt_repo() {
   [ -n "$codename" ] || return 1
 
   arch="$(dpkg --print-architecture)" || return 1
-  cat > /etc/apt/sources.list.d/cloudflare-client.list <<EOF
+  cat > "$repo_file" <<EOF
 deb [arch=${arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
 EOF
 }
 
-prepare_existing_cloudflare_apt_repo() {
-  local repo_file="${1:-/etc/apt/sources.list.d/cloudflare-client.list}"
-  local disabled_file="${repo_file}.warp-vps-disabled.$$"
-  [ -e "$repo_file" ] || return 1
-  if command -v curl >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
-    refresh_cloudflare_apt_repo || die "Cloudflare WARP APT 公钥或软件源刷新失败"
-    return 0
-  fi
+cloudflare_apt_candidate_available() {
+  command -v apt-cache >/dev/null 2>&1 || return 1
+  apt-cache --no-all-versions --full show cloudflare-warp 2>/dev/null \
+    | awk '$1 == "Filename:" { found=1 } END { exit !found }'
+}
 
-  mv "$repo_file" "$disabled_file" \
-    || die "无法临时停用旧 Cloudflare WARP APT 软件源"
-  if ! apt_get update -y \
-    || ! apt_get install -y curl ca-certificates gnupg; then
-    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
-    die "无法安装刷新 Cloudflare WARP APT 软件源所需的基础工具"
-  fi
-  if ! refresh_cloudflare_apt_repo; then
-    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
-    die "Cloudflare WARP APT 公钥或软件源刷新失败"
-  fi
-  rm -f "$disabled_file" || true
+refresh_cloudflare_apt_metadata() {
+  local repo_file="${1:-/etc/apt/sources.list.d/cloudflare-client.list}"
+  apt_get \
+    -o "Dir::Etc::sourcelist=${repo_file}" \
+    -o 'Dir::Etc::sourceparts=-' \
+    -o 'APT::Get::List-Cleanup=0' \
+    update
+}
+
+apt_package_installed() {
+  command -v dpkg-query >/dev/null 2>&1 \
+    && dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null \
+      | grep -Fxq 'install ok installed'
 }
 
 pkg_install_apt() {
   local mode="$1"
   local scope="${2:-google}"
   local repo_file="${3:-/etc/apt/sources.list.d/cloudflare-client.list}"
-  local install_rc cloudflare_repo_ready=0
+  local install_rc cloudflare_repo_added=0 cloudflare_candidate_ready=0
+  local -a packages=()
   export DEBIAN_FRONTEND=noninteractive
   log "如果系统自动更新正在占用 apt/dpkg，最多等待 20 分钟"
-  if [ -e "$repo_file" ]; then
-    prepare_existing_cloudflare_apt_repo "$repo_file"
-    cloudflare_repo_ready=1
-  elif [ "$mode" = "socks" ] && ! warp_client_complete \
-    && command -v curl >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
-    refresh_cloudflare_apt_repo || die "Cloudflare WARP APT 公钥或软件源刷新失败"
-    cloudflare_repo_ready=1
+
+  if ! command -v curl >/dev/null 2>&1 && ! apt_package_installed curl; then
+    packages+=(curl)
   fi
-  apt_get update -y
+  apt_package_installed ca-certificates || packages+=(ca-certificates)
+  if ! command -v timeout >/dev/null 2>&1 \
+    || { [ "$mode" = "wireguard" ] && ! command -v sha256sum >/dev/null 2>&1; }; then
+    apt_package_installed coreutils || packages+=(coreutils)
+  fi
+  if { ! command -v ip >/dev/null 2>&1 \
+    || { [ "$mode" = "socks" ] && ! command -v ss >/dev/null 2>&1; }; } \
+    && ! apt_package_installed iproute2; then
+    packages+=(iproute2)
+  fi
+  if ! command -v python3 >/dev/null 2>&1 && ! apt_package_installed python3; then
+    packages+=(python3)
+  fi
 
   if [ "$mode" = "wireguard" ]; then
-    if [ "$scope" = "global" ] || [ "${PREVIOUS_MODE:-}" = "socks" ]; then
-      apt_get install -y curl ca-certificates coreutils nftables iproute2 python3 wireguard-tools
-    else
-      apt_get install -y curl ca-certificates coreutils iproute2 python3 wireguard-tools
+    if { ! command -v wg >/dev/null 2>&1 \
+      || ! command -v wg-quick >/dev/null 2>&1 \
+      || ! unit_file_exists 'wg-quick@.service'; } \
+      && ! apt_package_installed wireguard-tools; then
+      packages+=(wireguard-tools)
     fi
-    return
+    if { [ "$scope" = "global" ] || [ "${PREVIOUS_MODE:-}" = "socks" ]; } \
+      && ! command -v nft >/dev/null 2>&1 \
+      && ! apt_package_installed nftables; then
+      packages+=(nftables)
+    fi
+    [ "${#packages[@]}" -eq 0 ] \
+      || apt_get install -y --no-upgrade "${packages[@]}" \
+      || return 1
+    return 0
   fi
 
-  apt_get install -y curl ca-certificates coreutils gnupg lsb-release nftables iproute2 python3
+  if ! command -v nft >/dev/null 2>&1 && ! apt_package_installed nftables; then
+    packages+=(nftables)
+  fi
+  if ! warp_client_complete; then
+    cloudflare_apt_candidate_available && cloudflare_candidate_ready=1
+    if [ "$cloudflare_candidate_ready" -eq 0 ] && [ ! -e "$repo_file" ]; then
+      if ! command -v gpg >/dev/null 2>&1 && ! apt_package_installed gnupg; then
+        packages+=(gnupg)
+      fi
+      if [ -z "$OS_CODENAME" ] && ! command -v lsb_release >/dev/null 2>&1 \
+        && ! apt_package_installed lsb-release; then
+        packages+=(lsb-release)
+      fi
+    fi
+  fi
+  [ "${#packages[@]}" -eq 0 ] \
+    || apt_get install -y --no-upgrade "${packages[@]}" \
+    || return 1
   if ! redsocks_path >/dev/null 2>&1; then
     install_rc=0
-    apt_get install -y redsocks || install_rc=$?
+    if apt_package_installed redsocks; then
+      apt_get install -y --reinstall --no-upgrade redsocks || install_rc=$?
+    else
+      apt_get install -y --no-upgrade redsocks || install_rc=$?
+    fi
     disable_new_packaged_redsocks_service
     [ "$install_rc" -eq 0 ] || return "$install_rc"
   fi
@@ -528,15 +566,33 @@ pkg_install_apt() {
     return
   fi
 
-  if [ "$cloudflare_repo_ready" -eq 0 ]; then
-    refresh_cloudflare_apt_repo || die "Cloudflare WARP APT 公钥或软件源刷新失败"
+  if [ "$cloudflare_candidate_ready" -eq 0 ]; then
+    if [ -e "$repo_file" ]; then
+      die "现有 Cloudflare WARP APT 软件源没有可用候选；请先运行 apt update 后重试"
+    fi
+    refresh_cloudflare_apt_repo "$repo_file" \
+      || die "Cloudflare WARP APT 公钥或软件源配置失败"
+    cloudflare_repo_added=1
+    if ! refresh_cloudflare_apt_metadata "$repo_file"; then
+      if [ "$cloudflare_repo_added" -eq 1 ]; then
+        rm -f -- "$repo_file"
+      fi
+      die "无法获取缺失的 cloudflare-warp 软件包元数据"
+    fi
   fi
-  apt_get update -y
-  apt_get install -y --reinstall cloudflare-warp
+  if apt_package_installed cloudflare-warp; then
+    apt_get install -y --reinstall --no-upgrade cloudflare-warp
+  else
+    apt_get install -y --no-upgrade cloudflare-warp
+  fi
 }
 
 apt_get() {
   apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" "$@"
+}
+
+rpm_package_installed() {
+  command -v rpm >/dev/null 2>&1 && rpm -q "$1" >/dev/null 2>&1
 }
 
 redsocks_path() {
@@ -571,12 +627,11 @@ raw_asset_url() {
 
 enable_rhel_extra_repos() {
   if command -v dnf >/dev/null 2>&1; then
-    dnf install -y dnf-plugins-core || true
+    rpm_package_installed dnf-plugins-core || dnf install -y dnf-plugins-core || true
     dnf config-manager --set-enabled crb >/dev/null 2>&1 || true
     dnf config-manager --set-enabled powertools >/dev/null 2>&1 || true
-    dnf install -y epel-release || true
   else
-    yum install -y yum-utils epel-release || true
+    rpm_package_installed yum-utils || yum install -y yum-utils || true
     yum-config-manager --enable crb >/dev/null 2>&1 || true
     yum-config-manager --enable powertools >/dev/null 2>&1 || true
   fi
@@ -628,6 +683,7 @@ EOF
 rpm_install_redsocks() {
   local manager="$1"
   local install_rc
+  local -a packages=()
   if redsocks_path >/dev/null 2>&1; then
     mark_managed_redsocks_if_current
     return
@@ -635,13 +691,30 @@ rpm_install_redsocks() {
 
   if [ "$OS_ID" = "fedora" ]; then
     install_rc=0
-    "$manager" install -y redsocks || install_rc=$?
+    if rpm_package_installed redsocks; then
+      "$manager" reinstall -y redsocks || install_rc=$?
+    else
+      "$manager" install -y redsocks || install_rc=$?
+    fi
     disable_new_packaged_redsocks_service
     return "$install_rc"
   fi
 
   log "当前 RPM 系统使用固定上游源码构建 redsocks"
-  "$manager" install -y gcc tar gzip libevent-devel
+  if ! command -v gcc >/dev/null 2>&1 && ! rpm_package_installed gcc; then
+    packages+=(gcc)
+  fi
+  if ! command -v tar >/dev/null 2>&1 && ! rpm_package_installed tar; then
+    packages+=(tar)
+  fi
+  if ! command -v gzip >/dev/null 2>&1 && ! rpm_package_installed gzip; then
+    packages+=(gzip)
+  fi
+  rpm_package_installed libevent-devel || enable_rhel_extra_repos
+  rpm_package_installed libevent-devel || packages+=(libevent-devel)
+  [ "${#packages[@]}" -eq 0 ] \
+    || "$manager" install -y "${packages[@]}" \
+    || return 1
   build_redsocks_from_source
 }
 
@@ -667,81 +740,65 @@ refresh_cloudflare_rpm_repo() {
   mv "$repo_tmp" "$repo_file" || die "无法启用 Cloudflare WARP RPM 软件源"
 }
 
-prepare_existing_cloudflare_rpm_repo() {
-  local manager="$1"
-  local repo_file="${2:-/etc/yum.repos.d/cloudflare-warp.repo}"
-  local disabled_file="${repo_file}.warp-vps-disabled.$$"
-  [ -e "$repo_file" ] || return 1
-  if command -v curl >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then
-    refresh_cloudflare_rpm_repo "$repo_file"
-    return 0
-  fi
-
-  mv "$repo_file" "$disabled_file" \
-    || die "无法临时停用旧 Cloudflare WARP RPM 软件源"
-  if ! "$manager" install -y curl ca-certificates rpm; then
-    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
-    die "无法安装刷新 Cloudflare WARP RPM 软件源所需的基础工具"
-  fi
-  if ! command -v curl >/dev/null 2>&1 || ! command -v rpm >/dev/null 2>&1; then
-    mv "$disabled_file" "$repo_file" >/dev/null 2>&1 || true
-    die "刷新 Cloudflare WARP RPM 软件源所需的基础工具安装不完整"
-  fi
-  mv "$disabled_file" "$repo_file" \
-    || die "无法恢复 Cloudflare WARP RPM 软件源"
-  refresh_cloudflare_rpm_repo "$repo_file"
-}
-
 pkg_install_rpm() {
   local mode="$1"
   local manager="$2"
   local scope="${3:-google}"
   local repo_file="${4:-/etc/yum.repos.d/cloudflare-warp.repo}"
-  local cloudflare_repo_ready=0 cloudflare_metadata_ready=0
-  if [ -e "$repo_file" ]; then
-    prepare_existing_cloudflare_rpm_repo "$manager" "$repo_file"
-    cloudflare_repo_ready=1
-    "$manager" clean metadata || die "无法刷新 RPM 软件源元数据"
-    cloudflare_metadata_ready=1
+  local -a packages=()
+
+  if ! command -v rpm >/dev/null 2>&1; then
+    "$manager" install -y rpm || return 1
+    command -v rpm >/dev/null 2>&1 || die "依赖安装后仍找不到 rpm"
   fi
-  if [ "$mode" = "wireguard" ]; then
-    if [ "$scope" = "global" ] || [ "${PREVIOUS_MODE:-}" = "socks" ]; then
-      "$manager" install -y curl ca-certificates coreutils nftables iproute python3 wireguard-tools
-    else
-      "$manager" install -y curl ca-certificates coreutils iproute python3 wireguard-tools
-    fi
-    return
+  if ! command -v curl >/dev/null 2>&1 && ! rpm_package_installed curl; then
+    packages+=(curl)
+  fi
+  rpm_package_installed ca-certificates || packages+=(ca-certificates)
+  if ! command -v timeout >/dev/null 2>&1 \
+    || { [ "$mode" = "wireguard" ] && ! command -v sha256sum >/dev/null 2>&1; }; then
+    rpm_package_installed coreutils || packages+=(coreutils)
+  fi
+  if { ! command -v ip >/dev/null 2>&1 \
+    || { [ "$mode" = "socks" ] && ! command -v ss >/dev/null 2>&1; }; } \
+    && ! rpm_package_installed iproute; then
+    packages+=(iproute)
+  fi
+  if ! command -v python3 >/dev/null 2>&1 && ! rpm_package_installed python3; then
+    packages+=(python3)
   fi
 
-  if [ "$cloudflare_repo_ready" -eq 0 ] && ! warp_client_complete \
-    && command -v curl >/dev/null 2>&1 \
-    && command -v rpm >/dev/null 2>&1; then
-    refresh_cloudflare_rpm_repo
-    cloudflare_repo_ready=1
-    "$manager" clean metadata || die "无法刷新 RPM 软件源元数据"
-    cloudflare_metadata_ready=1
-  fi
-  if [ "$OS_ID" != "fedora" ]; then
-    enable_rhel_extra_repos
-  fi
-  "$manager" install -y curl ca-certificates coreutils nftables iproute python3 rpm
-  rpm_install_redsocks "$manager"
-  if ! warp_client_complete; then
-    if [ "$cloudflare_repo_ready" -eq 0 ]; then
-      refresh_cloudflare_rpm_repo
+  if [ "$mode" = "wireguard" ]; then
+    if { ! command -v wg >/dev/null 2>&1 \
+      || ! command -v wg-quick >/dev/null 2>&1 \
+      || ! unit_file_exists 'wg-quick@.service'; } \
+      && ! rpm_package_installed wireguard-tools; then
+      packages+=(wireguard-tools)
     fi
-    if [ "$cloudflare_metadata_ready" -eq 0 ]; then
-      "$manager" clean metadata || die "无法刷新 RPM 软件源元数据"
+    if { [ "$scope" = "global" ] || [ "${PREVIOUS_MODE:-}" = "socks" ]; } \
+      && ! command -v nft >/dev/null 2>&1 \
+      && ! rpm_package_installed nftables; then
+      packages+=(nftables)
+    fi
+    [ "${#packages[@]}" -eq 0 ] \
+      || "$manager" install -y "${packages[@]}" \
+      || return 1
+    return 0
+  fi
+
+  if ! command -v nft >/dev/null 2>&1 && ! rpm_package_installed nftables; then
+    packages+=(nftables)
+  fi
+  [ "${#packages[@]}" -eq 0 ] \
+    || "$manager" install -y "${packages[@]}" \
+    || return 1
+  rpm_install_redsocks "$manager" || return 1
+  if ! warp_client_complete; then
+    if [ ! -e "$repo_file" ]; then
+      refresh_cloudflare_rpm_repo "$repo_file"
     fi
     if rpm -q cloudflare-warp >/dev/null 2>&1; then
-      if [ "$manager" = "dnf" ]; then
-        "$manager" upgrade -y --best cloudflare-warp
-      else
-        "$manager" update -y cloudflare-warp
-      fi
-      if ! warp_client_complete; then
-        "$manager" reinstall -y cloudflare-warp
-      fi
+      "$manager" reinstall -y cloudflare-warp
     else
       "$manager" install -y cloudflare-warp
     fi

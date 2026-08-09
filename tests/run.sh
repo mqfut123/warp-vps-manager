@@ -1559,16 +1559,20 @@ test_systemd_state_checks_support_old_key_value_output() {
 }
 
 test_redsocks_cleanup_precedes_warp_install() {
-  local body install_line cleanup_line warp_line
+  local body install_line repair_line cleanup_line warp_line
   body="$(function_body "$INSTALL_SCRIPT" pkg_install_apt)"
-  install_line="$(line_number "$body" 'apt_get install -y redsocks')"
+  install_line="$(line_number "$body" 'apt_get install -y --no-upgrade redsocks')"
+  repair_line="$(line_number "$body" 'apt_get install -y --reinstall --no-upgrade redsocks')"
   cleanup_line="$(line_number "$body" 'disable_new_packaged_redsocks_service')"
-  warp_line="$(line_number "$body" 'apt_get install -y --reinstall cloudflare-warp')"
-  if [ -z "$install_line" ] || [ -z "$cleanup_line" ] || [ -z "$warp_line" ]; then
+  warp_line="$(line_number "$body" 'apt_get install -y --reinstall --no-upgrade cloudflare-warp')"
+  if [ -z "$install_line" ] || [ -z "$repair_line" ] \
+    || [ -z "$cleanup_line" ] || [ -z "$warp_line" ]; then
     fail 'APT dependency phases are incomplete'
     return 1
   fi
-  if [ "$install_line" -ge "$cleanup_line" ] || [ "$cleanup_line" -ge "$warp_line" ]; then
+  if [ "$install_line" -ge "$cleanup_line" ] \
+    || [ "$repair_line" -ge "$cleanup_line" ] \
+    || [ "$cleanup_line" -ge "$warp_line" ]; then
     fail 'a newly introduced redsocks.service must be stopped before WARP installation can fail'
   fi
 }
@@ -1658,7 +1662,21 @@ test_apt_wireguard_dependencies_are_minimal() {
   }
 
   local package_calls=''
-  apt-get() {
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl|timeout|sha256sum|ip|python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  apt_package_installed() {
+    case "$1" in
+      ca-certificates|coreutils|iproute2|python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  unit_file_exists() { return 1; }
+  apt_get() {
     package_calls="${package_calls}$*\n"
     return 0
   }
@@ -1669,7 +1687,8 @@ test_apt_wireguard_dependencies_are_minimal() {
   OS_CODENAME=noble
 
   pkg_install_apt wireguard
-  assert_contains "$package_calls" 'wireguard-tools' 'WireGuard mode should install wireguard-tools' || return 1
+  assert_eq 'install -y --no-upgrade wireguard-tools' "${package_calls%\\n}" \
+    'WireGuard mode should submit only its missing package' || return 1
   assert_not_contains "$package_calls" 'nftables' 'WireGuard mode must not install nftables' || return 1
   assert_not_contains "$package_calls" 'iptables' 'WireGuard mode must not install iptables' || return 1
   assert_not_contains "$package_calls" 'redsocks' 'WireGuard mode must not install redsocks' || return 1
@@ -1678,64 +1697,130 @@ test_apt_wireguard_dependencies_are_minimal() {
   package_calls=''
   PREVIOUS_MODE=socks
   pkg_install_apt wireguard google
-  assert_contains "$package_calls" 'nftables' \
-    'switching from Socks must retain nftables until its old table can be cleared'
+  assert_eq 'install -y --no-upgrade wireguard-tools nftables' "${package_calls%\\n}" \
+    'switching from Socks must add only WireGuard and its required cleanup dependency'
 }
 
-test_existing_cloudflare_apt_repo_refreshes_before_updates() {
+test_cloudflare_apt_repo_refresh_is_new_source_only() {
   source_without_main "$INSTALL_SCRIPT"
-  local root repo events='' mode
+  local root repo event_file candidate_ready=1 package_installed=1 warp_ready=0
   root="$(mktemp -d)"
   repo="$root/cloudflare-client.list"
-  printf 'stale cloudflare source\n' > "$repo"
+  event_file="$root/events"
   OS_CODENAME=noble
 
   command() {
     [ "$1" = '-v' ] || return 1
-    case "$2" in curl|gpg) return 0 ;; *) builtin command "$@" ;; esac
+    case "$2" in
+      curl|gpg|timeout|ip|ss|python3|nft|dpkg-query) return 0 ;;
+      *) return 1 ;;
+    esac
   }
-  refresh_cloudflare_apt_repo() { events="${events}refresh-cloudflare"$'\n'; }
-  apt_get() { events="${events}apt:$*"$'\n'; }
-  warp_client_complete() { return 0; }
-  redsocks_path() { return 1; }
+  apt_package_installed() {
+    case "$1" in
+      cloudflare-warp) [ "$package_installed" -eq 1 ] ;;
+      *) return 0 ;;
+    esac
+  }
+  cloudflare_apt_candidate_available() { [ "$candidate_ready" -eq 1 ]; }
+  warp_client_complete() { [ "$warp_ready" -eq 1 ]; }
+  redsocks_path() { printf '/usr/bin/redsocks\n'; }
   disable_new_packaged_redsocks_service() { :; }
   log() { :; }
-
-  for mode in wireguard socks; do
-    events=''
-    pkg_install_apt "$mode" google "$repo" || {
-      fail "an existing Cloudflare source should be refreshed before $mode dependencies"
-      return 1
-    }
-    assert_eq 'refresh-cloudflare' "$(head -n 1 <<< "$events")" \
-      "an existing Cloudflare source must be refreshed before the first $mode apt update" || return 1
-  done
-
-  command() {
-    [ "$1" = '-v' ] || return 1
-    case "$2" in curl|gpg) return 1 ;; *) builtin command "$@" ;; esac
-  }
-  events=''
   refresh_cloudflare_apt_repo() {
-    events="${events}refresh-cloudflare"$'\n'
-    printf 'fresh cloudflare source\n' > "$repo"
+    printf 'repo-add:%s\n' "$1" >> "$event_file"
+    printf 'cloudflare source\n' > "$1"
   }
-  apt_get() {
-    if [ "$1" = update ] && [ -e "$repo" ]; then
-      fail 'the stale Cloudflare source remained enabled while installing refresh prerequisites'
-      return 1
-    fi
-    events="${events}apt:$*"$'\n'
+  refresh_cloudflare_apt_metadata() {
+    printf 'repo-update:%s\n' "$1" >> "$event_file"
   }
-  prepare_existing_cloudflare_apt_repo "$repo" || {
-    fail 'a stale Cloudflare source should be repairable when curl and gpg are missing'
+  apt_get() { printf 'apt:%s\n' "$*" >> "$event_file"; }
+  die() { printf 'die:%s\n' "$*" >> "$event_file"; exit 1; }
+
+  printf 'existing cloudflare source\n' > "$repo"
+  : > "$event_file"
+  pkg_install_apt socks google "$repo" || return 1
+  assert_eq 'apt:install -y --reinstall --no-upgrade cloudflare-warp' \
+    "$(< "$event_file")" \
+    'an existing source and candidate should repair only WARP without refreshing metadata' \
+    || return 1
+  assert_eq 'existing cloudflare source' "$(< "$repo")" \
+    'an existing Cloudflare source must remain unchanged' || return 1
+
+  : > "$event_file"
+  candidate_ready=0
+  if (pkg_install_apt socks google "$repo"); then
+    fail 'an existing source without a local candidate must require an explicit user refresh'
+    return 1
+  fi
+  assert_contains "$(< "$event_file")" 'die:现有 Cloudflare WARP APT 软件源没有可用候选' \
+    'an existing source without a candidate should return an actionable reason' || return 1
+  assert_not_contains "$(< "$event_file")" 'repo-update:' \
+    'an existing source must never trigger an automatic metadata refresh' || return 1
+
+  : > "$event_file"
+  repo="$root/new-cloudflare-client.list"
+  package_installed=0
+  pkg_install_apt socks google "$repo" || return 1
+  assert_eq "repo-add:${repo}"$'\n'"repo-update:${repo}"$'\n'\
+"apt:install -y --no-upgrade cloudflare-warp" \
+    "$(< "$event_file")" \
+    'a newly added Cloudflare source should receive one scoped refresh before WARP installation' \
+    || return 1
+
+  : > "$event_file"
+  repo="$root/failed-cloudflare-client.list"
+  refresh_cloudflare_apt_metadata() {
+    printf 'repo-update:%s\n' "$1" >> "$event_file"
     return 1
   }
-  assert_eq $'apt:update -y\napt:install -y curl ca-certificates gnupg\nrefresh-cloudflare' \
-    "${events%$'\n'}" \
-    'refresh prerequisites must install with the stale source disabled before repo refresh' || return 1
-  assert_eq 'fresh cloudflare source' "$(< "$repo")" \
-    'the repaired Cloudflare source must replace the temporarily disabled stale source'
+  if (pkg_install_apt socks google "$repo"); then
+    fail 'a failed scoped metadata refresh must stop WARP installation'
+    return 1
+  fi
+  [ ! -e "$repo" ] || {
+    fail 'a failed first metadata refresh must withdraw the newly added source'
+    return 1
+  }
+
+  local metadata_body
+  metadata_body="$(function_body "$INSTALL_SCRIPT" refresh_cloudflare_apt_metadata)"
+  assert_contains "$metadata_body" 'Dir::Etc::sourcelist=${repo_file}' \
+    'Cloudflare metadata refresh must target only its own source file' || return 1
+  assert_contains "$metadata_body" 'Dir::Etc::sourceparts=-' \
+    'Cloudflare metadata refresh must exclude every other APT source directory' || return 1
+  assert_file_not_matches "$INSTALL_SCRIPT" 'apt_get update( -y)?$|apt-get[^\n]* update' \
+    'the installer must not execute a general APT metadata refresh'
+}
+
+test_cloudflare_apt_candidate_requires_downloadable_record() {
+  source_without_main "$INSTALL_SCRIPT"
+  local cache_record=''
+
+  command() {
+    [ "$1" = '-v' ] && [ "$2" = 'apt-cache' ]
+  }
+  apt-cache() {
+    [ "$*" = '--no-all-versions --full show cloudflare-warp' ] || return 2
+    printf '%s' "$cache_record"
+  }
+
+  cache_record=$'Package: cloudflare-warp\nVersion: 1.0\nStatus: install ok installed\n'
+  if cloudflare_apt_candidate_available; then
+    fail 'an installed-only dpkg status record must not count as a downloadable candidate'
+    return 1
+  fi
+  cache_record=$'Package: cloudflare-warp\nVersion: 2.0\nFilename: pool/cloudflare-warp_2.0_amd64.deb\n'
+  cloudflare_apt_candidate_available || {
+    fail 'a candidate record backed by a repository Filename should be reusable'
+    return 1
+  }
+
+  cache_record=$'Package: cloudflare-warp\nVersion: 3.0\nStatus: install ok installed\nVersion: 2.0\nFilename-old: pool/cloudflare-warp_2.0_amd64.deb\n'
+  if cloudflare_apt_candidate_available; then
+    fail 'an unavailable installed candidate must not borrow a Filename from another version'
+    return 1
+  fi
 }
 
 test_rpm_wireguard_dependencies_are_minimal() {
@@ -1745,7 +1830,21 @@ test_rpm_wireguard_dependencies_are_minimal() {
     return 1
   }
 
-  local package_calls='' root repo refresh_line clean_line install_line
+  local package_calls='' root repo
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      rpm|curl|timeout|sha256sum|ip|python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  rpm_package_installed() {
+    case "$1" in
+      ca-certificates|coreutils|iproute|python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  unit_file_exists() { return 1; }
   dnf() {
     package_calls="${package_calls}$*"$'\n'
     return 0
@@ -1763,7 +1862,8 @@ test_rpm_wireguard_dependencies_are_minimal() {
   OS_VERSION_MAJOR=9
 
   pkg_install_rpm wireguard dnf
-  assert_contains "$package_calls" 'wireguard-tools' 'WireGuard mode should install wireguard-tools' || return 1
+  assert_eq 'install -y wireguard-tools' "${package_calls%$'\n'}" \
+    'WireGuard mode should submit only its missing RPM package' || return 1
   assert_not_contains "$package_calls" 'nftables' 'WireGuard mode must not install nftables' || return 1
   assert_not_contains "$package_calls" 'iptables' 'WireGuard mode must not install iptables' || return 1
   assert_not_contains "$package_calls" 'redsocks' 'WireGuard mode must not install redsocks' || return 1
@@ -1782,75 +1882,74 @@ test_rpm_wireguard_dependencies_are_minimal() {
   repo="$root/cloudflare-warp.repo"
   printf 'stale cloudflare repo\n' > "$repo"
   package_calls=''
-  command() {
-    [ "$1" = '-v' ] || return 1
-    case "$2" in curl|rpm) return 0 ;; *) builtin command "$@" ;; esac
-  }
   refresh_cloudflare_rpm_repo() { package_calls="${package_calls}refresh-cloudflare"$'\n'; }
   pkg_install_rpm wireguard dnf google "$repo"
-  refresh_line="$(line_number "$package_calls" 'refresh-cloudflare')"
-  clean_line="$(line_number "$package_calls" 'clean metadata')"
-  install_line="$(line_number "$package_calls" 'wireguard-tools')"
-  if [ -z "$refresh_line" ] || [ -z "$clean_line" ] || [ -z "$install_line" ] \
-    || [ "$refresh_line" -ge "$clean_line" ] || [ "$clean_line" -ge "$install_line" ]; then
-    fail 'an existing Cloudflare RPM repo must refresh before a WireGuard dependency transaction'
-    return 1
-  fi
-  unset -f command
+  assert_eq 'install -y wireguard-tools' "${package_calls%$'\n'}" \
+    'WireGuard dependency installation must ignore an unrelated Cloudflare RPM source' || return 1
+  assert_eq 'stale cloudflare repo' "$(< "$repo")" \
+    'WireGuard dependency installation must preserve an existing Cloudflare RPM source'
 }
 
-test_rpm_existing_repo_bootstraps_refresh_tools_before_wireguard() {
+test_package_transactions_submit_only_missing_packages() {
   source_without_main "$INSTALL_SCRIPT"
-
-  local root repo package_calls='' tools_ready=0 repo_enabled_during_bootstrap=0
-  local bootstrap_line refresh_line clean_line install_line
-  root="$(mktemp -d)"
-  repo="$root/cloudflare-warp.repo"
-  printf 'stale cloudflare repo\n' > "$repo"
+  local package_calls='' package_rc=0
   command() {
     [ "$1" = '-v' ] || return 1
     case "$2" in
-      curl|rpm) [ "$tools_ready" -eq 1 ] ;;
-      *) builtin command "$@" ;;
+      curl|timeout|sha256sum|ip|wg|wg-quick|rpm) return 0 ;;
+      *) return 1 ;;
     esac
   }
-  dnf() {
-    if [ "$1" = install ] && [ "$tools_ready" -eq 0 ]; then
-      [ ! -e "$repo" ] || repo_enabled_during_bootstrap=1
-      tools_ready=1
-    fi
-    package_calls="${package_calls}$*"$'\n'
-    return 0
+  apt_package_installed() {
+    [ "$1" != python3 ]
   }
-  refresh_cloudflare_rpm_repo() {
-    package_calls="${package_calls}refresh-cloudflare"$'\n'
+  rpm_package_installed() {
+    [ "$1" != python3 ]
   }
+  unit_file_exists() { return 0; }
+  log() { :; }
+  apt_get() { package_calls="${package_calls}apt:$*"$'\n'; return "$package_rc"; }
+  dnf() { package_calls="${package_calls}dnf:$*"$'\n'; return "$package_rc"; }
 
-  pkg_install_rpm wireguard dnf google "$repo"
-  assert_eq '0' "$repo_enabled_during_bootstrap" \
-    'the stale Cloudflare RPM repo must be disabled while refresh tools are installed' || return 1
-  [ -e "$repo" ] || {
-    fail 'the existing Cloudflare RPM repo must be restored before refresh'
-    return 1
-  }
-  bootstrap_line="$(line_number "$package_calls" 'install -y curl ca-certificates rpm')"
-  refresh_line="$(line_number "$package_calls" 'refresh-cloudflare')"
-  clean_line="$(line_number "$package_calls" 'clean metadata')"
-  install_line="$(line_number "$package_calls" 'wireguard-tools')"
-  if [ -z "$bootstrap_line" ] || [ -z "$refresh_line" ] || [ -z "$clean_line" ] \
-    || [ -z "$install_line" ] || [ "$bootstrap_line" -ge "$refresh_line" ] \
-    || [ "$refresh_line" -ge "$clean_line" ] || [ "$clean_line" -ge "$install_line" ]; then
-    fail 'missing RPM refresh tools must bootstrap with the stale repo disabled before WireGuard dependencies'
+  pkg_install_apt wireguard
+  assert_eq 'apt:install -y --no-upgrade python3' "${package_calls%$'\n'}" \
+    'APT must submit exactly the one missing package' || return 1
+  package_calls=''
+  pkg_install_rpm wireguard dnf
+  assert_eq 'dnf:install -y python3' "${package_calls%$'\n'}" \
+    'RPM must submit exactly the one missing package' || return 1
+  assert_not_contains "$package_calls" 'clean metadata' \
+    'RPM dependency installation must not explicitly clean metadata' || return 1
+
+  package_rc=42
+  if pkg_install_apt wireguard; then
+    fail 'an APT dependency transaction failure must propagate from pkg_install_apt'
     return 1
   fi
-  unset -f command
+  if pkg_install_rpm wireguard dnf; then
+    fail 'an RPM dependency transaction failure must propagate from pkg_install_rpm'
+    return 1
+  fi
 }
 
 test_socks_dependencies_are_mode_specific() {
   source_without_main "$INSTALL_SCRIPT"
 
   local package_calls=''
-  apt-get() {
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl|timeout|ip|ss|python3|rpm) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  apt_package_installed() {
+    case "$1" in
+      ca-certificates|coreutils|iproute2|python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  apt_get() {
     package_calls="${package_calls}$*\n"
     return 0
   }
@@ -1878,7 +1977,12 @@ test_socks_dependencies_are_mode_specific() {
     package_calls="${package_calls}$*\n"
     return 0
   }
-  enable_rhel_extra_repos() { :; }
+  rpm_package_installed() {
+    case "$1" in
+      ca-certificates|coreutils|iproute|python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
   warp_client_complete() { return 0; }
   rpm_install_redsocks() {
     package_calls="${package_calls}redsocks-path\n"
@@ -1910,26 +2014,41 @@ test_complete_mode_dependencies_skip_package_manager() {
   assert_eq '0' "$package_calls" 'complete dependencies should skip package installation'
 }
 
-test_incomplete_dependencies_use_current_package_candidate() {
+test_missing_and_incomplete_warp_transactions_are_distinct() {
   source_without_main "$INSTALL_SCRIPT"
-  local manager_calls='' rpm_installed=1 warp_ready=0 clean_line candidate_line
+  local manager_calls='' apt_calls='' rpm_installed=1 apt_installed=1 warp_ready=0
+  local root rpm_repo apt_repo
+  root="$(mktemp -d)"
+  rpm_repo="$root/cloudflare-warp.repo"
+  apt_repo="$root/cloudflare-client.list"
+  printf 'cloudflare rpm repo\n' > "$rpm_repo"
+  printf 'cloudflare apt repo\n' > "$apt_repo"
   OS_ID=fedora
   STATE_DIR=/unused/state
 
-  enable_rhel_extra_repos() { :; }
   rpm_install_redsocks() { :; }
   warp_client_complete() { [ "$warp_ready" -eq 1 ]; }
-  install() { return 0; }
-  curl() { return 0; }
-  chmod() { return 0; }
-  mv() { return 0; }
-  rpm() {
-    case "$1" in
-      --import) return 0 ;;
-      -q) [ "$rpm_installed" -eq 1 ] ;;
+  redsocks_path() { printf '/usr/bin/redsocks\n'; }
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      rpm|curl|timeout|ip|ss|python3|nft|gpg|dpkg-query) return 0 ;;
       *) return 1 ;;
     esac
   }
+  rpm_package_installed() {
+    case "$1" in
+      cloudflare-warp) [ "$rpm_installed" -eq 1 ] ;;
+      *) return 0 ;;
+    esac
+  }
+  apt_package_installed() {
+    case "$1" in
+      cloudflare-warp) [ "$apt_installed" -eq 1 ] ;;
+      *) return 0 ;;
+    esac
+  }
+  rpm() { [ "$1" = '-q' ] && [ "$rpm_installed" -eq 1 ]; }
   dnf() {
     manager_calls="${manager_calls}$*"$'\n'
     case "$*" in
@@ -1937,41 +2056,59 @@ test_incomplete_dependencies_use_current_package_candidate() {
     esac
     return 0
   }
+  cloudflare_apt_candidate_available() { return 0; }
+  apt_get() {
+    apt_calls="${apt_calls}$*"$'\n'
+    case "$*" in
+      *cloudflare-warp*) warp_ready=1 ;;
+    esac
+    return 0
+  }
+  log() { :; }
 
-  pkg_install_rpm socks dnf || {
-    fail 'an incomplete installed WARP dependency should be repaired from the current repository candidate'
+  pkg_install_rpm socks dnf google "$rpm_repo" || {
+    fail 'an incomplete installed RPM WARP dependency should be repaired in place'
     return 1
   }
-  assert_not_contains "$manager_calls" 'reinstall' \
-    'RPM dependency repair must not reinstall the already installed version instead of selecting the current candidate' \
-    || return 1
-  grep -Eq '^(install|upgrade).*cloudflare-warp' <<< "$manager_calls" || {
-    fail 'an incomplete installed WARP dependency must use an install or upgrade candidate transaction'
-    return 1
-  }
-  clean_line="$(line_number "$manager_calls" 'clean metadata')"
-  candidate_line="$(line_number "$manager_calls" 'upgrade -y --best cloudflare-warp')"
-  if [ -z "$clean_line" ] || [ -z "$candidate_line" ] || [ "$clean_line" -ge "$candidate_line" ]; then
-    fail 'RPM metadata must expire before selecting an upgrade candidate'
-    return 1
-  fi
+  assert_eq 'reinstall -y cloudflare-warp' "${manager_calls%$'\n'}" \
+    'an installed but incomplete RPM WARP package must use package-specific reinstall' || return 1
+  assert_not_contains "$manager_calls" 'clean metadata' \
+    'RPM WARP repair must not explicitly clean metadata' || return 1
+  assert_not_contains "$manager_calls" 'upgrade' \
+    'RPM WARP repair must not select an upgrade transaction' || return 1
+  assert_not_contains "$manager_calls" 'update' \
+    'RPM WARP repair must not select an update transaction' || return 1
 
   manager_calls=''
   rpm_installed=0
   warp_ready=0
-  pkg_install_rpm socks dnf || {
-    fail 'a missing WARP dependency should install from the current repository candidate'
+  pkg_install_rpm socks dnf google "$rpm_repo" || {
+    fail 'a missing RPM WARP dependency should use a normal install transaction'
     return 1
   }
-  grep -Eq '^install.*cloudflare-warp' <<< "$manager_calls" || {
-    fail 'a missing RPM dependency must use the current install candidate'
+  assert_eq 'install -y cloudflare-warp' "${manager_calls%$'\n'}" \
+    'a missing RPM WARP package must use install without an explicit metadata refresh' || return 1
+
+  apt_calls=''
+  apt_installed=1
+  warp_ready=0
+  pkg_install_apt socks google "$apt_repo" || {
+    fail 'an incomplete installed APT WARP dependency should be repaired in place'
     return 1
   }
-  clean_line="$(line_number "$manager_calls" 'clean metadata')"
-  candidate_line="$(line_number "$manager_calls" 'install -y cloudflare-warp')"
-  if [ -z "$clean_line" ] || [ -z "$candidate_line" ] || [ "$clean_line" -ge "$candidate_line" ]; then
-    fail 'RPM metadata must expire before selecting a fresh install candidate'
-  fi
+  assert_eq 'install -y --reinstall --no-upgrade cloudflare-warp' \
+    "${apt_calls%$'\n'}" \
+    'an installed but incomplete APT WARP package must reinstall without upgrading' || return 1
+
+  apt_calls=''
+  apt_installed=0
+  warp_ready=0
+  pkg_install_apt socks google "$apt_repo" || {
+    fail 'a missing APT WARP dependency should use a normal install transaction'
+    return 1
+  }
+  assert_eq 'install -y --no-upgrade cloudflare-warp' "${apt_calls%$'\n'}" \
+    'a missing APT WARP package must install without upgrading other packages'
 }
 
 test_wireguard_dependencies_do_not_require_socks_tools() {
@@ -2070,19 +2207,37 @@ test_warp_client_reuse_requires_cli_and_unit() {
     fail 'warp-cli plus warp-svc.service should be reused'
     return 1
   }
-  assert_file_matches "$INSTALL_SCRIPT" 'apt_get install -y --reinstall cloudflare-warp' \
+  assert_file_matches "$INSTALL_SCRIPT" 'apt_get install -y --reinstall --no-upgrade cloudflare-warp' \
     'APT should repair a partial Cloudflare WARP package' || return 1
   assert_file_matches "$INSTALL_SCRIPT" '"\$manager" reinstall -y cloudflare-warp' \
-    'RPM systems should repair an installed but incomplete Cloudflare WARP package'
+    'RPM systems should repair an installed but incomplete Cloudflare WARP package' || return 1
+  assert_file_not_matches "$INSTALL_SCRIPT" \
+    '"\$manager" (upgrade|update)[^\n]*cloudflare-warp' \
+    'RPM WARP repair must not upgrade or update an installed package'
 }
 
 test_rpm_redsocks_uses_fedora_package_or_source() {
   source_without_main "$INSTALL_SCRIPT"
   local package_calls=''
-  local build_calls=0
+  local build_calls=0 extra_repo_calls=0 build_deps_ready=0
 
   redsocks_path() { return 1; }
   mark_managed_redsocks_if_current() { :; }
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      dnf) return 0 ;;
+      gcc|tar|gzip) [ "$build_deps_ready" -eq 1 ] ;;
+      *) return 1 ;;
+    esac
+  }
+  rpm_package_installed() {
+    case "$1" in
+      libevent-devel) [ "$build_deps_ready" -eq 1 ] ;;
+      *) return 1 ;;
+    esac
+  }
+  enable_rhel_extra_repos() { extra_repo_calls=$((extra_repo_calls + 1)); }
   unit_file_exists() { return 0; }
   systemctl() { return 0; }
   log() { :; }
@@ -2107,7 +2262,21 @@ test_rpm_redsocks_uses_fedora_package_or_source() {
     'non-Fedora RPM systems should install source build dependencies' || return 1
   assert_not_contains "$package_calls" 'install -y redsocks' \
     'non-Fedora RPM systems must not assume a redsocks package exists' || return 1
-  assert_eq '1' "$build_calls" 'non-Fedora RPM systems should use the source build path'
+  assert_eq '1' "$extra_repo_calls" \
+    'a missing libevent development package should enable its build repository once' || return 1
+  assert_eq '1' "$build_calls" 'non-Fedora RPM systems should use the source build path' || return 1
+
+  package_calls=''
+  build_calls=0
+  extra_repo_calls=0
+  build_deps_ready=1
+  rpm_install_redsocks dnf
+  assert_eq '' "$package_calls" \
+    'complete source-build dependencies must not invoke the package manager' || return 1
+  assert_eq '0' "$extra_repo_calls" \
+    'complete source-build dependencies must not alter extra repositories' || return 1
+  assert_eq '1' "$build_calls" \
+    'complete source-build dependencies should proceed directly to the build'
 }
 
 test_no_iptables_package_dependency() {
@@ -3264,6 +3433,10 @@ test_wireguard_global_reply_mark_and_stop_contract() {
   assert_contains "$rendered" \
     'iifname != "lo" iifname != "warp-vps-wg" fib daddr type local ct direction original meta mark set 51888 ct mark set meta mark' \
     'new native inbound connections must save the bypass mark before reverse-path filtering' || return 1
+  assert_contains "$rendered" \
+    'add rule inet warp_vps_global output ct direction reply meta mark set 51888 ct mark set meta mark' \
+    'replies on connections established before global routing must bypass the tunnel immediately' \
+    || return 1
   assert_contains "$rendered" \
     'add rule inet warp_vps_global output ct mark 51888 meta mark set ct mark' \
     'replies to native inbound connections must restore the bypass mark' || return 1
@@ -8319,12 +8492,13 @@ run_test 'uninstall only stops a managed WARP service' test_managed_warp_service
 run_test 'package manager selection is capability based' test_package_manager_detection_is_capability_based
 run_test 'Ubuntu derivatives prefer UBUNTU_CODENAME' test_ubuntu_codename_takes_precedence
 run_test 'apt WireGuard dependencies are mode specific' test_apt_wireguard_dependencies_are_minimal
-run_test 'existing Cloudflare APT source refreshes before updates' test_existing_cloudflare_apt_repo_refreshes_before_updates
+run_test 'Cloudflare APT metadata refresh is limited to a newly added source' test_cloudflare_apt_repo_refresh_is_new_source_only
+run_test 'Cloudflare APT candidates require a downloadable record' test_cloudflare_apt_candidate_requires_downloadable_record
 run_test 'RPM WireGuard dependencies are mode specific' test_rpm_wireguard_dependencies_are_minimal
-run_test 'RPM existing repo bootstraps refresh tools before WireGuard dependencies' test_rpm_existing_repo_bootstraps_refresh_tools_before_wireguard
+run_test 'package transactions submit only missing dependencies' test_package_transactions_submit_only_missing_packages
 run_test 'Socks dependencies are mode specific' test_socks_dependencies_are_mode_specific
 run_test 'complete mode dependencies skip package-manager access' test_complete_mode_dependencies_skip_package_manager
-run_test 'incomplete dependencies use the current package candidate' test_incomplete_dependencies_use_current_package_candidate
+run_test 'missing and incomplete WARP packages use distinct transactions' test_missing_and_incomplete_warp_transactions_are_distinct
 run_test 'WireGuard dependencies exclude Socks-only tools' test_wireguard_dependencies_do_not_require_socks_tools
 run_test 'WireGuard dependency reuse requires its systemd template' test_wireguard_dependency_reuse_requires_systemd_template
 run_test 'WARP reuse requires both CLI and service unit' test_warp_client_reuse_requires_cli_and_unit

@@ -83,9 +83,15 @@ jobs:
           client="warp-vps-client-$$"
           echo_pid=""
           https_pid=""
+          inbound_server_pid=""
+          inbound_client_pid=""
           cleanup() {
             [ -z "$echo_pid" ] || kill "$echo_pid" >/dev/null 2>&1 || true
             [ -z "$https_pid" ] || kill "$https_pid" >/dev/null 2>&1 || true
+            [ -z "$inbound_server_pid" ] \
+              || kill "$inbound_server_pid" >/dev/null 2>&1 || true
+            [ -z "$inbound_client_pid" ] \
+              || kill "$inbound_client_pid" >/dev/null 2>&1 || true
             ip netns del "$server" >/dev/null 2>&1 || true
             ip netns del "$router" >/dev/null 2>&1 || true
             ip netns del "$client" >/dev/null 2>&1 || true
@@ -318,9 +324,67 @@ jobs:
           ip netns exec "$server" ip -4 route del "$google4_cidr" dev warp-vps-wg
           ip netns exec "$server" ip -6 route del "$google6_cidr" dev warp-vps-wg
 
+          inbound_listen_ready="$RUNNER_TEMP/warp-vps-inbound-listen-$$"
+          inbound_established="$RUNNER_TEMP/warp-vps-inbound-established-$$"
+          inbound_release="$RUNNER_TEMP/warp-vps-inbound-release-$$"
+          inbound_result="$RUNNER_TEMP/warp-vps-inbound-result-$$"
+          ip netns exec "$server" env \
+            INBOUND_LISTEN_READY="$inbound_listen_ready" \
+            INBOUND_ESTABLISHED="$inbound_established" \
+            INBOUND_RELEASE="$inbound_release" \
+            python3 - <<'PY' &
+          import os
+          import pathlib
+          import socket
+          import time
+
+          listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          listener.bind(("192.0.2.2", 22222))
+          listener.listen(1)
+          pathlib.Path(os.environ["INBOUND_LISTEN_READY"]).touch()
+          connection, _ = listener.accept()
+          pathlib.Path(os.environ["INBOUND_ESTABLISHED"]).touch()
+          deadline = time.monotonic() + 15
+          release = pathlib.Path(os.environ["INBOUND_RELEASE"])
+          while not release.exists() and time.monotonic() < deadline:
+              time.sleep(0.05)
+          if not release.exists():
+              raise SystemExit("global route test release timed out")
+          connection.sendall(b"preserved-inbound-reply")
+          connection.close()
+          listener.close()
+          PY
+          inbound_server_pid=$!
+          for _ in $(seq 1 50); do
+            [ -e "$inbound_listen_ready" ] && break
+            sleep 0.1
+          done
+          [ -e "$inbound_listen_ready" ]
+
+          ip netns exec "$client" env INBOUND_RESULT="$inbound_result" python3 - <<'PY' &
+          import os
+          import pathlib
+          import socket
+
+          connection = socket.create_connection(("192.0.2.2", 22222), timeout=5)
+          connection.settimeout(15)
+          data = connection.recv(1024)
+          pathlib.Path(os.environ["INBOUND_RESULT"]).write_bytes(data)
+          connection.close()
+          PY
+          inbound_client_pid=$!
+          for _ in $(seq 1 50); do
+            [ -e "$inbound_established" ] && break
+            sleep 0.1
+          done
+          [ -e "$inbound_established" ]
+
           ip netns exec "$server" nft -f "$RUNNER_TEMP/warp-vps-wireguard-global.nft"
           ip netns exec "$server" nft list chain inet warp_vps_global prerouting \
             | grep -Eq 'fib daddr type local.*ct direction original.*meta mark set (0x0*ca[bB]0|51888).*ct mark set meta mark'
+          ip netns exec "$server" nft list chain inet warp_vps_global output \
+            | grep -Eq 'ct direction reply.*meta mark set (0x0*ca[bB]0|51888).*ct mark set meta mark'
           ip netns exec "$server" nft list chain inet warp_vps_global output \
             | grep -Eq 'ct mark (0x0*ca[bB]0|51888).*meta mark set ct mark'
           ip netns exec "$server" nft list chain inet warp_vps_global postrouting \
@@ -332,6 +396,12 @@ jobs:
           ip netns exec "$server" ip -6 rule add priority 18000 table main suppress_prefixlength 0
           ip netns exec "$server" ip -4 rule add not fwmark 51888 table 51888 priority 18001
           ip netns exec "$server" ip -6 rule add not fwmark 51888 table 51888 priority 18001
+          touch "$inbound_release"
+          wait "$inbound_server_pid"
+          inbound_server_pid=""
+          wait "$inbound_client_pid"
+          inbound_client_pid=""
+          grep -Fxq 'preserved-inbound-reply' "$inbound_result"
           ip netns exec "$server" ip -4 route get "$google4_probe" \
             | grep -Fq 'dev warp-vps-wg'
           assert_ordinary_https_blocked '/ordinary/wireguard-global'
