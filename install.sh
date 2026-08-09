@@ -56,6 +56,7 @@ INSTALL_NONINTERACTIVE=0
 INSTALL_MODE_OPTION=""
 INSTALL_SCOPE_OPTION=""
 INSTALL_SWAP_OPTION=""
+INSTALL_SWAP_EXPLICIT=0
 INSTALL_SOCKS_PORT_OPTION=""
 
 log() { printf '[warp-vps] %s\n' "$*"; }
@@ -146,8 +147,28 @@ max_creatable_swap_mb() {
   fi
 }
 
+swap_file_listed_in() {
+  local state_file="$1"
+  local state
+  if [ ! -e "$state_file" ]; then
+    [ "$state_file" = "/etc/fstab" ] && return 1
+    return 2
+  fi
+  [ -r "$state_file" ] || return 2
+  state="$(awk -v swap_file="$SWAP_FILE" '
+    $1 == swap_file { found=1 }
+    END { print found ? "listed" : "absent" }
+  ' "$state_file")" || return 2
+  case "$state" in
+    listed) return 0 ;;
+    absent) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
 create_swap_file() {
   local size_mb="$1"
+  local state_rc=0
   [ "$size_mb" -ge 256 ] || return 1
   if [ -e "$SWAP_FILE" ]; then
     log "$SWAP_FILE 已存在，不能覆盖"
@@ -156,63 +177,83 @@ create_swap_file() {
 
   log "正在创建 $(format_gb "$size_mb") Swap：$SWAP_FILE"
   if ! dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb"; then
-    rollback_swap_file "写入 Swap 文件失败"
+    rollback_swap_file "写入 Swap 文件失败" || return 2
     return 1
   fi
   if ! chmod 0600 "$SWAP_FILE"; then
-    rollback_swap_file "设置 Swap 权限失败"
+    rollback_swap_file "设置 Swap 权限失败" || return 2
     return 1
   fi
   if ! mkswap "$SWAP_FILE" >/dev/null; then
-    rollback_swap_file "格式化 Swap 失败"
+    rollback_swap_file "格式化 Swap 失败" || return 2
     return 1
   fi
   if ! swapon "$SWAP_FILE"; then
-    rollback_swap_file "启用 Swap 失败"
+    rollback_swap_file "启用 Swap 失败" || return 2
     return 1
   fi
-  if ! awk -v swap_file="$SWAP_FILE" '$1 == swap_file { found=1 } END { exit !found }' /etc/fstab; then
-    if ! printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab; then
-      rollback_swap_file "写入 /etc/fstab 失败"
+  swap_file_listed_in /etc/fstab || state_rc=$?
+  case "$state_rc" in
+    0) ;;
+    1)
+      if ! printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab; then
+        rollback_swap_file "写入 /etc/fstab 失败" || return 2
+        return 1
+      fi
+      ;;
+    *)
+      rollback_swap_file "无法确认 /etc/fstab 的 Swap 状态" || return 2
       return 1
-    fi
-  fi
+      ;;
+  esac
   log "Swap 创建完成"
 }
 
 rollback_swap_file() {
   local reason="$1"
-  local backup_dir cleaned_fstab fstab_entry
+  local backup_dir cleaned_fstab fstab_entry state_rc
   backup_dir="${BACKUP_ROOT}/swap-failed-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fstab_entry=0
   log "$reason，正在撤销本次 Swap 创建"
   if ! install -d -m 0755 "$backup_dir"; then
     log "无法创建 Swap 回滚目录，已保留当前 Swap 状态：$backup_dir"
-    return 0
+    return 1
   fi
-  if awk -v swap_file="$SWAP_FILE" '$1 == swap_file { found=1 } END { exit !found }' /etc/fstab; then
-    fstab_entry=1
-    if ! install -m 0644 /etc/fstab "${backup_dir}/fstab.before-warp-vps"; then
-      log "无法备份 /etc/fstab，已保留当前 Swap 状态"
-      return 0
-    fi
-    cleaned_fstab="${backup_dir}/fstab.cleaned"
-    if ! awk -v swap_file="$SWAP_FILE" '$1 != swap_file { print }' /etc/fstab > "$cleaned_fstab"; then
-      log "无法生成清理后的 /etc/fstab，已保留当前 Swap 状态"
-      return 0
-    fi
-  fi
-  if awk -v swap_file="$SWAP_FILE" '$1 == swap_file { found=1 } END { exit !found }' /proc/swaps 2>/dev/null; then
-    if ! swapoff "$SWAP_FILE" >/dev/null 2>&1; then
-      log "无法停用 $SWAP_FILE，已保留当前 fstab 记录和文件，避免破坏正在使用的 Swap"
-      return 0
-    fi
-  fi
+  state_rc=0
+  swap_file_listed_in /etc/fstab || state_rc=$?
+  case "$state_rc" in
+    0)
+      fstab_entry=1
+      if ! install -m 0644 /etc/fstab "${backup_dir}/fstab.before-warp-vps"; then
+        log "无法备份 /etc/fstab，已保留当前 Swap 状态"
+        return 1
+      fi
+      cleaned_fstab="${backup_dir}/fstab.cleaned"
+      if ! awk -v swap_file="$SWAP_FILE" '$1 != swap_file { print }' /etc/fstab > "$cleaned_fstab"; then
+        log "无法生成清理后的 /etc/fstab，已保留当前 Swap 状态"
+        return 1
+      fi
+      ;;
+    1) ;;
+    *) log "无法读取 /etc/fstab，已保留当前 Swap 状态"; return 1 ;;
+  esac
+  state_rc=0
+  swap_file_listed_in /proc/swaps || state_rc=$?
+  case "$state_rc" in
+    0)
+      if ! swapoff "$SWAP_FILE" >/dev/null 2>&1; then
+        log "无法停用 $SWAP_FILE，已保留当前 fstab 记录和文件，避免破坏正在使用的 Swap"
+        return 1
+      fi
+      ;;
+    1) ;;
+    *) log "无法读取 /proc/swaps，已保留当前 Swap 状态"; return 1 ;;
+  esac
   if [ "$fstab_entry" -eq 1 ]; then
     if ! install -m 0644 "$cleaned_fstab" /etc/fstab; then
       swapon "$SWAP_FILE" >/dev/null 2>&1 || true
       log "无法恢复 /etc/fstab，已保留 Swap 文件；请检查：${backup_dir}/fstab.before-warp-vps"
-      return 0
+      return 1
     fi
   fi
   if [ -e "$SWAP_FILE" ]; then
@@ -222,14 +263,25 @@ rollback_swap_file() {
       fi
       swapon "$SWAP_FILE" >/dev/null 2>&1 || true
       log "无法释放失败 Swap 占用的磁盘空间：$SWAP_FILE"
-      return 0
+      return 1
     fi
     if ! mv "$SWAP_FILE" "${backup_dir}/swapfile-warp-vps-manager"; then
       log "Swap 空间已释放，但无法移动零长度占位文件：$SWAP_FILE"
-      return 0
+      return 1
     fi
     log "失败 Swap 已释放磁盘空间，零长度占位已移动到：${backup_dir}/swapfile-warp-vps-manager"
   fi
+  state_rc=0
+  swap_file_listed_in /proc/swaps || state_rc=$?
+  [ "$state_rc" -eq 1 ] || { log "无法确认失败 Swap 已停用"; return 1; }
+  state_rc=0
+  swap_file_listed_in /etc/fstab || state_rc=$?
+  [ "$state_rc" -eq 1 ] || { log "无法确认失败 Swap 的 fstab 记录已清除"; return 1; }
+  if [ -e "$SWAP_FILE" ]; then
+    log "失败 Swap 文件仍存在：$SWAP_FILE"
+    return 1
+  fi
+  return 0
 }
 
 prompt_swap_creation() {
@@ -323,8 +375,13 @@ collect_noninteractive_swap_choice() {
   esac
 
   max_mb="$(max_creatable_swap_mb)"
-  [ "$selected" -le "$max_mb" ] \
-    || die "磁盘空间不足，最多建议创建 $(format_gb "$max_mb") Swap；可使用 --swap none 明确跳过"
+  if [ "$selected" -gt "$max_mb" ]; then
+    if [ "$INSTALL_SWAP_EXPLICIT" -eq 0 ]; then
+      log "警告：磁盘空间不足，无法创建默认 1G Swap；本次继续安装且不创建 Swap"
+      return 0
+    fi
+    die "磁盘空间不足，最多建议创建 $(format_gb "$max_mb") Swap；可使用 --swap none 明确跳过"
+  fi
   SWAP_ACTION="create"
   SWAP_SIZE_MB="$selected"
 }
@@ -366,15 +423,26 @@ collect_swap_choice() {
 }
 
 apply_swap_choice() {
-  local mem_mb
+  local mem_mb create_rc
   while [ "$SWAP_ACTION" = "create" ]; do
-    if create_swap_file "$SWAP_SIZE_MB"; then
+    create_rc=0
+    create_swap_file "$SWAP_SIZE_MB" || create_rc=$?
+    if [ "$create_rc" -eq 0 ]; then
       return 0
     fi
-    if [ "$INSTALL_NONINTERACTIVE" -eq 1 ]; then
-      die "Swap 创建失败，已撤销本次创建"
+    if [ "$create_rc" -ne 1 ]; then
+      die "Swap 创建失败，无法确认本次创建已完整撤销；已停止安装"
     fi
-    printf 'Swap 创建失败，已撤销本次创建。请重新选择。\n'
+    if [ "$INSTALL_NONINTERACTIVE" -eq 1 ]; then
+      if [ "$INSTALL_SWAP_EXPLICIT" -eq 0 ]; then
+        log "警告：默认 1G Swap 创建失败；已确认本次创建没有遗留未清理状态，本次继续安装且不创建 Swap"
+        SWAP_ACTION="none"
+        SWAP_SIZE_MB=0
+        return 0
+      fi
+      die "Swap 创建失败；已确认本次创建没有遗留未清理状态"
+    fi
+    printf 'Swap 创建失败；已确认本次创建没有遗留未清理状态。请重新选择。\n'
     mem_mb="$(mem_available_mb)"
     prompt_swap_creation "$mem_mb"
   done
@@ -1999,12 +2067,13 @@ print_installer_menu() {
   printf '路由范围：%s\n' "$(menu_scope_label)"
   printf '  1. 查看本地运行状态\n'
   printf '  2. 运行完整诊断\n'
-  printf '  3. 检测 Gemini / YouTube Premium 解锁\n'
-  printf '  4. 重启分流链路\n'
-  printf '  5. 更新脚本和 Google IP 规则\n'
-  printf '  6. 重装或切换路由范围 / 运行模式\n'
-  printf '  7. 查看最近日志\n'
-  printf '  8. 卸载\n'
+  printf '  3. 检测原生出口 Gemini / YouTube Premium 解锁\n'
+  printf '  4. 检测当前 WARP 出口 Gemini / YouTube Premium 解锁\n'
+  printf '  5. 重启分流链路\n'
+  printf '  6. 更新脚本和 Google IP 规则\n'
+  printf '  7. 重装或切换路由范围 / 运行模式\n'
+  printf '  8. 查看最近日志\n'
+  printf '  9. 卸载\n'
   printf '  0. 退出\n'
 }
 
@@ -2053,14 +2122,18 @@ installer_menu() {
         finish_menu_action "完整诊断" || return 0
         ;;
       3)
-        run_menu_manager_action unlock-check
-        finish_menu_action "解锁检测" || return 0
+        run_menu_manager_action native-unlock-check
+        finish_menu_action "原生出口解锁检测" || return 0
         ;;
       4)
+        run_menu_manager_action unlock-check
+        finish_menu_action "当前 WARP 出口解锁检测" || return 0
+        ;;
+      5)
         run_menu_manager_action restart
         finish_menu_action "重启" || return 0
         ;;
-      5)
+      6)
         run_menu_manager_action update
         if [ "$MENU_ACTION_RC" -eq 0 ]; then
           printf '\n[warp-vps] 更新完成。请重新运行 warp-vps 使用新版本管理菜单。\n'
@@ -2068,7 +2141,7 @@ installer_menu() {
         fi
         finish_menu_action "更新" || return 0
         ;;
-      6)
+      7)
         printf '\n即将进入现有安装事务；可重新选择路由范围和 Socks5 / WireGuard 模式。\n'
         set +e
         (
@@ -2083,11 +2156,11 @@ installer_menu() {
         fi
         finish_menu_action "重装或切换" || return 0
         ;;
-      7)
+      8)
         run_menu_manager_action logs
         finish_menu_action "日志查询" || return 0
         ;;
-      8)
+      9)
         run_menu_manager_action uninstall
         if [ "$MENU_ACTION_RC" -eq 0 ]; then
           return 0
@@ -2099,7 +2172,7 @@ installer_menu() {
         return 0
         ;;
       *)
-        printf '输入无效，请输入 0-8。\n' >&2
+        printf '输入无效，请输入 0-9。\n' >&2
         ;;
     esac
   done
@@ -2117,10 +2190,10 @@ installer_usage() {
 
   无参数 / --menu  需要终端；未安装时开始安装，已有安装时进入管理菜单
   --install         需要终端；进入安装、重装或模式切换流程
-  --non-interactive 禁止读取输入；全新默认 Google 精准分流、WireGuard、无 Swap 时创建 1G
+  --non-interactive 禁止读取输入；全新默认 Google 精准分流、WireGuard，并尝试创建 1G Swap
   --mode             选择模式；keep 仅适用于已有安装
   --scope            选择路由范围；keep 仅适用于已有安装
-  --swap             auto 默认按需创建 1G；N 为 GiB；none 明确跳过
+  --swap             auto 严格创建 1G；N 为严格创建的 GiB；none 跳过；省略时失败且已清理则继续
   --socks-port       Socks5 使用自动空闲端口或指定端口
 EOF
 }
@@ -2136,6 +2209,7 @@ parse_install_options() {
   INSTALL_MODE_OPTION=""
   INSTALL_SCOPE_OPTION=""
   INSTALL_SWAP_OPTION=""
+  INSTALL_SWAP_EXPLICIT=0
   INSTALL_SOCKS_PORT_OPTION=""
 
   while [ "$#" -gt 0 ]; do
@@ -2186,6 +2260,7 @@ parse_install_options() {
             ;;
         esac
         INSTALL_SWAP_OPTION="$value"
+        INSTALL_SWAP_EXPLICIT=1
         seen_swap=1
         shift 2
         ;;
@@ -2455,7 +2530,7 @@ main() {
     printf '路由范围：精准分流 Google 服务\n'
   fi
   printf '交互菜单：warp-vps\n'
-  printf '显式命令：warp-vps {status|test|restart|unlock-check|update|reinstall|switch|logs|uninstall}\n'
+  printf '显式命令：warp-vps {status|test|native-unlock-check|unlock-check|restart|update|reinstall|switch|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ] && [ "$selected_scope" = "global" ]; then
     printf 'Socks5 全局模式会把 VPS 主动发起的公网 IPv4 TCP 透明转发到 WARP；入站连接回包保持原生路径，Google IPv4 UDP/443（QUIC）和 Google IPv6 继续拒绝。\n'
   elif [ "$selected_mode" = "socks" ]; then

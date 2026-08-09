@@ -31,6 +31,9 @@ REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 UNLOCK_CONNECT_TIMEOUT=5
 UNLOCK_MAX_TIME=12
+NATIVE_FAMILY=""
+NATIVE_IFACE=""
+NATIVE_SOURCE_IP=""
 DOWNLOAD_CONNECT_TIMEOUT=10
 DOWNLOAD_MAX_TIME=120
 WGCF_OPERATION_TIMEOUT=120
@@ -1778,6 +1781,230 @@ PY
   done
 }
 
+select_native_egress() {
+  local family iface address address_type excluded_iface
+  excluded_iface="${WG_IFACE:-$DEFAULT_WG_IFACE}"
+  for family in 4 6; do
+    iface="$(ip "-${family}" route show table main default 2>/dev/null | awk -v excluded="$excluded_iface" '
+      {
+        for (i = 1; i <= NF; i++) {
+          if ($i == "dev" && i < NF && $(i + 1) != excluded) {
+            print $(i + 1)
+            exit
+          }
+        }
+      }
+    ')"
+    [ -n "$iface" ] || continue
+    if [ "$family" -eq 4 ]; then
+      address_type="inet"
+    else
+      address_type="inet6"
+    fi
+    address="$(ip -o "-${family}" address show dev "$iface" scope global 2>/dev/null | awk -v type="$address_type" '
+      $3 == type {
+        split($4, parts, "/")
+        print parts[1]
+        exit
+      }
+    ')"
+    [ -n "$address" ] || continue
+    printf '%s|%s|%s\n' "$family" "$iface" "$address"
+    return 0
+  done
+  return 1
+}
+
+native_https_request() {
+  local method="$1"
+  local url="$2"
+  local body="${3-}"
+  local bind_iface=""
+  local socket_mark=0
+  local target_uid=0
+  local target_gid=0
+
+  if [ "${WARP_MODE:-}" = "socks" ]; then
+    target_uid="$REDSOCKS_UID"
+    target_gid="$(id -g "$REDSOCKS_USER" 2>/dev/null || true)"
+    case "$target_gid" in ''|*[!0-9]*) return 0 ;; esac
+  else
+    bind_iface="${NATIVE_IFACE:-}"
+    if [ "${WARP_SCOPE:-}" = "global" ]; then
+      socket_mark="$WG_GLOBAL_MARK"
+    fi
+  fi
+
+  http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
+    timeout -k 1 "$UNLOCK_MAX_TIME" python3 -c '
+import http.client
+import ipaddress
+import os
+import socket
+import ssl
+import sys
+import time
+import urllib.parse
+
+method, url, request_body = sys.argv[1:4]
+family_number = int(sys.argv[4])
+source_ip = sys.argv[5]
+bind_iface = sys.argv[6]
+socket_mark = int(sys.argv[7])
+mode = sys.argv[8]
+target_uid = int(sys.argv[9])
+target_gid = int(sys.argv[10])
+connect_timeout = float(sys.argv[11])
+max_time = float(sys.argv[12])
+user_agent = sys.argv[13]
+
+if method not in ("GET", "POST") or family_number not in (4, 6):
+    raise SystemExit(1)
+family = socket.AF_INET if family_number == 4 else socket.AF_INET6
+source = ipaddress.ip_address(source_ip)
+if source.version != family_number:
+    raise SystemExit(1)
+
+context = ssl.create_default_context()
+if mode == "socks":
+    os.setgroups([])
+    os.setresgid(target_gid, target_gid, target_gid)
+    os.setresuid(target_uid, target_uid, target_uid)
+
+deadline = time.monotonic() + max_time
+max_response_bytes = 8 * 1024 * 1024
+
+
+def operation_timeout():
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exceeded")
+    return min(connect_timeout, remaining)
+
+
+class NativeHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        last_error = None
+        addresses = socket.getaddrinfo(
+            self.host,
+            self.port,
+            family,
+            socket.SOCK_STREAM,
+        )
+        for af, socktype, protocol, _, sockaddr in addresses:
+            raw_socket = None
+            try:
+                raw_socket = socket.socket(af, socktype, protocol)
+                raw_socket.settimeout(operation_timeout())
+                if bind_iface:
+                    raw_socket.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_BINDTODEVICE,
+                        bind_iface.encode("ascii") + b"\0",
+                    )
+                if socket_mark:
+                    raw_socket.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_MARK,
+                        socket_mark,
+                    )
+                if family == socket.AF_INET:
+                    raw_socket.bind((source_ip, 0))
+                else:
+                    raw_socket.bind((source_ip, 0, 0, 0))
+                raw_socket.connect(sockaddr)
+                self.sock = context.wrap_socket(raw_socket, server_hostname=self.host)
+                self.sock.settimeout(operation_timeout())
+                return
+            except (OSError, TimeoutError) as error:
+                last_error = error
+                if raw_socket is not None:
+                    raw_socket.close()
+        if last_error is not None:
+            raise last_error
+        raise OSError("no address for selected family")
+
+
+current_url = url
+current_method = method
+current_body = request_body.encode("utf-8") if method == "POST" else None
+for redirect_count in range(6):
+    parsed = urllib.parse.urlsplit(current_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise SystemExit(1)
+    port = parsed.port or 443
+    target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "identity",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+        "User-Agent": user_agent,
+    }
+    if current_method == "POST":
+        headers["Accept"] = "*/*"
+        headers["Accept-Language"] = "en-US"
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    connection = NativeHTTPSConnection(
+        parsed.hostname,
+        port,
+        timeout=operation_timeout(),
+        context=context,
+    )
+    try:
+        connection.request(current_method, target, body=current_body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read(max_response_bytes + 1)
+        status = response.status
+        location = response.getheader("Location")
+    finally:
+        connection.close()
+    if len(response_body) > max_response_bytes:
+        raise SystemExit(1)
+    if status in (301, 302, 303, 307, 308) and location:
+        if redirect_count == 5:
+            raise SystemExit(1)
+        current_url = urllib.parse.urljoin(current_url, location)
+        if status in (301, 302, 303) and current_method == "POST":
+            current_method = "GET"
+            current_body = None
+        continue
+    if status < 200 or status >= 300:
+        raise SystemExit(1)
+    sys.stdout.buffer.write(response_body)
+    raise SystemExit(0)
+raise SystemExit(1)
+' "$method" "$url" "$body" "${NATIVE_FAMILY:-}" "${NATIVE_SOURCE_IP:-}" \
+      "$bind_iface" "$socket_mark" "${WARP_MODE:-}" "$target_uid" "$target_gid" \
+      "$UNLOCK_CONNECT_TIMEOUT" "$UNLOCK_MAX_TIME" "$UNLOCK_TEST_UA" 2>/dev/null || true
+}
+
+parse_cloudflare_trace() {
+  python3 -c '
+import ipaddress
+import re
+import sys
+
+values = {}
+for line in sys.stdin.read().splitlines():
+    key, separator, value = line.partition("=")
+    if separator and key in ("ip", "loc", "warp") and key not in values:
+        values[key] = value.strip()
+ip_value = values.get("ip", "")
+try:
+    ip_value = str(ipaddress.ip_address(ip_value))
+except ValueError:
+    ip_value = ""
+loc_value = values.get("loc", "")
+if not re.fullmatch(r"[A-Z]{2}", loc_value):
+    loc_value = ""
+warp_value = values.get("warp", "")
+if warp_value not in ("off", "on", "plus"):
+    warp_value = ""
+print(f"{ip_value}|{loc_value}|{warp_value}")
+'
+}
+
 curl_unlock_page() {
   local url="$1"
   curl -4 -fsSL --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
@@ -1883,19 +2110,23 @@ evaluate_gemini_unlock() {
   if grep -Eiq "gemini (is not|isn.t)( currently)? available in your (country|region)|not( currently)? available in your (country|region)|unavailable in your (country|region)" <<< "$body"; then
     restricted=1
   fi
+  location="$(parse_gemini_location "$location_response" 2>/dev/null || true)"
   if [ "$restricted" -eq 1 ] && gemini_page_normal "$body"; then
     printf 'unknown|页面特征冲突\n'
     return 0
   fi
   if [ "$restricted" -eq 1 ]; then
-    printf 'no|当前出口地区受限\n'
+    if [ -n "$location" ]; then
+      printf 'no|位置：%s；当前出口地区受限\n' "$location"
+    else
+      printf 'no|当前出口地区受限；位置未知\n'
+    fi
     return 0
   fi
   if [ -z "$body" ] || [ -z "$location_response" ]; then
     printf 'unknown|请求失败或未返回完整响应\n'
     return 0
   fi
-  location="$(parse_gemini_location "$location_response" 2>/dev/null || true)"
   if [ -z "$location" ]; then
     printf 'unknown|位置响应无法解析\n'
     return 0
@@ -1943,17 +2174,22 @@ evaluate_youtube_premium_unlock() {
     available=1
   fi
 
+  if [ "$region_status" -eq 2 ]; then
+    printf 'unknown|地区信息冲突\n'
+    return 0
+  fi
+
+  if [ "$unavailable" -eq 1 ] && [ "$available" -eq 1 ]; then
+    printf 'unknown|页面特征冲突\n'
+    return 0
+  fi
+
   if [ "$unavailable" -eq 1 ]; then
     if [ -n "$region" ]; then
       printf 'no|地区：%s\n' "$region"
     else
-      printf 'no|当前出口不可用\n'
+      printf 'no|地区：未知\n'
     fi
-    return 0
-  fi
-
-  if [ "$region_status" -eq 2 ]; then
-    printf 'unknown|地区信息冲突\n'
     return 0
   fi
 
@@ -1977,6 +2213,21 @@ evaluate_youtube_premium_unlock() {
 probe_youtube_premium_unlock() {
   local body
   body="$(curl_unlock_page "https://www.youtube.com/premium")"
+  evaluate_youtube_premium_unlock "$body"
+}
+
+probe_native_gemini_unlock() {
+  local body location_response
+  body="$(native_https_request GET "https://gemini.google.com/" || true)"
+  location_response="$(native_https_request POST \
+    "https://gemini.google.com/_/BardChatUi/data/batchexecute" \
+    'f.req=[[["K4WWud","[[0],[\"en-US\"]]",null,"generic"]]]' || true)"
+  evaluate_gemini_unlock "$body" "$location_response"
+}
+
+probe_native_youtube_premium_unlock() {
+  local body
+  body="$(native_https_request GET "https://www.youtube.com/premium" || true)"
   evaluate_youtube_premium_unlock "$body"
 }
 
@@ -2006,6 +2257,57 @@ run_unlock_checks() {
   print_unlock_result "Gemini" "$(probe_gemini_unlock)"
   print_unlock_result "YouTube Premium" "$(probe_youtube_premium_unlock)"
   info_line "检测基于公开网页特征和本机 IPv4 出口；若 Google 页面或地区策略变化，可能显示无法确认。"
+}
+
+run_native_unlock_checks() {
+  local selected trace_body trace_fields trace_ip trace_region trace_warp
+  section "原生出口解锁检测"
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn_line "找不到 python3，无法检测原生出口"
+    return 0
+  fi
+
+  selected="$(select_native_egress 2>/dev/null || true)"
+  if [ -z "$selected" ]; then
+    warn_line "原生默认接口没有可用的 global IPv4 或 IPv6 地址"
+    return 0
+  fi
+  IFS='|' read -r NATIVE_FAMILY NATIVE_IFACE NATIVE_SOURCE_IP <<< "$selected"
+  case "$NATIVE_FAMILY" in
+    4) info_line "原生接口：${NATIVE_IFACE}；源地址：${NATIVE_SOURCE_IP}（IPv4）" ;;
+    6) info_line "原生接口：${NATIVE_IFACE}；源地址：${NATIVE_SOURCE_IP}（IPv6）" ;;
+    *) warn_line "无法解析原生出口地址"; return 0 ;;
+  esac
+
+  trace_body="$(native_https_request GET "https://www.cloudflare.com/cdn-cgi/trace" || true)"
+  trace_fields="$(parse_cloudflare_trace <<< "$trace_body" 2>/dev/null || true)"
+  [ -n "$trace_fields" ] || trace_fields='||'
+  IFS='|' read -r trace_ip trace_region trace_warp <<< "$trace_fields"
+  if [ -n "$trace_ip" ]; then
+    info_line "原生公网 IP：${trace_ip}"
+  fi
+  if [ -n "$trace_region" ]; then
+    info_line "Cloudflare 地区：${trace_region}"
+  fi
+  case "$trace_warp" in
+    off) ok_line "Cloudflare Trace 确认未经过 WARP" ;;
+    on|plus)
+      warn_line "原生出口旁路失败：Cloudflare Trace 返回 warp=${trace_warp}；已停止本次服务检测"
+      return 0
+      ;;
+    *)
+      if [ -n "$trace_ip" ] || [ -n "$trace_region" ]; then
+        warn_line "Cloudflare Trace 未返回明确的 WARP 状态；继续检测服务"
+      else
+        warn_line "Cloudflare Trace 请求失败或响应无法解析；继续检测服务"
+      fi
+      ;;
+  esac
+
+  info_line "正在通过原生出口检测 Gemini 和 YouTube Premium，请稍等"
+  print_unlock_result "Gemini" "$(probe_native_gemini_unlock)"
+  print_unlock_result "YouTube Premium" "$(probe_native_youtube_premium_unlock)"
+  info_line "原生出口检测仅供参考，不影响安装、更新、重启或健康检查。"
 }
 
 google_http_probe() {
@@ -2231,6 +2533,12 @@ cmd_status() {
 
 cmd_unlock_check() {
   run_unlock_checks
+}
+
+cmd_native_unlock_check() {
+  require_root
+  load_config
+  run_native_unlock_checks
 }
 
 cmd_configure_warp() {
@@ -3126,6 +3434,8 @@ usage() {
   status          快速检查本地运行态
   test            检查本地运行态并运行非阻塞外部诊断
   restart         重启 WARP 分流链路
+  native-unlock-check
+                  通过原生 IPv4（无 IPv4 时用 IPv6）检测 Gemini / YouTube Premium
   unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
   update          更新脚本和固定规则快照
   reinstall       非交互重装并保持当前模式
@@ -3198,6 +3508,7 @@ main() {
     menu) [ "$#" -eq 0 ] || { cli_error "menu 不接受参数"; return 2; }; cmd_menu ;;
     status) [ "$#" -eq 0 ] || { cli_error "status 不接受参数"; return 2; }; cmd_status ;;
     test) [ "$#" -eq 0 ] || { cli_error "test 不接受参数"; return 2; }; cmd_test ;;
+    native-unlock-check) [ "$#" -eq 0 ] || { cli_error "native-unlock-check 不接受参数"; return 2; }; cmd_native_unlock_check ;;
     unlock-check) [ "$#" -eq 0 ] || { cli_error "unlock-check 不接受参数"; return 2; }; cmd_unlock_check ;;
     restart) [ "$#" -eq 0 ] || { cli_error "restart 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_restart ;;
     update) [ "$#" -eq 0 ] || { cli_error "update 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_update ;;
@@ -3218,7 +3529,7 @@ main() {
       if interactive_terminal_available; then
         cmd_menu
       else
-        cli_error "当前没有交互终端；请指定 status、test、restart、update、reinstall、switch、logs 或 uninstall"
+        cli_error "当前没有交互终端；请指定 status、test、native-unlock-check、unlock-check、restart、update、reinstall、switch、logs 或 uninstall"
         return 2
       fi
       ;;
