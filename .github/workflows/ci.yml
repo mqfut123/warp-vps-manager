@@ -50,7 +50,7 @@ jobs:
       - name: Install ShellCheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y iproute2 iputils-ping nftables shellcheck
+          sudo apt-get install -y iproute2 iputils-ping nftables openssl shellcheck
       - name: Run ShellCheck
         run: shellcheck install.sh bin/warp-vps tests/*.sh
       - name: Run regression tests
@@ -82,8 +82,10 @@ jobs:
           router="warp-vps-router-$$"
           client="warp-vps-client-$$"
           echo_pid=""
+          https_pid=""
           cleanup() {
             [ -z "$echo_pid" ] || kill "$echo_pid" >/dev/null 2>&1 || true
+            [ -z "$https_pid" ] || kill "$https_pid" >/dev/null 2>&1 || true
             ip netns del "$server" >/dev/null 2>&1 || true
             ip netns del "$router" >/dev/null 2>&1 || true
             ip netns del "$client" >/dev/null 2>&1 || true
@@ -111,13 +113,20 @@ jobs:
           ip -n "$router" address add 192.0.2.1/24 dev eth0
           ip -n "$router" address add 198.51.100.1/24 dev eth1
           ip -n "$client" address add 198.51.100.2/24 dev eth0
+          ip -n "$server" -6 address add 2001:db8:1::2/64 dev eth0 nodad
+          ip -n "$router" -6 address add 2001:db8:1::1/64 dev eth0 nodad
+          ip -n "$router" -6 address add 2001:db8:2::1/64 dev eth1 nodad
+          ip -n "$client" -6 address add 2001:db8:2::2/64 dev eth0 nodad
           ip -n "$server" link set eth0 up
           ip -n "$router" link set eth0 up
           ip -n "$router" link set eth1 up
           ip -n "$client" link set eth0 up
           ip -n "$server" route add default via 192.0.2.1
           ip -n "$client" route add default via 198.51.100.1
+          ip -n "$server" -6 route add default via 2001:db8:1::1
+          ip -n "$client" -6 route add default via 2001:db8:2::1
           ip netns exec "$router" sysctl -qw net.ipv4.ip_forward=1
+          ip netns exec "$router" sysctl -qw net.ipv6.conf.all.forwarding=1
 
           ip -n "$server" link add warp-vps-wg type dummy
           ip -n "$server" link set warp-vps-wg up
@@ -134,6 +143,152 @@ jobs:
           google6_cidr="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' "$RULES_DIR/google_ipv6.txt")"
           google4_probe="$(rule_probe_ip "$RULES_DIR/google_ipv4.txt" 4)"
           google6_probe="$(rule_probe_ip "$RULES_DIR/google_ipv6.txt" 6)"
+
+          ip -n "$client" address add "$google4_probe/32" dev eth0
+          ip -n "$router" route add "$google4_probe/32" via 198.51.100.2 dev eth1
+          ip -n "$client" -6 address add "$google6_probe/128" dev eth0 nodad
+          ip -n "$router" -6 route add "$google6_probe/128" via 2001:db8:2::2 dev eth1
+
+          https_cert="$RUNNER_TEMP/warp-vps-native-cert-$$.pem"
+          https_key="$RUNNER_TEMP/warp-vps-native-key-$$.pem"
+          https_ready="$RUNNER_TEMP/warp-vps-native-ready-$$"
+          https_log="$RUNNER_TEMP/warp-vps-native-requests-$$.log"
+          : > "$https_log"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj "/CN=$google4_probe" \
+            -addext "subjectAltName=IP:$google4_probe" \
+            -addext 'basicConstraints=critical,CA:TRUE' \
+            -addext 'keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign' \
+            -addext 'extendedKeyUsage=serverAuth' \
+            -keyout "$https_key" -out "$https_cert" >/dev/null 2>&1
+
+          ip netns exec "$client" env \
+            HTTPS_IP="$google4_probe" \
+            HTTPS_CERT="$https_cert" \
+            HTTPS_KEY="$https_key" \
+            HTTPS_READY="$https_ready" \
+            HTTPS_LOG="$https_log" \
+            python3 - <<'PY' &
+          import http.server
+          import os
+          import pathlib
+          import ssl
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  line = f"{self.client_address[0]}|{self.path}"
+                  with open(os.environ["HTTPS_LOG"], "a", encoding="utf-8") as handle:
+                      handle.write(line + "\n")
+                  body = (line + "\n").encode("utf-8")
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/plain; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, _format, *_args):
+                  pass
+
+          server = http.server.ThreadingHTTPServer((os.environ["HTTPS_IP"], 443), Handler)
+          context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          context.load_cert_chain(os.environ["HTTPS_CERT"], os.environ["HTTPS_KEY"])
+          server.socket = context.wrap_socket(server.socket, server_side=True)
+          pathlib.Path(os.environ["HTTPS_READY"]).touch()
+          server.serve_forever()
+          PY
+          https_pid=$!
+          for _ in $(seq 1 50); do
+            [ -e "$https_ready" ] && break
+            sleep 0.1
+          done
+          [ -e "$https_ready" ]
+
+          run_native_https_probe() {
+            local mode="$1" scope="$2" path="$3" probe_timeout="${4:-}"
+            timeout -k 1 15 ip netns exec "$server" env \
+              REPO_ROOT="$REPO_ROOT" \
+              SSL_CERT_FILE="$https_cert" \
+              TEST_NATIVE_ORIGIN="https://$google4_probe" \
+              TEST_PROBE_TIMEOUT="$probe_timeout" \
+              bash -s -- "$mode" "$scope" "$path" <<'NATIVE_PROBE'
+          set -Eeuo pipefail
+          source "$REPO_ROOT/bin/warp-vps"
+
+          WARP_MODE="$1"
+          WARP_SCOPE="$2"
+          REDSOCKS_UID=65534
+          REDSOCKS_USER=nobody
+          if [ -n "$TEST_PROBE_TIMEOUT" ]; then
+            UNLOCK_CONNECT_TIMEOUT="$TEST_PROBE_TIMEOUT"
+            UNLOCK_MAX_TIME="$TEST_PROBE_TIMEOUT"
+          fi
+
+          native_egress="$(select_native_egress)"
+          [ "$native_egress" = '4|eth0|192.0.2.2' ] || {
+            printf 'unexpected native egress: %s\n' "$native_egress" >&2
+            exit 1
+          }
+          IFS='|' read -r NATIVE_FAMILY NATIVE_IFACE NATIVE_SOURCE_IP <<< "$native_egress"
+          native_https_request GET "${TEST_NATIVE_ORIGIN}${3}"
+          NATIVE_PROBE
+          }
+
+          assert_native_https_path() {
+            local mode="$1" scope="$2" path="$3" response
+            response="$(run_native_https_probe "$mode" "$scope" "$path")"
+            grep -Fxq "192.0.2.2|${path}" <<< "$response"
+            grep -Fxq "192.0.2.2|${path}" "$https_log"
+          }
+
+          assert_ordinary_https_blocked() {
+            local path="$1" output
+            if output="$(ip netns exec "$server" curl -4 -fsS --noproxy '*' \
+              --connect-timeout 1 --max-time 3 --cacert "$https_cert" \
+              "https://${google4_probe}${path}" 2>/dev/null)"; then
+              printf 'ordinary HTTPS unexpectedly used the native path: %s\n' "$output" >&2
+              return 1
+            fi
+            ! grep -Fq "|${path}" "$https_log"
+          }
+
+          send_ordinary_udp_probe() {
+            local family="$1" address="$2"
+            ip netns exec "$server" python3 - "$family" "$address" <<'PY' || true
+          import socket
+          import sys
+
+          family = socket.AF_INET if sys.argv[1] == "4" else socket.AF_INET6
+          sock = socket.socket(family, socket.SOCK_DGRAM)
+          sock.settimeout(1)
+          try:
+              sock.sendto(b"warp-vps-leak-probe", (sys.argv[2], 443))
+          except OSError:
+              pass
+          PY
+          }
+
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.all.rp_filter=2
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.eth0.rp_filter=2
+
+          for scope in google global; do
+            ip netns exec "$server" nft -f "$RUNNER_TEMP/warp-vps-socks-${scope}.nft"
+            assert_native_https_path socks "$scope" "/native/socks-${scope}"
+            assert_ordinary_https_blocked "/ordinary/socks-${scope}"
+            send_ordinary_udp_probe 4 "$google4_probe"
+            send_ordinary_udp_probe 6 "$google6_probe"
+            socks_nat_state="$(ip netns exec "$server" \
+              nft -n list chain inet warp_vps output_nat)"
+            socks_filter_state="$(ip netns exec "$server" \
+              nft -n list chain inet warp_vps output_filter)"
+            grep -Eq 'counter packets [1-9][0-9]* bytes [0-9]+ redirect to :23456' \
+              <<< "$socks_nat_state"
+            grep -Eq 'ip daddr @google4.*udp dport 443.*counter packets [1-9][0-9]*' \
+              <<< "$socks_filter_state"
+            grep -Eq 'ip6 daddr @google6.*counter packets [1-9][0-9]*' \
+              <<< "$socks_filter_state"
+            ip netns exec "$server" nft delete table inet warp_vps
+          done
+
           ip netns exec "$server" ip -4 route replace "$google4_cidr" dev warp-vps-wg
           ip netns exec "$server" ip -6 route replace "$google6_cidr" dev warp-vps-wg
           ip netns exec "$server" ip -4 route get "$google4_probe" \
@@ -142,6 +297,24 @@ jobs:
             | grep -Fq 'dev warp-vps-wg'
           ip netns exec "$server" ip -4 route get 198.51.100.2 \
             | grep -Fq 'via 192.0.2.1 dev eth0'
+          assert_native_https_path wireguard google '/native/wireguard-google'
+          assert_ordinary_https_blocked '/ordinary/wireguard-google'
+
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.all.rp_filter=1
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.eth0.rp_filter=1
+          strict_output=''
+          strict_rc=0
+          strict_output="$(run_native_https_probe \
+            wireguard google '/native/wireguard-google-strict-rpf' 3 2>/dev/null)" || strict_rc=$?
+          [ "$strict_rc" -eq 0 ]
+          [ -z "$strict_output" ]
+          if grep -Fq '|/native/wireguard-google-strict-rpf' "$https_log"; then
+            printf 'strict rp_filter unexpectedly admitted the native HTTPS reply\n' >&2
+            exit 1
+          fi
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.all.rp_filter=2
+          ip netns exec "$server" sysctl -qw net.ipv4.conf.eth0.rp_filter=2
+
           ip netns exec "$server" ip -4 route del "$google4_cidr" dev warp-vps-wg
           ip netns exec "$server" ip -6 route del "$google6_cidr" dev warp-vps-wg
 
@@ -159,6 +332,16 @@ jobs:
           ip netns exec "$server" ip -6 rule add priority 18000 table main suppress_prefixlength 0
           ip netns exec "$server" ip -4 rule add not fwmark 51888 table 51888 priority 18001
           ip netns exec "$server" ip -6 rule add not fwmark 51888 table 51888 priority 18001
+          ip netns exec "$server" ip -4 route get "$google4_probe" \
+            | grep -Fq 'dev warp-vps-wg'
+          assert_ordinary_https_blocked '/ordinary/wireguard-global'
+
+          # Make SO_MARK independently observable even though SO_BINDTODEVICE also
+          # constrains route lookup: unmarked eth0 traffic hits this dead policy route.
+          ip netns exec "$server" ip -4 route replace "$google4_probe/32" \
+            via 192.0.2.254 dev eth0 table 51888
+          assert_native_https_path wireguard global '/native/wireguard-global'
+
           ip netns exec "$server" sysctl -qw net.ipv4.conf.all.src_valid_mark=1
           ip netns exec "$server" sysctl -qw net.ipv4.conf.all.rp_filter=1
           ip netns exec "$server" sysctl -qw net.ipv4.conf.eth0.rp_filter=1

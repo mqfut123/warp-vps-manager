@@ -837,7 +837,7 @@ test_real_no_tty_installer_requests_are_bounded() {
 test_installer_menu_maps_public_actions_and_recovers() {
   source_without_main "$INSTALL_SCRIPT"
   local answer_index=0 calls='' renders=0
-  local answers=('1' '' '2' '' '3' '' '4' '' '7' '' '9' '0')
+  local answers=('1' '' '2' '' '3' '' '4' '' '5' '' '8' '' '10' '0')
   require_root() { :; }
   print_installer_menu() { renders=$((renders + 1)); }
   read_input() {
@@ -852,9 +852,9 @@ test_installer_menu_maps_public_actions_and_recovers() {
   }
 
   installer_menu >/dev/null 2>&1
-  assert_eq 'status test unlock-check restart logs ' "$calls" \
+  assert_eq 'status test native-unlock-check unlock-check restart logs ' "$calls" \
     'menu choices must map to the existing public manager commands' || return 1
-  assert_eq '7' "$renders" \
+  assert_eq '8' "$renders" \
     'successful, failed, and invalid ordinary actions should all return to the same menu'
 }
 
@@ -893,7 +893,7 @@ test_installer_menu_terminal_actions_do_not_run_stale_code() {
   BIN_PATH=menu_manager
 
   local answer_index=0 manager_rc=0 calls=''
-  local answers=('5')
+  local answers=('6')
   read_input() {
     [ "$answer_index" -lt "${#answers[@]}" ] || return 1
     printf -v "$1" '%s' "${answers[$answer_index]}"
@@ -908,7 +908,7 @@ test_installer_menu_terminal_actions_do_not_run_stale_code() {
   manager_rc=28
   calls=''
   render_count=0
-  answers=('5' '' '0')
+  answers=('6' '' '0')
   installer_menu >/dev/null 2>&1
   assert_eq 'update ' "$calls" 'failed update should not run another manager action' || return 1
   assert_eq '2' "$render_count" 'failed update should return to the menu' || return 1
@@ -917,7 +917,7 @@ test_installer_menu_terminal_actions_do_not_run_stale_code() {
   manager_rc=0
   calls=''
   render_count=0
-  answers=('8')
+  answers=('9')
   installer_menu >/dev/null 2>&1
   assert_eq 'uninstall ' "$calls" 'successful uninstall should terminate the menu immediately' || return 1
   assert_eq '1' "$render_count" 'successful uninstall should exit the old menu after one render' || return 1
@@ -926,13 +926,13 @@ test_installer_menu_terminal_actions_do_not_run_stale_code() {
   manager_rc=17
   calls=''
   render_count=0
-  answers=('8' '' '0')
+  answers=('9' '' '0')
   installer_menu >/dev/null 2>&1
   assert_eq 'uninstall ' "$calls" 'failed uninstall should return without dispatching another action' || return 1
   assert_eq '2' "$render_count" 'failed uninstall should return to the menu' || return 1
 
   answer_index=0
-  answers=('6' '' '0')
+  answers=('7' '' '0')
   main() {
     printf 'INSTALL-BEGIN\n'
     false
@@ -947,7 +947,7 @@ test_installer_menu_terminal_actions_do_not_run_stale_code() {
   assert_eq '2' "$menu_count" 'a failed reinstall should return to a fresh menu iteration' || return 1
 
   answer_index=0
-  answers=('6')
+  answers=('7')
   main() { printf 'INSTALL-SUCCESS\n'; }
   output="$(installer_menu 2>&1)"
   assert_contains "$output" 'INSTALL-SUCCESS' \
@@ -974,6 +974,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   calls=''
   cmd_status() { calls="${calls}status "; }
   cmd_test() { calls="${calls}test "; }
+  cmd_native_unlock_check() { calls="${calls}native-unlock-check "; }
   cmd_unlock_check() { calls="${calls}unlock-check "; }
   cmd_restart() { calls="${calls}restart "; }
   cmd_update() { calls="${calls}update "; }
@@ -989,6 +990,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   }
   main status
   main test
+  main native-unlock-check
   main unlock-check
   main restart
   main update
@@ -996,7 +998,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   main uninstall --yes
   main reinstall --mode socks
   main switch wireguard --swap none
-  assert_eq 'status test unlock-check lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
+  assert_eq 'status test native-unlock-check unlock-check lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
     "$calls" 'all public CLI commands must retain their dispatcher and arguments' || return 1
   assert_contains "$calls" 'reinstall:--mode socks ' \
     'noninteractive reinstall arguments must reach their dispatcher' || return 1
@@ -1021,6 +1023,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   interactive_terminal_available() { return 1; }
   cmd_status() { calls="${calls}status "; }
   cmd_test() { calls="${calls}test "; }
+  cmd_native_unlock_check() { calls="${calls}native-unlock "; }
   cmd_unlock_check() { calls="${calls}unlock "; }
   cmd_restart() { calls="${calls}restart "; }
   cmd_update() { calls="${calls}update "; }
@@ -1036,7 +1039,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   install_systemd() { calls="${calls}systemd "; }
   run_with_runtime_lock() { shift; "$@"; }
 
-  for cmd in menu status test unlock-check restart update logs heal apply start-rules stop-rules \
+  for cmd in menu status test native-unlock-check unlock-check restart update logs heal apply start-rules stop-rules \
     configure-warp setup-wireguard preflight-wireguard wait-wireguard install-systemd help; do
     calls=''
     rc=0
@@ -4167,6 +4170,47 @@ test_swap_failure_returns_to_selection() {
   assert_eq ' 1024 2048' "$create_sizes" 'the retry should use the newly selected Swap size'
 }
 
+test_unconfirmed_swap_cleanup_stops_all_install_paths() {
+  source_without_main "$INSTALL_SCRIPT"
+  local path call_log output calls rc
+  call_log="$(mktemp)"
+  create_swap_file() {
+    printf 'create\n' >> "$call_log"
+    return 2
+  }
+  mem_available_mb() { printf '512\n'; }
+  prompt_swap_creation() {
+    printf 'prompt\n' >> "$call_log"
+    SWAP_ACTION=none
+  }
+
+  for path in implicit interactive; do
+    : > "$call_log"
+    SWAP_ACTION=create
+    SWAP_SIZE_MB=1024
+    INSTALL_SWAP_EXPLICIT=0
+    case "$path" in
+      implicit) INSTALL_NONINTERACTIVE=1 ;;
+      interactive) INSTALL_NONINTERACTIVE=0 ;;
+    esac
+    rc=0
+    output="$(apply_swap_choice 2>&1)" || rc=$?
+    [ "$rc" -ne 0 ] || {
+      fail "$path Swap cleanup uncertainty must stop installation"
+      return 1
+    }
+    calls="$(< "$call_log")"
+    assert_eq 'create' "$calls" \
+      "$path cleanup uncertainty must neither continue nor retry Swap creation" || return 1
+    assert_contains "$output" '无法确认本次创建已完整撤销' \
+      "$path cleanup uncertainty must report the unresolved state" || return 1
+    assert_not_contains "$output" '已撤销本次创建；本次继续安装' \
+      "$path cleanup uncertainty must not claim that rollback succeeded" || return 1
+    assert_not_contains "$output" '请重新选择' \
+      "$path cleanup uncertainty must not return to the interactive selection"
+  done
+}
+
 test_swap_defaults_to_one_gig() {
   source_without_main "$INSTALL_SCRIPT"
 
@@ -4236,47 +4280,151 @@ test_custom_swap_is_decimal_and_rollback_releases_space() {
   fi
 }
 
+test_swap_state_reader_and_rollback_failure_contract() {
+  source_without_main "$INSTALL_SCRIPT"
+  local state_root listed_file absent_file missing_file rc body
+  local move_line final_proc_line final_fstab_line final_file_line success_line
+  state_root="$(mktemp -d)"
+  listed_file="${state_root}/listed"
+  absent_file="${state_root}/absent"
+  missing_file="${state_root}/missing"
+  SWAP_FILE=/swapfile-warp-vps-manager
+  printf 'Filename Type Size Used Priority\n%s file 1024 0 -2\n' "$SWAP_FILE" > "$listed_file"
+  printf 'Filename Type Size Used Priority\n' > "$absent_file"
+
+  rc=0
+  swap_file_listed_in "$listed_file" || rc=$?
+  assert_eq '0' "$rc" 'the Swap state reader must identify a listed managed file' || return 1
+  rc=0
+  swap_file_listed_in "$absent_file" || rc=$?
+  assert_eq '1' "$rc" 'the Swap state reader must distinguish confirmed absence' || return 1
+  rc=0
+  swap_file_listed_in "$missing_file" || rc=$?
+  assert_eq '2' "$rc" 'an unreadable Swap state source must remain unknown' || return 1
+
+  body="$(function_body "$INSTALL_SCRIPT" rollback_swap_file)"
+  assert_contains "$body" $'log "无法创建 Swap 回滚目录，已保留当前 Swap 状态：$backup_dir"\n    return 1' \
+    'a missing rollback directory must report rollback failure' || return 1
+  assert_contains "$body" $'log "无法备份 /etc/fstab，已保留当前 Swap 状态"\n        return 1' \
+    'an unavailable fstab backup must report rollback failure' || return 1
+  assert_contains "$body" $'log "无法生成清理后的 /etc/fstab，已保留当前 Swap 状态"\n        return 1' \
+    'an unavailable cleaned fstab must report rollback failure' || return 1
+  assert_contains "$body" '*) log "无法读取 /etc/fstab，已保留当前 Swap 状态"; return 1 ;;' \
+    'an unreadable fstab state must report rollback failure' || return 1
+  assert_contains "$body" $'log "无法停用 $SWAP_FILE，已保留当前 fstab 记录和文件，避免破坏正在使用的 Swap"\n        return 1' \
+    'a failed swapoff must report rollback failure' || return 1
+  assert_contains "$body" '*) log "无法读取 /proc/swaps，已保留当前 Swap 状态"; return 1 ;;' \
+    'an unreadable live Swap state must report rollback failure' || return 1
+  assert_contains "$body" $'log "无法恢复 /etc/fstab，已保留 Swap 文件；请检查：${backup_dir}/fstab.before-warp-vps"\n      return 1' \
+    'a failed fstab replacement must report rollback failure' || return 1
+
+  assert_contains "$body" $'log "无法释放失败 Swap 占用的磁盘空间：$SWAP_FILE"\n      return 1' \
+    'a failed Swap truncation must report rollback failure' || return 1
+  assert_contains "$body" $'log "Swap 空间已释放，但无法移动零长度占位文件：$SWAP_FILE"\n      return 1' \
+    'a failed placeholder move must report rollback failure' || return 1
+  assert_contains "$body" $'swap_file_listed_in /proc/swaps || state_rc=$?\n  [ "$state_rc" -eq 1 ] || { log "无法确认失败 Swap 已停用"; return 1; }' \
+    'rollback success must require confirmed absence from /proc/swaps' || return 1
+  assert_contains "$body" $'swap_file_listed_in /etc/fstab || state_rc=$?\n  [ "$state_rc" -eq 1 ] || { log "无法确认失败 Swap 的 fstab 记录已清除"; return 1; }' \
+    'rollback success must require confirmed absence from /etc/fstab' || return 1
+  assert_contains "$body" $'if [ -e "$SWAP_FILE" ]; then\n    log "失败 Swap 文件仍存在：$SWAP_FILE"\n    return 1' \
+    'rollback success must require the managed Swap path to be absent' || return 1
+
+  move_line="$(line_number "$body" 'mv "$SWAP_FILE"')"
+  final_proc_line="$(awk -v pattern='swap_file_listed_in /proc/swaps' \
+    'index($0, pattern) { line=NR } END { print line }' <<< "$body")"
+  final_fstab_line="$(awk -v pattern='swap_file_listed_in /etc/fstab' \
+    'index($0, pattern) { line=NR } END { print line }' <<< "$body")"
+  final_file_line="$(awk -v pattern='if [ -e "$SWAP_FILE" ]; then' \
+    'index($0, pattern) { line=NR } END { print line }' <<< "$body")"
+  success_line="$(awk '$0 == "  return 0" { line=NR } END { print line }' <<< "$body")"
+  if [ -z "$move_line" ] || [ -z "$final_proc_line" ] || [ -z "$final_fstab_line" ] \
+    || [ -z "$final_file_line" ] || [ -z "$success_line" ] \
+    || [ "$move_line" -ge "$final_proc_line" ] \
+    || [ "$final_proc_line" -ge "$final_fstab_line" ] \
+    || [ "$final_fstab_line" -ge "$final_file_line" ] \
+    || [ "$final_file_line" -ge "$success_line" ]; then
+    fail 'rollback may return success only after all three post-cleanup states are reverified'
+    return 1
+  fi
+}
+
 test_noninteractive_swap_choices_and_failure_are_bounded() {
   source_without_main "$INSTALL_SCRIPT"
-  INSTALL_NONINTERACTIVE=1
   swap_total_mb() { printf '%s\n' "$mock_swap_total"; }
   max_creatable_swap_mb() { printf '%s\n' "$mock_max_swap"; }
-  local mock_swap_total=0 mock_max_swap=4096 output rc=0
+  local mock_swap_total=0 mock_max_swap=4096 output output_file rc=0 option
+  output_file="$(mktemp)"
 
-  INSTALL_SWAP_OPTION=''
+  parse_install_options --non-interactive
   collect_swap_choice
   assert_eq 'create' "$SWAP_ACTION" 'noninteractive no-Swap default must create Swap' || return 1
   assert_eq '1024' "$SWAP_SIZE_MB" 'noninteractive default Swap must be exactly 1G' || return 1
+  assert_eq '0' "${INSTALL_SWAP_EXPLICIT:-unset}" \
+    'an omitted --swap option must remain distinguishable from explicit auto' || return 1
 
-  INSTALL_SWAP_OPTION=2
+  parse_install_options --non-interactive --swap 2
   collect_swap_choice
   assert_eq '2048' "$SWAP_SIZE_MB" 'an explicit Swap value must be interpreted as GiB' || return 1
+  assert_eq '1' "${INSTALL_SWAP_EXPLICIT:-unset}" \
+    'an explicit Swap size must retain its strict failure policy' || return 1
 
-  INSTALL_SWAP_OPTION=none
+  parse_install_options --non-interactive --swap none
   collect_swap_choice >/dev/null
   assert_eq 'none' "$SWAP_ACTION" '--swap none must skip creation without prompting' || return 1
 
   mock_swap_total=512
-  INSTALL_SWAP_OPTION=2
+  parse_install_options --non-interactive --swap 2
   collect_swap_choice
   assert_eq 'none' "$SWAP_ACTION" 'an existing Swap must never be duplicated' || return 1
 
   mock_swap_total=0
   mock_max_swap=512
-  INSTALL_SWAP_OPTION=''
-  output="$(collect_swap_choice 2>&1)" || rc=$?
-  assert_eq '1' "$rc" 'insufficient disk for the requested Swap must fail before installation' || return 1
-  assert_contains "$output" '--swap none' 'the disk-space error must identify the explicit skip option' || return 1
+  parse_install_options --non-interactive
+  rc=0
+  collect_swap_choice > "$output_file" 2>&1 || rc=$?
+  output="$(< "$output_file")"
+  assert_eq '0' "$rc" 'insufficient disk for implicit 1G Swap must not block installation' || return 1
+  assert_eq 'none' "$SWAP_ACTION" \
+    'an unavailable implicit Swap allocation must continue without Swap' || return 1
+  assert_contains "$output" 'Swap' 'the implicit disk-space skip must remain visible' || return 1
 
+  for option in auto 2; do
+    parse_install_options --non-interactive --swap "$option"
+    rc=0
+    output="$(collect_swap_choice 2>&1)" || rc=$?
+    assert_eq '1' "$rc" \
+      "explicit --swap $option must still fail when disk space is insufficient" || return 1
+    assert_contains "$output" '--swap none' \
+      "the explicit --swap $option error must identify the skip option" || return 1
+  done
+
+  mock_max_swap=4096
+  parse_install_options --non-interactive
+  collect_swap_choice
   SWAP_ACTION=create
   SWAP_SIZE_MB=1024
   create_swap_file() { return 1; }
   prompt_swap_creation() { printf 'PROMPTED\n'; }
   rc=0
-  output="$(apply_swap_choice 2>&1)" || rc=$?
-  assert_eq '1' "$rc" 'a noninteractive Swap creation failure must propagate' || return 1
+  apply_swap_choice > "$output_file" 2>&1 || rc=$?
+  output="$(< "$output_file")"
+  assert_eq '0' "$rc" 'an implicit Swap creation failure must not block installation' || return 1
+  assert_eq 'none' "$SWAP_ACTION" \
+    'an implicit creation failure must leave installation on the no-Swap path' || return 1
   assert_not_contains "$output" 'PROMPTED' \
-    'a noninteractive Swap failure must not fall back to an input prompt'
+    'a noninteractive implicit Swap failure must not fall back to an input prompt' || return 1
+  assert_contains "$output" 'Swap' 'the implicit creation failure must remain visible' || return 1
+
+  for option in auto 2; do
+    parse_install_options --non-interactive --swap "$option"
+    collect_swap_choice
+    rc=0
+    output="$(apply_swap_choice 2>&1)" || rc=$?
+    assert_eq '1' "$rc" \
+      "an explicit --swap $option creation failure must still propagate" || return 1
+    assert_not_contains "$output" 'PROMPTED' \
+      "an explicit --swap $option failure must not read input" || return 1
+  done
 }
 
 evaluate_gemini_fixture() {
@@ -4307,7 +4455,7 @@ test_gemini_fixtures() {
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/unavailable.html" \
     "${FIXTURE_DIR}/gemini/unavailable-k4wwud.txt" \
-    'no|当前出口地区受限' || return 1
+    'no|位置：North York, ON, Canada；当前出口地区受限' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/unknown.html" \
     "${FIXTURE_DIR}/gemini/unknown-k4wwud.txt" \
@@ -4367,13 +4515,17 @@ test_youtube_fixtures() {
     'unknown|地区信息冲突' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-signals.html" \
-    'no|地区：US' || return 1
+    'unknown|页面特征冲突' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-cn.html" \
     'no|地区：CN' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/unavailable-us.html" \
     'no|地区：US' || return 1
+  assert_eq \
+    'no|地区：未知' \
+    "$(evaluate_youtube_premium_unlock 'Premium is not available in your country')" \
+    'an explicit unavailable response without a region must say that the region is unknown' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-only.html" \
     'unknown|页面特征不明确' || return 1
@@ -4384,6 +4536,274 @@ test_youtube_fixtures() {
     'unknown|网络连接失败' \
     "$(evaluate_youtube_premium_unlock '')" \
     'empty YouTube response should remain unknown'
+}
+
+test_native_egress_selection() {
+  source_without_main "$MANAGER_SCRIPT"
+  local mock_v4_defaults mock_v6_defaults mock_v4_addresses mock_v6_addresses
+  local output rc=0
+  mock_v4_defaults=$'default via 192.0.2.1 dev eth0 proto dhcp metric 100\ndefault via 192.0.2.2 dev eth1 proto dhcp metric 200'
+  mock_v6_defaults='default via 2001:db8:1::1 dev eth6 proto ra metric 100'
+  mock_v4_addresses=$'2: eth0    inet 198.51.100.10/24 brd 198.51.100.255 scope global eth0\n2: eth0    inet 198.51.100.11/24 brd 198.51.100.255 scope global secondary eth0'
+  mock_v6_addresses=$'3: eth6    inet6 2001:db8:1::10/64 scope global dynamic\n3: eth6    inet6 2001:db8:1::11/64 scope global secondary dynamic'
+  ip() {
+    case "$*" in
+      '-4 route show table main default') [ -z "$mock_v4_defaults" ] || printf '%s\n' "$mock_v4_defaults" ;;
+      '-6 route show table main default') [ -z "$mock_v6_defaults" ] || printf '%s\n' "$mock_v6_defaults" ;;
+      *'-o -4 addr show'*|*'-o -4 address show'*)
+        [ -z "$mock_v4_addresses" ] || printf '%s\n' "$mock_v4_addresses"
+        ;;
+      *'-o -6 addr show'*|*'-o -6 address show'*)
+        [ -z "$mock_v6_addresses" ] || printf '%s\n' "$mock_v6_addresses"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  output="$(select_native_egress)" || {
+    fail 'a default interface with global IPv4 addresses must be selectable'
+    return 1
+  }
+  assert_eq '4|eth0|198.51.100.10' "$output" \
+    'native selection must use the first global IPv4 on the first IPv4 default interface' || return 1
+
+  mock_v4_defaults=''
+  mock_v4_addresses=''
+  output="$(select_native_egress)" || {
+    fail 'an IPv6-only default interface with a global address must be selectable'
+    return 1
+  }
+  assert_eq '6|eth6|2001:db8:1::10' "$output" \
+    'native selection must fall back to the first global IPv6 only when IPv4 is unavailable' || return 1
+
+  mock_v4_defaults='default via 192.0.2.1 dev eth0'
+  mock_v6_defaults='default via 2001:db8:1::1 dev eth6'
+  mock_v4_addresses=''
+  mock_v6_addresses=''
+  rc=0
+  output="$(select_native_egress 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'native selection must fail when neither default interface has a global address'
+    return 1
+  }
+  : "$output"
+}
+
+test_native_unlock_trace_behavior() {
+  source_without_main "$MANAGER_SCRIPT"
+  local request_log output calls trace_state rc=0
+  request_log="$(mktemp)"
+  trace_state=off
+  select_native_egress() { printf '4|eth0|198.51.100.10\n'; }
+  native_https_request() {
+    printf '%s\n' "$*" >> "$request_log"
+    case "$*" in
+      *cdn-cgi/trace*)
+        case "$trace_state" in
+          fail) return 28 ;;
+          off) printf 'ip=203.0.113.8\nloc=US\nwarp=off\n' ;;
+          on|plus) printf 'ip=203.0.113.8\nloc=US\nwarp=%s\n' "$trace_state" ;;
+        esac
+        ;;
+      *BardChatUi/data/batchexecute*|*K4WWud*)
+        cat "${FIXTURE_DIR}/gemini/available-k4wwud.txt"
+        ;;
+      *gemini.google.com*)
+        cat "${FIXTURE_DIR}/gemini/available.html"
+        ;;
+      *youtube.com/premium*)
+        cat "${FIXTURE_DIR}/youtube/unavailable-us.html"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  output="$(run_native_unlock_checks)" || {
+    fail 'ordinary service results must remain advisory for the native check'
+    return 1
+  }
+  calls="$(< "$request_log")"
+  assert_contains "$output" '203.0.113.8' 'native trace output must show the observed public IP' || return 1
+  assert_contains "$output" 'US' 'native trace output must show the observed Cloudflare region' || return 1
+  assert_contains "$output" 'Gemini：可用' 'native Gemini output must reuse the existing parser' || return 1
+  assert_contains "$output" 'YouTube Premium：不可用（地区：US）' \
+    'native YouTube output must reuse the existing parser and parsed region' || return 1
+  assert_contains "$calls" 'gemini.google.com' 'the native check must request Gemini through the native transport' || return 1
+  assert_contains "$calls" 'youtube.com/premium' 'the native check must request YouTube through the native transport' || return 1
+
+  : > "$request_log"
+  trace_state=fail
+  output="$(run_native_unlock_checks)" || {
+    fail 'a failed Cloudflare trace request must not block the service checks'
+    return 1
+  }
+  calls="$(< "$request_log")"
+  assert_contains "$calls" 'gemini.google.com' \
+    'Gemini must still run when Cloudflare trace is unavailable' || return 1
+  assert_contains "$calls" 'youtube.com/premium' \
+    'YouTube must still run when Cloudflare trace is unavailable' || return 1
+  assert_contains "$output" 'Gemini' 'trace failure must still print the Gemini result' || return 1
+  assert_contains "$output" 'YouTube Premium' 'trace failure must still print the YouTube result' || return 1
+
+  for trace_state in on plus; do
+    : > "$request_log"
+    rc=0
+    output="$(run_native_unlock_checks 2>&1)" || rc=$?
+    calls="$(< "$request_log")"
+    assert_not_contains "$calls" 'gemini.google.com' \
+      "warp=$trace_state must stop before Gemini because the bypass failed" || return 1
+    assert_not_contains "$calls" 'youtube.com/premium' \
+      "warp=$trace_state must stop before YouTube because the bypass failed" || return 1
+    assert_contains "$output" '旁路失败' \
+      "warp=$trace_state must report the native bypass failure" || return 1
+    : "$rc"
+  done
+}
+
+test_native_https_request_mode_and_environment_contract() {
+  source_without_main "$MANAGER_SCRIPT"
+  local transport_log output recorded
+  transport_log="$(mktemp)"
+  http_proxy='http://lower-http.invalid:8080'
+  https_proxy='http://lower-https.invalid:8080'
+  all_proxy='socks5://lower-all.invalid:1080'
+  HTTP_PROXY='http://upper-http.invalid:8080'
+  HTTPS_PROXY='http://upper-https.invalid:8080'
+  ALL_PROXY='socks5://upper-all.invalid:1080'
+  UNLOCK_CONNECT_TIMEOUT=3
+  UNLOCK_MAX_TIME=7
+  timeout() {
+    {
+      printf 'proxy|%s|%s|%s|%s|%s|%s\n' \
+        "${http_proxy-}" "${https_proxy-}" "${all_proxy-}" \
+        "${HTTP_PROXY-}" "${HTTPS_PROXY-}" "${ALL_PROXY-}"
+      printf 'outer|%s|%s|%s|%s|%s\n' \
+        "${1-}" "${2-}" "${3-}" "${4-}" "${5-}"
+      printf 'request|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "${7-}" "${8-}" "${9-}" "${10-}" "${11-}" "${12-}" \
+        "${13-}" "${14-}" "${15-}" "${16-}" "${17-}" "${18-}"
+    } >> "$transport_log"
+    printf 'native-body\n'
+  }
+
+  WARP_MODE=wireguard
+  WARP_SCOPE=global
+  NATIVE_FAMILY=4
+  NATIVE_IFACE=eth0
+  NATIVE_SOURCE_IP=198.51.100.10
+  output="$(native_https_request POST 'https://example.invalid/path?q=1' 'x=1')"
+  assert_eq 'native-body' "$output" 'the native wrapper must return the transport response body' || return 1
+  recorded="$(< "$transport_log")"
+  assert_contains "$recorded" 'proxy||||||' \
+    'the native transport process must receive no lower- or upper-case proxy endpoint' || return 1
+  assert_contains "$recorded" 'outer|-k|1|7|python3|-c' \
+    'the native transport must have a bounded outer process deadline' || return 1
+  assert_contains "$recorded" \
+    'request|POST|https://example.invalid/path?q=1|x=1|4|198.51.100.10|eth0|51888|wireguard|0|0|3|7' \
+    'WireGuard global mode must pass source binding, interface and bypass mark to Python' || return 1
+
+  : > "$transport_log"
+  WARP_MODE=socks
+  WARP_SCOPE=global
+  REDSOCKS_USER=warp-redsocks
+  REDSOCKS_UID=991
+  NATIVE_FAMILY=6
+  NATIVE_IFACE=eth6
+  NATIVE_SOURCE_IP=2001:db8:1::10
+  id() { [ "$*" = '-g warp-redsocks' ] && printf '992\n'; }
+  output="$(native_https_request GET 'https://example.invalid/v6')"
+  assert_eq 'native-body' "$output" 'the Socks native wrapper must return the response body' || return 1
+  recorded="$(< "$transport_log")"
+  assert_contains "$recorded" \
+    'request|GET|https://example.invalid/v6||6|2001:db8:1::10||0|socks|991|992|3|7' \
+    'Socks mode must pass the exempt uid/gid without a WireGuard interface or mark' || return 1
+
+  assert_eq 'http://lower-http.invalid:8080' "$http_proxy" \
+    'ignoring proxy variables for one request must not mutate the caller environment' || return 1
+  assert_eq 'http://upper-http.invalid:8080' "$HTTP_PROXY" \
+    'ignoring upper-case proxy variables must remain scoped to the transport process'
+}
+
+test_native_https_request_socket_redirect_and_deadline_contract() {
+  local body drop_line resolve_line socket_line bind_line connect_line tls_line
+  body="$(function_body "$MANAGER_SCRIPT" native_https_request)"
+  [ -n "$body" ] || {
+    fail 'could not extract native_https_request'
+    return 1
+  }
+
+  drop_line="$(line_number "$body" 'os.setresuid(target_uid, target_uid, target_uid)')"
+  resolve_line="$(line_number "$body" 'addresses = socket.getaddrinfo(')"
+  socket_line="$(line_number "$body" 'raw_socket = socket.socket(af, socktype, protocol)')"
+  bind_line="$(line_number "$body" 'raw_socket.bind((source_ip, 0))')"
+  connect_line="$(line_number "$body" 'raw_socket.connect(sockaddr)')"
+  tls_line="$(line_number "$body" 'context.wrap_socket(raw_socket, server_hostname=self.host)')"
+  for name in drop_line resolve_line socket_line bind_line connect_line tls_line; do
+    [ -n "${!name}" ] || {
+      fail "native socket boundary is missing: $name"
+      return 1
+    }
+  done
+  if [ "$drop_line" -ge "$resolve_line" ] || [ "$drop_line" -ge "$socket_line" ]; then
+    fail 'Socks mode must drop supplementary groups and uid/gid before DNS resolution and socket creation'
+    return 1
+  fi
+  if [ "$socket_line" -ge "$bind_line" ] || [ "$bind_line" -ge "$connect_line" ] \
+    || [ "$connect_line" -ge "$tls_line" ]; then
+    fail 'the native socket must bind its source before connect and validate TLS only after connecting'
+    return 1
+  fi
+
+  assert_contains "$body" 'os.setgroups([])' \
+    'Socks privilege drop must clear supplementary groups' || return 1
+  assert_contains "$body" 'socket.SO_BINDTODEVICE' \
+    'WireGuard native requests must bind the selected native interface' || return 1
+  assert_contains "$body" 'socket.SO_MARK' \
+    'WireGuard global native requests must carry the project bypass mark' || return 1
+  assert_contains "$body" 'raw_socket.bind((source_ip, 0, 0, 0))' \
+    'IPv6 native requests must bind the selected IPv6 source address' || return 1
+  assert_contains "$body" 'ssl.create_default_context()' \
+    'native HTTPS must retain system certificate verification' || return 1
+  assert_contains "$body" 'server_hostname=self.host' \
+    'native HTTPS must validate TLS against the current redirect host' || return 1
+
+  assert_contains "$body" 'for redirect_count in range(6):' \
+    'native HTTPS must cap the redirect chain' || return 1
+  assert_contains "$body" 'parsed.scheme != "https"' \
+    'native redirects must reject a downgrade to cleartext HTTP' || return 1
+  assert_contains "$body" 'parsed.username or parsed.password' \
+    'native redirects must reject credential-bearing URLs' || return 1
+  assert_contains "$body" 'status in (301, 302, 303, 307, 308)' \
+    'native HTTPS must recognize only the intended redirect statuses' || return 1
+  assert_contains "$body" 'urllib.parse.urljoin(current_url, location)' \
+    'relative redirects must resolve against the current HTTPS URL' || return 1
+  assert_contains "$body" 'status in (301, 302, 303) and current_method == "POST"' \
+    '301/302/303 redirects must convert POST to GET without changing 307/308 semantics' || return 1
+  assert_contains "$body" 'max_response_bytes = 8 * 1024 * 1024' \
+    'native HTTPS must bound response memory' || return 1
+
+  assert_contains "$body" 'timeout -k 1 "$UNLOCK_MAX_TIME" python3' \
+    'native HTTPS must retain the outer wall-clock deadline' || return 1
+  assert_contains "$body" 'deadline = time.monotonic() + max_time' \
+    'redirects and address retries must share one monotonic deadline' || return 1
+  assert_contains "$body" 'return min(connect_timeout, remaining)' \
+    'each socket operation must use the smaller connect or remaining deadline' || return 1
+  assert_contains "$body" 'raw_socket.settimeout(operation_timeout())' \
+    'connect must have a socket timeout' || return 1
+  assert_contains "$body" 'self.sock.settimeout(operation_timeout())' \
+    'TLS response reads must have a socket timeout'
+}
+
+test_native_unlock_command_is_explicit_and_root_scoped() {
+  source_without_main "$MANAGER_SCRIPT"
+  local calls=''
+  require_root() { calls="${calls}root "; }
+  load_config() { calls="${calls}config "; }
+  run_native_unlock_checks() { calls="${calls}native "; }
+
+  cmd_native_unlock_check
+  assert_eq 'root config native ' "$calls" \
+    'the native unlock command must load its routing context only after the root boundary'
 }
 
 test_status_and_test_do_not_run_unlock_checks() {
@@ -4398,11 +4818,16 @@ test_status_and_test_do_not_run_unlock_checks() {
     }
     assert_not_contains "$body" 'run_unlock_checks' \
       'status and test must not run the external unlock probes' || return 1
+    assert_not_contains "$body" 'run_native_unlock_checks' \
+      'status and test must not run the native-exit unlock probes' || return 1
   done
 
   body="$(function_body "$MANAGER_SCRIPT" cmd_unlock_check)"
   assert_contains "$body" 'run_unlock_checks' \
-    'unlock-check should remain the explicit command for external unlock probes'
+    'unlock-check should remain the explicit command for external unlock probes' || return 1
+  body="$(function_body "$MANAGER_SCRIPT" cmd_native_unlock_check)"
+  assert_contains "$body" 'run_native_unlock_checks' \
+    'native-unlock-check should remain the only explicit native-exit probe command'
 }
 
 test_local_runtime_paths_do_not_depend_on_external_probes() {
@@ -4423,6 +4848,8 @@ test_local_runtime_paths_do_not_depend_on_external_probes() {
       "$name must not gate on a WireGuard handshake" || return 1
     assert_not_contains "$body" 'run_external_diagnostics' \
       "$name must not run external diagnostics" || return 1
+    assert_not_contains "$body" 'run_native_unlock_checks' \
+      "$name must not run native-exit unlock probes" || return 1
   done
 
   for name in run_final_self_check start_previous_runtime; do
@@ -4568,7 +4995,9 @@ test_install_unlock_check_is_post_success_and_nonblocking() {
     return 1
   fi
   assert_not_contains "$body" '"$BIN_PATH" status' \
-    'installer completion must not be blocked by diagnostic status output'
+    'installer completion must not be blocked by diagnostic status output' || return 1
+  assert_not_contains "$body" '"$BIN_PATH" native-unlock-check' \
+    'the native-exit unlock check must remain manual and never join installation completion'
 }
 
 test_old_runtime_restore_does_not_call_status() {
@@ -7921,13 +8350,20 @@ run_test 'Socks readiness rejects unowned and invalid listeners' test_socks_loca
 run_test 'reused Socks port conflicts stop before runtime mutation' test_reused_socks_port_conflict_stops_before_runtime_mutation
 run_test 'Socks readiness waits use wall-clock deadlines' test_socks_waits_use_wall_clock_deadlines
 run_test 'failed Swap creation returns to selection' test_swap_failure_returns_to_selection
+run_test 'uncertain Swap cleanup stops implicit and interactive installation' test_unconfirmed_swap_cleanup_stops_all_install_paths
 run_test 'empty Swap choice defaults to 1G' test_swap_defaults_to_one_gig
 run_test 'no-Swap hosts default to 1G even with sufficient memory' test_no_swap_defaults_to_one_gig_even_with_sufficient_memory
 run_test 'Swap creation supports older coreutils' test_swap_creation_works_with_older_coreutils
 run_test 'custom Swap uses decimal input and releases failed allocation' test_custom_swap_is_decimal_and_rollback_releases_space
+run_test 'Swap rollback preserves unknown state and reverifies cleanup' test_swap_state_reader_and_rollback_failure_contract
 run_test 'noninteractive Swap choices and failures are bounded' test_noninteractive_swap_choices_and_failure_are_bounded
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
+run_test 'native egress selection prefers the first IPv4 and supports IPv6-only hosts' test_native_egress_selection
+run_test 'native unlock trace failures remain advisory except for confirmed WARP paths' test_native_unlock_trace_behavior
+run_test 'native HTTPS passes mode boundaries and ignores proxy environments' test_native_https_request_mode_and_environment_contract
+run_test 'native HTTPS bounds sockets redirects responses and deadlines' test_native_https_request_socket_redirect_and_deadline_contract
+run_test 'native unlock command is explicit and root scoped' test_native_unlock_command_is_explicit_and_root_scoped
 run_test 'status and test do not run unlock probes' test_status_and_test_do_not_run_unlock_checks
 run_test 'local runtime paths avoid external probes' test_local_runtime_paths_do_not_depend_on_external_probes
 run_test 'test exit status follows only local state' test_cmd_test_returns_only_local_status

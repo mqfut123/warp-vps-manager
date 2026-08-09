@@ -16,6 +16,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/ma
 
 全新交互安装默认选择 **Google 精准分流 + 1G Swap**。安装器先处理 Swap，再选择 Google 精准分流或全局 WARP，最后根据出站 UDP 探测结果建议 WireGuard 或 Socks5。检测到已有项目安装时，再运行同一命令会进入管理菜单。
 
+全新非交互安装省略 `--swap` 时会尝试创建 1G Swap；磁盘空间不足，或创建失败且已确认清理完成时，会警告并继续安装。无法确认清理完成时仍停止。显式使用 `--swap auto` 或 `--swap N` 时保持严格语义，创建条件不满足会停止安装；`--swap none` 明确跳过。
+
 ## 和其他方案对比
 
 WARP VPS Manager 默认使用 Google 官方公网 IP 列表，并排除 Google Cloud 客户地址，只把目标 Google 流量交给 WARP；需要统一出口时，可在同一安装流程切换为全局 WARP。
@@ -74,7 +76,8 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 |---|---|
 | `warp-vps status` | 查看配置、服务、接口、端口和分流服务运行态 |
 | `warp-vps test` | 运行分流与外部连通性诊断 |
-| `warp-vps unlock-check` | 检测 Gemini 和 YouTube Premium |
+| `warp-vps native-unlock-check` | 绕过 WARP 分流，检测原生出口的 Gemini 和 YouTube Premium |
+| `warp-vps unlock-check` | 检测当前 WARP IPv4 出口的 Gemini 和 YouTube Premium |
 | `warp-vps restart` | 重启 WARP 分流链路 |
 | `warp-vps update` | 更新程序与 Google IP 规则；不安装或升级运行依赖，旧版规则差异不会阻止更新 |
 | `warp-vps reinstall --scope global` | 保持运行模式并切换到全局 WARP |
@@ -84,6 +87,8 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 | `warp-vps logs` | 查看最近的服务日志 |
 
 进入“重装或切换”后，可重新选择路由范围和 Socks5 / WireGuard 模式；运行模式直接回车保持当前模式。非交互重装未指定 `--scope` 时保留当前范围；全新非交互安装的路由范围默认使用 Google 精准分流，运行模式默认 WireGuard，可用 `--scope` 与 `--mode` 显式指定。
+
+`native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
 
 ## 卸载
 
