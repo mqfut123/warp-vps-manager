@@ -2742,6 +2742,8 @@ test_wireguard_start_rules_is_the_lifecycle_boundary() {
     'reinstall must start the verified route unit even when reusing the interface' || return 1
   assert_contains "$start_body" 'select_working_wireguard_endpoint' \
     'WireGuard route startup must select a real working endpoint' || return 1
+  assert_not_contains "$start_body" 'run_native_unlock_checks' \
+    'verified route startup must not run the advisory native-exit checks' || return 1
   resolve_line="$(line_number "$start_body" 'candidates="$(wireguard_endpoint_candidates)"')"
   apply_line="$(line_number "$start_body" 'apply_rules')"
   if [ -z "$resolve_line" ] || [ -z "$apply_line" ] \
@@ -4830,11 +4832,10 @@ test_status_and_test_do_not_run_unlock_checks() {
     'native-unlock-check should remain the only explicit native-exit probe command'
 }
 
-test_local_runtime_paths_do_not_depend_on_external_probes() {
+test_runtime_paths_keep_diagnostics_scoped() {
   local body name
   for name in test_quiet wait_for_wg_ready wait_for_warp_proxy_ready \
-    warp_proxy_local_ready socks5_greeting_ok \
-    restart_wireguard_runtime reload_runtime_after_update cmd_heal; do
+    warp_proxy_local_ready socks5_greeting_ok; do
     body="$(function_body "$MANAGER_SCRIPT" "$name")"
     [ -n "$body" ] || {
       fail "could not extract local runtime function: $name"
@@ -4850,6 +4851,21 @@ test_local_runtime_paths_do_not_depend_on_external_probes() {
       "$name must not run external diagnostics" || return 1
     assert_not_contains "$body" 'run_native_unlock_checks' \
       "$name must not run native-exit unlock probes" || return 1
+  done
+
+  for name in start_rules cmd_restart restart_wireguard_runtime \
+    reload_runtime_after_update cmd_heal; do
+    body="$(function_body "$MANAGER_SCRIPT" "$name")"
+    [ -n "$body" ] || {
+      fail "could not extract runtime lifecycle function: $name"
+      return 1
+    }
+    assert_not_contains "$body" 'run_external_diagnostics' \
+      "$name must not run advisory connectivity diagnostics" || return 1
+    assert_not_contains "$body" 'run_unlock_checks' \
+      "$name must not run advisory WARP unlock checks" || return 1
+    assert_not_contains "$body" 'run_native_unlock_checks' \
+      "$name must not run advisory native-exit unlock checks" || return 1
   done
 
   for name in run_final_self_check start_previous_runtime; do
@@ -8365,7 +8381,7 @@ run_test 'native HTTPS passes mode boundaries and ignores proxy environments' te
 run_test 'native HTTPS bounds sockets redirects responses and deadlines' test_native_https_request_socket_redirect_and_deadline_contract
 run_test 'native unlock command is explicit and root scoped' test_native_unlock_command_is_explicit_and_root_scoped
 run_test 'status and test do not run unlock probes' test_status_and_test_do_not_run_unlock_checks
-run_test 'local runtime paths avoid external probes' test_local_runtime_paths_do_not_depend_on_external_probes
+run_test 'runtime paths keep advisory diagnostics explicit' test_runtime_paths_keep_diagnostics_scoped
 run_test 'test exit status follows only local state' test_cmd_test_returns_only_local_status
 run_test 'status and healthy timer checks remain local' test_status_and_healthy_timer_stay_local
 run_test 'HTTP probes accept error responses as reachable' test_http_probe_accepts_http_error_responses

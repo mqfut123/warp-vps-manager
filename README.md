@@ -16,7 +16,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/ma
 
 全新交互安装默认选择 **Google 精准分流 + 1G Swap**。安装器先处理 Swap，再选择 Google 精准分流或全局 WARP，最后根据出站 UDP 探测结果建议 WireGuard 或 Socks5。检测到已有项目安装时，再运行同一命令会进入管理菜单。
 
-全新非交互安装省略 `--swap` 时会尝试创建 1G Swap；磁盘空间不足，或创建失败且已确认清理完成时，会警告并继续安装。无法确认清理完成时仍停止。显式使用 `--swap auto` 或 `--swap N` 时保持严格语义，创建条件不满足会停止安装；`--swap none` 明确跳过。
+非交互安装、重装或切换省略 `--swap` 时会尝试创建 1G Swap；磁盘空间不足，或创建失败且已确认清理完成时，会警告并继续安装。无法确认清理完成时仍停止。显式使用 `--swap auto` 或 `--swap N` 时保持严格语义，创建条件不满足会停止安装；`--swap none` 明确跳过。
 
 ## 和其他方案对比
 
@@ -32,7 +32,7 @@ WARP VPS Manager 默认使用 Google 官方公网 IP 列表，并排除 Google C
 
 ## 两种路由范围
 
-v1.1.3 的 Google 精准分流和全局 WARP 都可以搭配 WireGuard 或 Socks5，切换路由范围不需要重新选择另一套管理工具。
+Google 精准分流和全局 WARP 都可以搭配 WireGuard 或 Socks5，切换路由范围不需要重新选择另一套管理工具。
 
 - **精准分流 Google（默认）**：网站、面板、API 和其他业务继续使用 VPS 原生 IP。
 - **全局走 WARP**：WireGuard 接管公网 IPv4、IPv6 与全部协议；Socks5 接管 VPS 主动发起的公网 IPv4 TCP。
@@ -89,6 +89,8 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 进入“重装或切换”后，可重新选择路由范围和 Socks5 / WireGuard 模式；运行模式直接回车保持当前模式。非交互重装未指定 `--scope` 时保留当前范围；全新非交互安装的路由范围默认使用 Google 精准分流，运行模式默认 WireGuard，可用 `--scope` 与 `--mode` 显式指定。
 
 `native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
+
+`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 受限时同时显示可解析的位置；YouTube Premium 的地区或页面特征互相冲突时显示无法确认，明确不可用但缺少地区时显示地区未知。
 
 ## 卸载
 
