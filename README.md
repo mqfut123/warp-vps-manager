@@ -49,7 +49,9 @@ WireGuard 全局模式让公网 IPv4、IPv6、TCP、UDP 和 QUIC 全部走 WARP�
 
 Socks5 会让支持回落的客户端从 QUIC 改用经 WARP 转发的 TCP；其他 Google IPv4 UDP 端口和非 Google 目标 UDP 不受影响。
 
-全新交互安装会向 Cloudflare STUN UDP/3478 发出有界探测。收到有效回包时，直接回车默认选择 WireGuard；已完成探测但未收到有效回包时，直接回车默认选择 Socks5，并提示 WireGuard 只使用 UDP、不会回退 TCP。检测无法完成时保留 WireGuard 默认；显式输入 `1` 或 `2` 始终按所选模式安装。该探测用于判断默认建议，只证明 Cloudflare STUN UDP/3478 能否往返，不能代替安装后的 WARP WireGuard 握手检测。
+全新交互安装会向 Cloudflare STUN UDP/3478 发出有界探测。收到有效回包时，直接回车默认选择 WireGuard；已完成探测但未收到有效回包时，直接回车默认选择 Socks5，并提示 WireGuard 只使用 UDP、不会回退 TCP。检测无法完成时保留 WireGuard 默认；显式输入 `1` 或 `2` 始终按所选模式安装。该探测只用于默认建议；WireGuard 配置生成后，安装器还会逐个验证域名当前解析出的 WARP UDP 对端，只有 Google IPv4、Google IPv6 均返回、WireGuard 最近握手存在且接收字节增长时才继续安装。更新、开机和显式重启也会重新选择当前可用对端，但不会把解析出的 IP 写死到配置文件。所有对端都失败时会清除本项目路由并提示改用 Socks5。
+
+WARP 对端使用 IPv4 还是 IPv6，只决定 WireGuard 加密包如何到达 Cloudflare，不限制隧道内承载的地址族。底层使用已验证的 IPv4 对端时，Google IPv6 仍通过 WireGuard 的 IPv6 地址和路由走 WARP；只有 Socks5 模式不承载 IPv6。
 
 ## 运行条件
 

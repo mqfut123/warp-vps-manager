@@ -34,6 +34,9 @@ UNLOCK_MAX_TIME=12
 DOWNLOAD_CONNECT_TIMEOUT=10
 DOWNLOAD_MAX_TIME=120
 WGCF_OPERATION_TIMEOUT=120
+WG_ENDPOINT_RESOLVE_TIMEOUT=10
+WG_PREFLIGHT_CONNECT_TIMEOUT=4
+WG_PREFLIGHT_MAX_TIME=8
 WARP_REGISTRATION_STATE="unknown"
 WARP_REGISTRATION_DETAIL=""
 WARP_RUNTIME_DETAILS=""
@@ -729,6 +732,129 @@ PY
   mv "$config_tmp" "$WG_CONFIG"
 }
 
+wireguard_endpoint_candidates() {
+  timeout -k 2 "$WG_ENDPOINT_RESOLVE_TIMEOUT" python3 - "$WG_CONFIG" <<'PY'
+import ipaddress
+import pathlib
+import socket
+import sys
+
+path = pathlib.Path(sys.argv[1])
+endpoints = []
+in_peer = False
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        in_peer = line[1:-1].strip().lower() == "peer"
+        continue
+    if in_peer and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "endpoint":
+            endpoints.append(value.strip())
+
+if len(endpoints) != 1:
+    raise SystemExit("WireGuard 配置必须包含唯一 WARP 对端")
+
+endpoint = endpoints[0]
+if endpoint.startswith("["):
+    close = endpoint.find("]")
+    host = endpoint[1:close]
+    port = endpoint[close + 2:]
+else:
+    host, port = endpoint.rsplit(":", 1)
+
+try:
+    literal = ipaddress.ip_address(host)
+except ValueError:
+    literal = None
+
+addresses = []
+if literal is not None:
+    addresses.append(literal)
+else:
+    try:
+        resolved = socket.getaddrinfo(
+            host,
+            int(port),
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_DGRAM,
+            proto=socket.IPPROTO_UDP,
+        )
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"无法解析 WireGuard WARP 对端：{error}")
+    seen = set()
+    for family, _, _, _, sockaddr in resolved:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        address = ipaddress.ip_address(sockaddr[0])
+        if address in seen:
+            continue
+        seen.add(address)
+        addresses.append(address)
+    addresses.sort(key=lambda address: address.version)
+
+if not addresses:
+    raise SystemExit("WireGuard WARP 对端没有可用的 IPv4 或 IPv6 地址")
+
+for address in addresses:
+    if address.version == 6:
+        print(f"[{address}]:{port}")
+    else:
+        print(f"{address}:{port}")
+PY
+}
+
+wireguard_peer_received_bytes() {
+  local peer="$1"
+  wg show "$WG_IFACE" transfer 2>/dev/null \
+    | awk -v peer="$peer" '$1 == peer { print $2; found=1 } END { if (!found) exit 1 }'
+}
+
+select_working_wireguard_endpoint() {
+  local candidates="$1"
+  local peers peer endpoint before after4 after6 selected
+  peers="$(wg show "$WG_IFACE" peers 2>/dev/null)" || return 1
+  peer="$(awk 'NF { print; count++ } END { if (count != 1) exit 1 }' <<< "$peers")" \
+    || return 1
+  selected=""
+
+  while IFS= read -r endpoint; do
+    [ -n "$endpoint" ] || continue
+    before="$(wireguard_peer_received_bytes "$peer")" || continue
+    case "$before" in ''|*[!0-9]*) continue ;; esac
+
+    info_line "正在验证 WireGuard WARP 对端：${endpoint}"
+    if ! wg set "$WG_IFACE" peer "$peer" endpoint "$endpoint"; then
+      continue
+    fi
+    if ! curl -4 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
+      --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
+      https://www.google.com/generate_204; then
+      continue
+    fi
+    after4="$(wireguard_peer_received_bytes "$peer")" || continue
+    case "$after4" in ''|*[!0-9]*) continue ;; esac
+    [ "$after4" -gt "$before" ] || continue
+
+    if ! curl -6 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
+      --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
+      https://www.google.com/generate_204; then
+      continue
+    fi
+    after6="$(wireguard_peer_received_bytes "$peer")" || continue
+    case "$after6" in ''|*[!0-9]*) continue ;; esac
+    if wg_handshake_recent && [ "$after6" -gt "$after4" ]; then
+      selected="$endpoint"
+      break
+    fi
+  done <<< "$candidates"
+
+  [ -n "$selected" ] || return 1
+  ok_line "WireGuard WARP 对端和隧道内 IPv4 / IPv6 数据面已验证：${selected}"
+}
+
 route_file_lines() {
   local file="$1"
   awk 'NF && $1 !~ /^#/ { print $1 }' "$file"
@@ -1072,6 +1198,28 @@ apply_rules() {
   nft -f "$NFT_CONF"
 }
 
+fail_wireguard_start() {
+  if stop_wg_routes_strict; then
+    die "WireGuard 数据面启动失败：没有 WARP UDP 对端能够同时访问 Google IPv4 和 IPv6；已清除本项目路由。WireGuard 不会回退 TCP，请运行 warp-vps switch socks --socks-port auto"
+  fi
+  die "WireGuard 数据面启动失败：没有 WARP UDP 对端能够同时访问 Google IPv4 和 IPv6，且无法确认本项目路由已完整清除。WireGuard 不会回退 TCP，请运行 warp-vps switch socks --socks-port auto"
+}
+
+start_rules() {
+  local candidates
+  load_config
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    candidates="$(wireguard_endpoint_candidates)" || fail_wireguard_start
+  fi
+
+  apply_rules
+  [ "$WARP_MODE" = "wireguard" ] || return 0
+  if select_working_wireguard_endpoint "$candidates"; then
+    return 0
+  fi
+  fail_wireguard_start
+}
+
 stop_rules() {
   if [ -r "$CONFIG_FILE" ]; then
     load_config
@@ -1311,7 +1459,7 @@ Wants=${route_wants}
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=${BIN_PATH} apply
+ExecStart=${BIN_PATH} start-rules
 ExecStop=${BIN_PATH} stop-rules
 
 [Install]
@@ -1462,7 +1610,6 @@ restart_wireguard_runtime() {
   remove_wireguard_interface || return 1
   systemctl reset-failed "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
   systemctl start "wg-quick@${WG_IFACE}.service" || return 1
-  apply_rules || return 1
   wait_for_wg_ready 20
 }
 
@@ -2287,6 +2434,7 @@ cmd_preflight_wireguard() {
   [ "$WARP_MODE" = "wireguard" ] || die "当前不是 WireGuard 模式"
   [ -r "$WG_CONFIG" ] || die "找不到 WireGuard 配置：$WG_CONFIG"
   command -v wg-quick >/dev/null 2>&1 || die "找不到 wg-quick，请先安装 wireguard-tools"
+  command -v curl >/dev/null 2>&1 || die "找不到 curl，无法验证 WireGuard 双栈数据面"
   if ! wg_interface_absent; then
     info_line "正在停止上次安装留下的 WireGuard 网卡：$WG_IFACE"
     remove_wireguard_interface \
@@ -2295,12 +2443,12 @@ cmd_preflight_wireguard() {
 
   local failed
   failed=0
-  info_line "正在临时拉起 WireGuard 网卡做路由预检"
+  info_line "正在临时拉起 WireGuard 网卡做真实握手和双栈数据面预检"
   if ! wg-quick up "$WG_CONFIG"; then
     failed=1
   fi
   if [ "$failed" -eq 0 ]; then
-    if ! "$SELF_PATH" apply; then
+    if ! "$SELF_PATH" start-rules; then
       failed=1
     fi
   fi
@@ -2308,7 +2456,7 @@ cmd_preflight_wireguard() {
     failed=1
   fi
   [ "$failed" -eq 0 ] || die "WireGuard 预检失败，未写入开机服务"
-  ok_line "WireGuard 预检通过"
+  ok_line "WireGuard 真实握手和双栈数据面预检通过"
 }
 
 download_update_asset() {
@@ -2528,7 +2676,9 @@ cmd_heal() {
       2) warn "暂时无法读取旧 Socks5 nftables 状态，本次不据此修改规则" ;;
     esac
     if ! service_active "wg-quick@${WG_IFACE}.service" || ! wg_interface_is_wireguard; then
-      restart_wireguard_runtime || true
+      if restart_wireguard_runtime; then
+        repair_rules=1
+      fi
     fi
     if ! service_active warp-vps.service; then
       repair_rules=1
@@ -3141,10 +3291,11 @@ usage() {
 内部命令：
   heal            健康检查和自动修复
   apply           重新生成并加载分流规则
+  start-rules     启动分流规则并验证 WireGuard 双栈数据面
   stop-rules      移除本项目 nftables 规则
   configure-warp  配置并连接 Cloudflare WARP 本地代理
   setup-wireguard 准备 WireGuard WARP 配置
-  preflight-wireguard 预检 WireGuard 网卡和路由
+  preflight-wireguard 预检 WireGuard 对端和双栈数据面
   wait-wireguard  等待 WireGuard 出口就绪
   install-systemd 安装 systemd 服务
 EOF
@@ -3206,6 +3357,7 @@ main() {
     logs) [ "$#" -eq 0 ] || { cli_error "logs 不接受参数"; return 2; }; cmd_logs ;;
     heal) [ "$#" -eq 0 ] || { cli_error "heal 不接受参数"; return 2; }; run_with_runtime_lock skip cmd_heal ;;
     apply) [ "$#" -eq 0 ] || { cli_error "apply 不接受参数"; return 2; }; require_root; apply_rules ;;
+    start-rules) [ "$#" -eq 0 ] || { cli_error "start-rules 不接受参数"; return 2; }; require_root; start_rules ;;
     stop-rules) [ "$#" -eq 0 ] || { cli_error "stop-rules 不接受参数"; return 2; }; require_root; stop_rules ;;
     configure-warp) [ "$#" -eq 0 ] || { cli_error "configure-warp 不接受参数"; return 2; }; cmd_configure_warp ;;
     setup-wireguard) [ "$#" -eq 0 ] || { cli_error "setup-wireguard 不接受参数"; return 2; }; cmd_setup_wireguard ;;
