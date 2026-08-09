@@ -1027,6 +1027,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   cmd_logs() { calls="${calls}logs "; }
   cmd_heal() { calls="${calls}heal "; }
   apply_rules() { calls="${calls}apply "; }
+  start_rules() { calls="${calls}start-rules "; }
   stop_rules() { calls="${calls}stop-rules "; }
   cmd_configure_warp() { calls="${calls}configure "; }
   cmd_setup_wireguard() { calls="${calls}setup "; }
@@ -1035,7 +1036,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   install_systemd() { calls="${calls}systemd "; }
   run_with_runtime_lock() { shift; "$@"; }
 
-  for cmd in menu status test unlock-check restart update logs heal apply stop-rules \
+  for cmd in menu status test unlock-check restart update logs heal apply start-rules stop-rules \
     configure-warp setup-wireguard preflight-wireguard wait-wireguard install-systemd help; do
     calls=''
     rc=0
@@ -2385,6 +2386,375 @@ test_wireguard_config_generation_is_retryable() {
     fail 'a WireGuard peer without IPv4 AllowedIPs must not be reused'
     return 1
   fi
+}
+
+test_wireguard_endpoint_candidates_preserve_hostname_config() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root output original body
+  root="$(mktemp -d)"
+  WG_CONFIG="$root/warp-vps-wg.conf"
+  timeout() {
+    [ "$1" = '-k' ] || return 1
+    shift 3
+    "$@"
+  }
+
+  cat > "$root/sitecustomize.py" <<'PY'
+import socket
+
+
+def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if host != "endpoint.test":
+        raise OSError(f"unexpected host: {host}")
+    return [
+        (socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", ("2001:db8::10", port, 0, 0)),
+        (socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", ("2001:db8::10", port, 0, 0)),
+        (socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", ("192.0.2.10", port)),
+        (socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", ("192.0.2.10", port)),
+    ]
+
+
+socket.getaddrinfo = fake_getaddrinfo
+PY
+  sed 's/engage\.cloudflareclient\.com/endpoint.test/' \
+    "${FIXTURE_DIR}/wireguard/valid.conf" > "$WG_CONFIG"
+  original="$(< "$WG_CONFIG")"
+  output="$(PYTHONPATH="$root" wireguard_endpoint_candidates)" || return 1
+  assert_eq $'192.0.2.10:2408\n[2001:db8::10]:2408' "$output" \
+    'hostname resolution must deduplicate addresses and prefer IPv4 before IPv6' || return 1
+  assert_eq "$original" "$(< "$WG_CONFIG")" \
+    'hostname candidate discovery must not rewrite the WireGuard config' || return 1
+
+  sed 's/engage\.cloudflareclient\.com/162.159.192.1/' \
+    "${FIXTURE_DIR}/wireguard/valid.conf" > "$WG_CONFIG"
+  original="$(< "$WG_CONFIG")"
+  output="$(wireguard_endpoint_candidates)" || return 1
+  assert_eq '162.159.192.1:2408' "$output" \
+    'an IPv4 literal must remain a valid runtime endpoint candidate' || return 1
+  assert_eq "$original" "$(< "$WG_CONFIG")" \
+    'runtime candidate discovery must not rewrite the WireGuard config' || return 1
+
+  sed 's/engage\.cloudflareclient\.com:2408/[2606:4700:d0::a29f:c001]:2408/' \
+    "${FIXTURE_DIR}/wireguard/valid.conf" > "$WG_CONFIG"
+  output="$(wireguard_endpoint_candidates)" || return 1
+  assert_eq '[2606:4700:d0::a29f:c001]:2408' "$output" \
+    'an IPv6 literal must keep WireGuard bracket notation' || return 1
+
+  body="$(function_body "$MANAGER_SCRIPT" wireguard_endpoint_candidates)"
+  assert_contains "$body" 'addresses.sort(key=lambda address: address.version)' \
+    'resolved endpoints must prefer IPv4 before falling back to IPv6' || return 1
+  assert_contains "$body" 'WG_ENDPOINT_RESOLVE_TIMEOUT' \
+    'endpoint DNS resolution must have a total deadline'
+}
+
+test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
+  source_without_main "$MANAGER_SCRIPT"
+  local mock_peer_key mock_current_endpoint mock_received set_calls curl_calls original candidates
+  mock_peer_key='BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB='
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG="${FIXTURE_DIR}/wireguard/valid.conf"
+  original="$(< "$WG_CONFIG")"
+  mock_current_endpoint=''
+  mock_received=0
+  set_calls=''
+  curl_calls=''
+  candidates=$'[2606:4700:d0::a29f:c001]:2408\n162.159.192.1:2408'
+  wg() {
+    case "$*" in
+      'show warp-vps-wg peers') printf '%s\n' "$mock_peer_key" ;;
+      'show warp-vps-wg transfer') printf '%s\t%s\t100\n' "$mock_peer_key" "$mock_received" ;;
+      "set warp-vps-wg peer $mock_peer_key endpoint "*)
+        mock_current_endpoint="${*: -1}"
+        set_calls="${set_calls}${mock_current_endpoint}"$'\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  curl() {
+    curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
+    [ "$mock_current_endpoint" = '162.159.192.1:2408' ] || return 28
+    case "$1" in
+      -4) mock_received=256 ;;
+      -6) mock_received=512 ;;
+    esac
+  }
+  wg_handshake_recent() { [ "$mock_current_endpoint" = '162.159.192.1:2408' ]; }
+  info_line() { :; }
+  ok_line() { :; }
+
+  select_working_wireguard_endpoint "$candidates" || {
+    fail 'preflight should fall back from a failed IPv6 transport to working IPv4'
+    return 1
+  }
+  assert_eq $'[2606:4700:d0::a29f:c001]:2408\n162.159.192.1:2408' \
+    "${set_calls%$'\n'}" \
+    'preflight must try the next resolved endpoint after a failed transport' || return 1
+  assert_contains "$curl_calls" '162.159.192.1:2408 -4' \
+    'the selected transport must carry Google IPv4' || return 1
+  assert_contains "$curl_calls" '162.159.192.1:2408 -6' \
+    'an IPv4 WireGuard transport must also prove tunneled Google IPv6' || return 1
+  assert_eq "$original" "$(< "$WG_CONFIG")" \
+    'a successful runtime endpoint must not be written into the hostname config' || return 1
+
+  mock_current_endpoint=''
+  mock_received=0
+  set_calls=''
+  curl_calls=''
+  candidates=$'162.159.192.1:2408\n[2606:4700:d0::a29f:c001]:2408'
+  curl() {
+    curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
+    [ "$mock_current_endpoint" = '[2606:4700:d0::a29f:c001]:2408' ] || return 28
+    case "$1" in
+      -4) mock_received=384 ;;
+      -6) mock_received=768 ;;
+    esac
+  }
+  wg_handshake_recent() { [ "$mock_current_endpoint" = '[2606:4700:d0::a29f:c001]:2408' ]; }
+  select_working_wireguard_endpoint "$candidates" || {
+    fail 'preflight should fall back from a failed IPv4 transport to working IPv6'
+    return 1
+  }
+  assert_eq $'162.159.192.1:2408\n[2606:4700:d0::a29f:c001]:2408' \
+    "${set_calls%$'\n'}" \
+    'IPv6 must remain available when the preferred IPv4 transport fails' || return 1
+
+  mock_current_endpoint=''
+  mock_received=0
+  candidates='162.159.192.1:2408'
+  curl() {
+    if [ "$1" = '-4' ]; then mock_received=512; return 0; fi
+    return 28
+  }
+  wg_handshake_recent() { return 0; }
+  if select_working_wireguard_endpoint "$candidates" >/dev/null; then
+    fail 'an endpoint with only tunneled IPv4 must not pass the dual-stack preflight'
+    return 1
+  fi
+}
+
+test_wireguard_endpoint_selection_requires_handshake_and_receive() {
+  source_without_main "$MANAGER_SCRIPT"
+  local mock_peer_key mock_received body candidates
+  mock_peer_key='BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB='
+  mock_received=0
+  WG_IFACE=warp-vps-wg
+  candidates='162.159.192.1:2408'
+  wg() {
+    case "$*" in
+      'show warp-vps-wg peers') printf '%s\n' "$mock_peer_key" ;;
+      'show warp-vps-wg transfer') printf '%s\t%s\t100\n' "$mock_peer_key" "$mock_received" ;;
+      "set warp-vps-wg peer $mock_peer_key endpoint 162.159.192.1:2408") return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  curl() {
+    case "$1" in
+      -4) mock_received=256 ;;
+      -6) mock_received=512 ;;
+    esac
+  }
+  wg_handshake_recent() { return 1; }
+  info_line() { :; }
+  ok_line() { :; }
+  if select_working_wireguard_endpoint "$candidates" >/dev/null; then
+    fail 'HTTP responses and received bytes must not replace a recent WireGuard handshake'
+    return 1
+  fi
+
+  mock_received=0
+  curl() { return 0; }
+  wg_handshake_recent() { return 0; }
+  if select_working_wireguard_endpoint "$candidates" >/dev/null; then
+    fail 'HTTP mocks and a handshake must not pass without increased WireGuard receive bytes'
+    return 1
+  fi
+
+  mock_received=0
+  curl() {
+    if [ "$1" = '-4' ]; then
+      mock_received=256
+    fi
+    return 0
+  }
+  if select_working_wireguard_endpoint "$candidates" >/dev/null; then
+    fail 'an IPv6 HTTP response must not pass without its own WireGuard receive increase'
+    return 1
+  fi
+
+  body="$(function_body "$MANAGER_SCRIPT" select_working_wireguard_endpoint)"
+  assert_contains "$body" 'curl -4 -sS' \
+    'an IPv4 HTTP response of any status must prove transport reachability' || return 1
+  assert_contains "$body" 'curl -6 -sS' \
+    'an IPv6 HTTP response of any status must prove transport reachability' || return 1
+  assert_contains "$body" "--noproxy '*'" \
+    'endpoint validation must bypass environment proxies' || return 1
+  assert_not_contains "$body" 'curl -4 -fsS' \
+    'HTTP policy errors must not be confused with an IPv4 transport failure' || return 1
+  assert_not_contains "$body" 'curl -6 -fsS' \
+    'HTTP policy errors must not be confused with an IPv6 transport failure'
+}
+
+test_start_rules_validates_wireguard_and_cleans_failures() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event_log output rc scope candidate
+  event_log="$(mktemp)"
+  candidate='162.159.192.1:2408'
+  WARP_MODE=wireguard
+  load_config() { :; }
+  wireguard_endpoint_candidates() {
+    printf 'resolve:%s\n' "$WARP_SCOPE" >> "$event_log"
+    printf '%s\n' "$candidate"
+  }
+  apply_rules() { printf 'apply:%s:%s\n' "$WARP_MODE" "$WARP_SCOPE" >> "$event_log"; }
+  select_working_wireguard_endpoint() {
+    printf 'select:%s:%s\n' "$WARP_SCOPE" "$1" >> "$event_log"
+    return 1
+  }
+  stop_wg_routes_strict() { printf 'cleanup:%s\n' "$WARP_SCOPE" >> "$event_log"; }
+  die() { printf '%s\n' "$1"; exit 1; }
+
+  for scope in google global; do
+    WARP_SCOPE="$scope"
+    : > "$event_log"
+    rc=0
+    output="$(start_rules 2>&1)" || rc=$?
+    [ "$rc" -ne 0 ] || {
+      fail "a failed $scope WireGuard data plane must fail route startup"
+      return 1
+    }
+    assert_eq "resolve:${scope}
+apply:wireguard:${scope}
+select:${scope}:${candidate}
+cleanup:${scope}" "$(< "$event_log")" \
+      "a failed $scope data plane must resolve before routing, validate, then clean" || return 1
+    assert_contains "$output" 'WireGuard 不会回退 TCP' \
+      'startup failure must explain the protocol boundary' || return 1
+    assert_contains "$output" 'warp-vps switch socks --socks-port auto' \
+      'startup failure must provide the supported alternative' || return 1
+  done
+
+  : > "$event_log"
+  select_working_wireguard_endpoint() {
+    printf 'select:%s:%s\n' "$WARP_SCOPE" "$1" >> "$event_log"
+    return 0
+  }
+  start_rules || return 1
+  assert_eq "resolve:global
+apply:wireguard:global
+select:global:${candidate}" "$(< "$event_log")" \
+    'a verified WireGuard startup must retain its applied routes' || return 1
+
+  : > "$event_log"
+  WARP_SCOPE=google
+  wireguard_endpoint_candidates() {
+    printf 'resolve:%s\n' "$WARP_SCOPE" >> "$event_log"
+    return 1
+  }
+  rc=0
+  output="$(start_rules 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'endpoint resolution failure must fail route startup'
+    return 1
+  }
+  assert_eq $'resolve:google\ncleanup:google' "$(< "$event_log")" \
+    'endpoint resolution failure must clean existing routes before any route write' || return 1
+
+  : > "$event_log"
+  WARP_MODE=socks
+  wireguard_endpoint_candidates() {
+    printf 'unexpected-resolve\n' >> "$event_log"
+    return 1
+  }
+  select_working_wireguard_endpoint() {
+    printf 'unexpected-probe\n' >> "$event_log"
+    return 1
+  }
+  start_rules || {
+    fail 'Socks route startup must not depend on WireGuard endpoint validation'
+    return 1
+  }
+  assert_eq 'apply:socks:google' "$(< "$event_log")" \
+    'Socks startup must apply only its existing local routing path'
+}
+
+test_wireguard_preflight_uses_start_rules_and_cleans_interface() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event_log output rc=0
+  event_log="$(mktemp)"
+  WARP_MODE=wireguard
+  WG_IFACE=warp-vps-wg
+  WG_CONFIG="${FIXTURE_DIR}/wireguard/valid.conf"
+  SELF_PATH=manager_mock
+  require_root() { :; }
+  load_config() { :; }
+  command() { if [ "${1:-}" = '-v' ]; then return 0; fi; builtin command "$@"; }
+  wg_interface_absent() { return 0; }
+  wg-quick() { printf 'wg-quick:%s\n' "$*" >> "$event_log"; }
+  manager_mock() { printf 'manager:%s\n' "$*" >> "$event_log"; return 1; }
+  remove_wireguard_interface() { printf 'cleanup-interface\n' >> "$event_log"; }
+  info_line() { :; }
+  ok_line() { :; }
+  die() { printf '%s\n' "$1"; exit 1; }
+
+  output="$(cmd_preflight_wireguard 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'a failed start-rules data plane must reject target preparation'
+    return 1
+  }
+  assert_contains "$(< "$event_log")" 'manager:start-rules' \
+    'installation preflight must use the same startup boundary as systemd' || return 1
+  assert_contains "$(< "$event_log")" 'cleanup-interface' \
+    'a failed real endpoint check must remove the temporary WireGuard interface' || return 1
+  assert_contains "$output" 'WireGuard 预检失败，未写入开机服务' \
+    'preflight must reject service installation after data-plane failure'
+}
+
+test_wireguard_start_rules_is_the_lifecycle_boundary() {
+  local systemd_body preflight_body start_body fail_body heal_body status_body quiet_body
+  local restart_body backend_restart_body reload_body installer_body resolve_line apply_line
+  systemd_body="$(function_body "$MANAGER_SCRIPT" install_systemd)"
+  preflight_body="$(function_body "$MANAGER_SCRIPT" cmd_preflight_wireguard)"
+  start_body="$(function_body "$MANAGER_SCRIPT" start_rules)"
+  fail_body="$(function_body "$MANAGER_SCRIPT" fail_wireguard_start)"
+  heal_body="$(function_body "$MANAGER_SCRIPT" cmd_heal)"
+  status_body="$(function_body "$MANAGER_SCRIPT" run_self_check)"
+  quiet_body="$(function_body "$MANAGER_SCRIPT" test_quiet)"
+  restart_body="$(function_body "$MANAGER_SCRIPT" cmd_restart)"
+  backend_restart_body="$(function_body "$MANAGER_SCRIPT" restart_wireguard_runtime)"
+  reload_body="$(function_body "$MANAGER_SCRIPT" reload_runtime_after_update)"
+  installer_body="$(function_body "$INSTALL_SCRIPT" main)"
+
+  assert_contains "$systemd_body" 'ExecStart=${BIN_PATH} start-rules' \
+    'boot, update, reinstall and restart must enter verified route startup' || return 1
+  assert_contains "$preflight_body" '"$SELF_PATH" start-rules' \
+    'installation preflight must enter the same verified route startup' || return 1
+  assert_contains "$restart_body" 'systemctl restart warp-vps.service' \
+    'an explicit restart must re-enter verified route startup' || return 1
+  assert_not_contains "$backend_restart_body" 'apply_rules' \
+    'WireGuard backend repair must not install routes before start-rules resolves candidates' \
+    || return 1
+  assert_contains "$reload_body" 'systemctl start warp-vps.service' \
+    'an update must re-enter verified route startup after installing the new unit' || return 1
+  assert_contains "$installer_body" 'enable_project_unit warp-vps.service' \
+    'reinstall must start the verified route unit even when reusing the interface' || return 1
+  assert_contains "$start_body" 'select_working_wireguard_endpoint' \
+    'WireGuard route startup must select a real working endpoint' || return 1
+  resolve_line="$(line_number "$start_body" 'candidates="$(wireguard_endpoint_candidates)"')"
+  apply_line="$(line_number "$start_body" 'apply_rules')"
+  [ -n "$resolve_line" ] && [ -n "$apply_line" ] && [ "$resolve_line" -lt "$apply_line" ] || {
+    fail 'WireGuard endpoint candidates must resolve before project routes can affect DNS'
+    return 1
+  }
+  assert_contains "$start_body" 'select_working_wireguard_endpoint "$candidates"' \
+    'startup must validate the frozen pre-route candidate list' || return 1
+  assert_contains "$fail_body" 'stop_wg_routes_strict' \
+    'failed endpoint selection must strictly remove project routes' || return 1
+  assert_contains "$heal_body" 'repair_rules=1' \
+    'a rebuilt WireGuard interface must restart the verified route service' || return 1
+  assert_not_contains "$status_body" 'select_working_wireguard_endpoint' \
+    'status must remain a local nonblocking report' || return 1
+  assert_not_contains "$quiet_body" 'select_working_wireguard_endpoint' \
+    'healthy timer checks must not run external endpoint validation'
 }
 
 test_wireguard_route_failures_cleanup() {
@@ -4105,9 +4475,9 @@ test_cmd_test_returns_only_local_status() {
   fi
 }
 
-test_external_probe_failures_do_not_block_local_operations() {
+test_status_and_healthy_timer_stay_local() {
   source_without_main "$MANAGER_SCRIPT"
-  local external_calls=0 handshake_calls=0 repair_calls=0 manager_calls=''
+  local external_calls=0 handshake_calls=0 repair_calls=0
 
   WARP_MODE=wireguard
   WARP_SCOPE=google
@@ -4141,36 +4511,6 @@ test_external_probe_failures_do_not_block_local_operations() {
   assert_eq '0' "$handshake_calls" \
     'status must not query or display a non-actionable handshake observation' || return 1
 
-  systemctl() { return 0; }
-  begin_runtime_maintenance() { :; }
-  finish_runtime_maintenance() { :; }
-  restart_wireguard_runtime() { return 0; }
-  run_self_check() { return 0; }
-  cmd_restart >/dev/null || {
-    fail 'restart must follow the healthy local result when external probes are unavailable'
-    return 1
-  }
-  assert_eq '0' "$external_calls" \
-    'restart must not call an external diagnostic' || return 1
-
-  manager_mock() {
-    manager_calls="${manager_calls}$1\n"
-    case "$1" in
-      install-systemd) return 0 ;;
-      status) return 1 ;;
-      *) return 1 ;;
-    esac
-  }
-  BIN_PATH=manager_mock
-  reload_runtime_after_update >/dev/null || {
-    fail 'successful update service actions must not depend on status output'
-    return 1
-  }
-  assert_not_contains "$manager_calls" 'status' \
-    'update reload must not call the diagnostic status command' || return 1
-  assert_not_contains "$manager_calls" 'test' \
-    'update reload must not call the external diagnostic command' || return 1
-
   required_runtime_units_ready() { return 0; }
   test_quiet() { return 0; }
   restart_wireguard_runtime() { repair_calls=$((repair_calls + 1)); return 0; }
@@ -4179,7 +4519,7 @@ test_external_probe_failures_do_not_block_local_operations() {
     return 1
   }
   assert_eq '0' "$external_calls" \
-    'health checks must not run external probes' || return 1
+    'a healthy timer check must not run external probes' || return 1
   assert_eq '0' "$repair_calls" \
     'external uncertainty must not trigger self-healing'
 }
@@ -4713,7 +5053,7 @@ test_update_reuses_healthy_backends() {
   assert_eq '0' "$restart_wg_calls" \
     'an update must not restart a healthy WireGuard interface' || return 1
   assert_not_contains "$systemctl_calls" 'restart wg-quick@warp-vps-wg.service' \
-    'a healthy WireGuard update must not re-resolve its Endpoint' || return 1
+    'an update must keep the healthy interface while route-service startup reselects its endpoint' || return 1
   assert_not_contains "$manager_calls" 'status' \
     'a healthy WireGuard update must not invoke diagnostic status' || return 1
 
@@ -4820,7 +5160,7 @@ test_restart_reuses_healthy_backends() {
   WG_IFACE=warp-vps-wg
   cmd_restart >/dev/null || return 1
   assert_eq '0' "$restart_wg_calls" \
-    'restart must not tear down a healthy WireGuard interface and re-resolve DNS' || return 1
+    'restart must keep a healthy WireGuard interface for runtime endpoint reselection' || return 1
   assert_not_contains "$systemctl_calls" 'restart wg-quick@warp-vps-wg.service' \
     'restart must preserve a healthy WireGuard backend' || return 1
 
@@ -6591,7 +6931,7 @@ test_main_executes_bidirectional_mode_switches() {
   assert_not_contains "$events" 'stop:wireguard' \
     'same-mode reinstall must not stop the healthy WireGuard backend' || return 1
   assert_not_contains "$events" 'manager:preflight-wireguard' \
-    'same-mode reinstall must not re-resolve the WireGuard endpoint' || return 1
+    'same-mode reinstall should defer endpoint reselection to route-service startup' || return 1
   assert_eq '1' "$prepare_calls" \
     'main should pass through the target preparation gate exactly once' || return 1
 
@@ -7547,6 +7887,12 @@ run_test 'iptables CLI is not an installation dependency' test_no_iptables_packa
 run_test 'WireGuard support uses a real runtime preflight' test_wireguard_uses_runtime_capability
 run_test 'wgcf fixed release atomically replaces old executables' test_wgcf_fixed_binary_replaces_old_copy_atomically
 run_test 'WireGuard generation recovers from partial state' test_wireguard_config_generation_is_retryable
+run_test 'WireGuard endpoint candidates preserve hostname config' test_wireguard_endpoint_candidates_preserve_hostname_config
+run_test 'WireGuard endpoint selection falls back and requires dual stack' test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack
+run_test 'WireGuard endpoint selection requires handshake and receive' test_wireguard_endpoint_selection_requires_handshake_and_receive
+run_test 'WireGuard route startup cleans failed data planes' test_start_rules_validates_wireguard_and_cleans_failures
+run_test 'WireGuard preflight uses verified route startup' test_wireguard_preflight_uses_start_rules_and_cleans_interface
+run_test 'WireGuard route startup is the lifecycle boundary' test_wireguard_start_rules_is_the_lifecycle_boundary
 run_test 'WireGuard route failures clean partial state' test_wireguard_route_failures_cleanup
 run_test 'WireGuard routes do not require native IPv6' test_wireguard_routes_work_without_native_ipv6
 run_test 'WireGuard route cleanup handles each IP family independently' test_wireguard_route_cleanup_is_dual_stack_independent
@@ -7584,7 +7930,7 @@ run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'status and test do not run unlock probes' test_status_and_test_do_not_run_unlock_checks
 run_test 'local runtime paths avoid external probes' test_local_runtime_paths_do_not_depend_on_external_probes
 run_test 'test exit status follows only local state' test_cmd_test_returns_only_local_status
-run_test 'external probe failures do not block local operations' test_external_probe_failures_do_not_block_local_operations
+run_test 'status and healthy timer checks remain local' test_status_and_healthy_timer_stay_local
 run_test 'HTTP probes accept error responses as reachable' test_http_probe_accepts_http_error_responses
 run_test 'install unlock check is post-success and nonblocking' test_install_unlock_check_is_post_success_and_nonblocking
 run_test 'old runtime restore does not call status' test_old_runtime_restore_does_not_call_status

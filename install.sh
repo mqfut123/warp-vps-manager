@@ -1695,10 +1695,10 @@ prepare_target_backend() {
       TARGET_CONFIG_PREPARED=1
     fi
     if [ "$INSTALL_RUNTIME_TOUCHED" -eq 0 ]; then
-      log "WireGuard 配置已准备完成；将在旧分流暂停后执行本地路由预检"
+      log "WireGuard 配置已准备完成；将在旧分流暂停后执行真实握手和双栈数据面预检"
       return 0
     fi
-    log "正在预检 WireGuard 网卡和本地路由"
+    log "正在预检 WireGuard 网卡、WARP 对端和双栈数据面"
     WARP_VPS_CONFIG_FILE="$TARGET_CONFIG_FILE" \
       WARP_VPS_RULES_DIR="$PROJECT_STAGE_DIR/rules" \
       "$PROJECT_STAGE_DIR/bin/warp-vps" preflight-wireguard || return 1
