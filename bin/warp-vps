@@ -769,6 +769,12 @@ if endpoint.startswith("["):
 else:
     host, port = endpoint.rsplit(":", 1)
 
+ports = [port]
+if host.rstrip(".").lower() == "engage.cloudflareclient.com":
+    for fallback_port in ("2408", "500", "1701", "4500"):
+        if fallback_port not in ports:
+            ports.append(fallback_port)
+
 try:
     literal = ipaddress.ip_address(host)
 except ValueError:
@@ -802,11 +808,12 @@ else:
 if not addresses:
     raise SystemExit("WireGuard WARP 对端没有可用的 IPv4 或 IPv6 地址")
 
-for address in addresses:
-    if address.version == 6:
-        print(f"[{address}]:{port}")
-    else:
-        print(f"{address}:{port}")
+for candidate_port in ports:
+    for address in addresses:
+        if address.version == 6:
+            print(f"[{address}]:{candidate_port}")
+        else:
+            print(f"{address}:{candidate_port}")
 PY
 }
 
@@ -836,6 +843,7 @@ select_working_wireguard_endpoint() {
     if ! curl -4 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
       --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
       https://www.google.com/generate_204; then
+      warn_line "该对端的隧道内 Google IPv4 未返回：${endpoint}"
       continue
     fi
     after4="$(wireguard_peer_received_bytes "$peer")" || continue
@@ -845,6 +853,7 @@ select_working_wireguard_endpoint() {
     if ! curl -6 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
       --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
       https://www.google.com/generate_204; then
+      warn_line "该对端的隧道内 Google IPv6 未返回：${endpoint}"
       continue
     fi
     after6="$(wireguard_peer_received_bytes "$peer")" || continue

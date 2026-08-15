@@ -2621,7 +2621,7 @@ import socket
 
 
 def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    if host != "endpoint.test":
+    if host not in ("engage.cloudflareclient.com", "endpoint.test"):
         raise OSError(f"unexpected host: {host}")
     return [
         (socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", ("2001:db8::10", port, 0, 0)),
@@ -2633,14 +2633,19 @@ def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 
 socket.getaddrinfo = fake_getaddrinfo
 PY
-  sed 's/engage\.cloudflareclient\.com/endpoint.test/' \
-    "${FIXTURE_DIR}/wireguard/valid.conf" > "$WG_CONFIG"
+  cp "${FIXTURE_DIR}/wireguard/valid.conf" "$WG_CONFIG"
   original="$(< "$WG_CONFIG")"
   output="$(PYTHONPATH="$root" wireguard_endpoint_candidates)" || return 1
-  assert_eq $'192.0.2.10:2408\n[2001:db8::10]:2408' "$output" \
-    'hostname resolution must deduplicate addresses and prefer IPv4 before IPv6' || return 1
+  assert_eq $'192.0.2.10:2408\n[2001:db8::10]:2408\n192.0.2.10:500\n[2001:db8::10]:500\n192.0.2.10:1701\n[2001:db8::10]:1701\n192.0.2.10:4500\n[2001:db8::10]:4500' "$output" \
+    'the managed WARP hostname must try its configured port before documented fallback ports' || return 1
   assert_eq "$original" "$(< "$WG_CONFIG")" \
     'hostname candidate discovery must not rewrite the WireGuard config' || return 1
+
+  sed 's/engage\.cloudflareclient\.com/endpoint.test/' \
+    "${FIXTURE_DIR}/wireguard/valid.conf" > "$WG_CONFIG"
+  output="$(PYTHONPATH="$root" wireguard_endpoint_candidates)" || return 1
+  assert_eq $'192.0.2.10:2408\n[2001:db8::10]:2408' "$output" \
+    'an unmanaged hostname must keep only its configured port' || return 1
 
   sed 's/engage\.cloudflareclient\.com/162.159.192.1/' \
     "${FIXTURE_DIR}/wireguard/valid.conf" > "$WG_CONFIG"
@@ -2660,6 +2665,8 @@ PY
   body="$(function_body "$MANAGER_SCRIPT" wireguard_endpoint_candidates)"
   assert_contains "$body" 'addresses.sort(key=lambda address: address.version)' \
     'resolved endpoints must prefer IPv4 before falling back to IPv6' || return 1
+  assert_contains "$body" '("2408", "500", "1701", "4500")' \
+    'the managed WARP hostname must include the documented WireGuard fallback ports' || return 1
   assert_contains "$body" 'WG_ENDPOINT_RESOLVE_TIMEOUT' \
     'endpoint DNS resolution must have a total deadline'
 }
@@ -2675,7 +2682,7 @@ test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
   mock_received=0
   set_calls=''
   curl_calls=''
-  candidates=$'[2606:4700:d0::a29f:c001]:2408\n162.159.192.1:2408'
+  candidates=$'162.159.192.1:2408\n162.159.192.1:500'
   wg() {
     case "$*" in
       'show warp-vps-wg peers') printf '%s\n' "$mock_peer_key" ;;
@@ -2689,26 +2696,27 @@ test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
   }
   curl() {
     curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
-    [ "$mock_current_endpoint" = '162.159.192.1:2408' ] || return 28
+    [ "$mock_current_endpoint" = '162.159.192.1:500' ] || return 28
     case "$1" in
       -4) mock_received=256 ;;
       -6) mock_received=512 ;;
     esac
   }
-  wg_handshake_recent() { [ "$mock_current_endpoint" = '162.159.192.1:2408' ]; }
+  wg_handshake_recent() { [ "$mock_current_endpoint" = '162.159.192.1:500' ]; }
   info_line() { :; }
   ok_line() { :; }
+  warn_line() { :; }
 
   select_working_wireguard_endpoint "$candidates" || {
-    fail 'preflight should fall back from a failed IPv6 transport to working IPv4'
+    fail 'preflight should fall back from the default WARP port to a working fallback port'
     return 1
   }
-  assert_eq $'[2606:4700:d0::a29f:c001]:2408\n162.159.192.1:2408' \
+  assert_eq $'162.159.192.1:2408\n162.159.192.1:500' \
     "${set_calls%$'\n'}" \
     'preflight must try the next resolved endpoint after a failed transport' || return 1
-  assert_contains "$curl_calls" '162.159.192.1:2408 -4' \
+  assert_contains "$curl_calls" '162.159.192.1:500 -4' \
     'the selected transport must carry Google IPv4' || return 1
-  assert_contains "$curl_calls" '162.159.192.1:2408 -6' \
+  assert_contains "$curl_calls" '162.159.192.1:500 -6' \
     'an IPv4 WireGuard transport must also prove tunneled Google IPv6' || return 1
   assert_eq "$original" "$(< "$WG_CONFIG")" \
     'a successful runtime endpoint must not be written into the hostname config' || return 1
@@ -2805,6 +2813,10 @@ test_wireguard_endpoint_selection_requires_handshake_and_receive() {
     'an IPv6 HTTP response of any status must prove transport reachability' || return 1
   assert_contains "$body" "--noproxy '*'" \
     'endpoint validation must bypass environment proxies' || return 1
+  assert_contains "$body" '隧道内 Google IPv4 未返回' \
+    'endpoint failures must identify the tunneled address family' || return 1
+  assert_contains "$body" '隧道内 Google IPv6 未返回' \
+    'endpoint failures must identify the tunneled address family' || return 1
   assert_not_contains "$body" 'curl -4 -fsS' \
     'HTTP policy errors must not be confused with an IPv4 transport failure' || return 1
   assert_not_contains "$body" 'curl -6 -fsS' \
