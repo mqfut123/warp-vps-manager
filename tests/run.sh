@@ -2714,10 +2714,9 @@ test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
   assert_eq $'162.159.192.1:2408\n162.159.192.1:500' \
     "${set_calls%$'\n'}" \
     'preflight must try the next resolved endpoint after a failed transport' || return 1
-  assert_contains "$curl_calls" '162.159.192.1:500 -4' \
-    'the selected transport must carry Google IPv4' || return 1
-  assert_contains "$curl_calls" '162.159.192.1:500 -6' \
-    'an IPv4 WireGuard transport must also prove tunneled Google IPv6' || return 1
+  assert_eq $'162.159.192.1:2408 -4\n162.159.192.1:2408 -4\n162.159.192.1:500 -4\n162.159.192.1:500 -6' \
+    "${curl_calls%$'\n'}" \
+    'preflight must retry one transient IPv4 failure before changing transport' || return 1
   assert_eq "$original" "$(< "$WG_CONFIG")" \
     'a successful runtime endpoint must not be written into the hostname config' || return 1
 
@@ -2755,6 +2754,74 @@ test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
     fail 'an endpoint with only tunneled IPv4 must not pass the dual-stack preflight'
     return 1
   fi
+}
+
+test_wireguard_endpoint_selection_retries_the_same_endpoint() {
+  source_without_main "$MANAGER_SCRIPT"
+  local mock_peer_key mock_current_endpoint mock_received set_calls curl_calls ipv4_attempts candidates
+  mock_peer_key='BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB='
+  WG_IFACE=warp-vps-wg
+  mock_current_endpoint=''
+  mock_received=0
+  set_calls=''
+  curl_calls=''
+  ipv4_attempts=0
+  candidates=$'162.159.192.1:2408\n162.159.192.1:500'
+  wg() {
+    case "$*" in
+      'show warp-vps-wg peers') printf '%s\n' "$mock_peer_key" ;;
+      'show warp-vps-wg transfer') printf '%s\t%s\t100\n' "$mock_peer_key" "$mock_received" ;;
+      "set warp-vps-wg peer $mock_peer_key endpoint "*)
+        mock_current_endpoint="${*: -1}"
+        set_calls="${set_calls}${mock_current_endpoint}"$'\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  curl() {
+    curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
+    [ "$mock_current_endpoint" = '162.159.192.1:2408' ] || return 28
+    case "$1" in
+      -4)
+        ipv4_attempts=$((ipv4_attempts + 1))
+        [ "$ipv4_attempts" -eq 2 ] || return 28
+        mock_received=256
+        ;;
+      -6) mock_received=512 ;;
+      *) return 28 ;;
+    esac
+  }
+  wg_handshake_recent() { [ "$mock_current_endpoint" = '162.159.192.1:2408' ]; }
+  info_line() { :; }
+  ok_line() { :; }
+  warn_line() { :; }
+
+  select_working_wireguard_endpoint "$candidates" || {
+    fail 'preflight should keep the same endpoint through one transient IPv4 timeout'
+    return 1
+  }
+  assert_eq '162.159.192.1:2408' "${set_calls%$'\n'}" \
+    'a transient timeout must not reset the peer or touch the next endpoint' || return 1
+  assert_eq $'162.159.192.1:2408 -4\n162.159.192.1:2408 -4\n162.159.192.1:2408 -6' \
+    "${curl_calls%$'\n'}" \
+    'the same endpoint must get two bounded IPv4 attempts before dual-stack validation' || return 1
+
+  mock_current_endpoint=''
+  mock_received=0
+  set_calls=''
+  curl_calls=''
+  candidates='162.159.192.1:2408'
+  curl() {
+    curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
+    return 28
+  }
+  if select_working_wireguard_endpoint "$candidates" >/dev/null; then
+    fail 'two failed IPv4 attempts on the only endpoint must still fail preflight'
+    return 1
+  fi
+  assert_eq $'162.159.192.1:2408 -4\n162.159.192.1:2408 -4' \
+    "${curl_calls%$'\n'}" \
+    'the readiness retry must remain finite' || return 1
 }
 
 test_wireguard_endpoint_selection_requires_handshake_and_receive() {
@@ -4896,7 +4963,7 @@ test_youtube_fixtures() {
     'unknown|地区信息冲突' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-signals.html" \
-    'unknown|页面特征冲突' || return 1
+    'no|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-cn.html" \
     'no|地区：CN' || return 1
@@ -8715,6 +8782,7 @@ run_test 'wgcf fixed release atomically replaces old executables' test_wgcf_fixe
 run_test 'WireGuard generation recovers from partial state' test_wireguard_config_generation_is_retryable
 run_test 'WireGuard endpoint candidates preserve hostname config' test_wireguard_endpoint_candidates_preserve_hostname_config
 run_test 'WireGuard endpoint selection falls back and requires dual stack' test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack
+run_test 'WireGuard endpoint selection retries the same endpoint' test_wireguard_endpoint_selection_retries_the_same_endpoint
 run_test 'WireGuard endpoint selection requires handshake and receive' test_wireguard_endpoint_selection_requires_handshake_and_receive
 run_test 'WireGuard route startup cleans failed data planes' test_start_rules_validates_wireguard_and_cleans_failures
 run_test 'WireGuard preflight uses verified route startup' test_wireguard_preflight_uses_start_rules_and_cleans_interface

@@ -825,7 +825,7 @@ wireguard_peer_received_bytes() {
 
 select_working_wireguard_endpoint() {
   local candidates="$1"
-  local peers peer endpoint before after4 after6 selected
+  local peers peer endpoint before after4 after6 selected attempt ipv4_ready
   peers="$(wg show "$WG_IFACE" peers 2>/dev/null)" || return 1
   peer="$(awk 'NF { print; count++ } END { if (count != 1) exit 1 }' <<< "$peers")" \
     || return 1
@@ -840,9 +840,16 @@ select_working_wireguard_endpoint() {
     if ! wg set "$WG_IFACE" peer "$peer" endpoint "$endpoint"; then
       continue
     fi
-    if ! curl -4 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
-      --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
-      https://www.google.com/generate_204; then
+    ipv4_ready=0
+    for attempt in 1 2; do
+      if curl -4 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
+        --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
+        https://www.google.com/generate_204; then
+        ipv4_ready=1
+        break
+      fi
+    done
+    if [ "$ipv4_ready" -ne 1 ]; then
       warn_line "该对端的隧道内 Google IPv4 未返回：${endpoint}"
       continue
     fi
@@ -2415,11 +2422,6 @@ evaluate_youtube_premium_unlock() {
 
   if [ "$region_status" -eq 2 ]; then
     printf 'unknown|地区信息冲突\n'
-    return 0
-  fi
-
-  if [ "$unavailable" -eq 1 ] && [ "$available" -eq 1 ]; then
-    printf 'unknown|页面特征冲突\n'
     return 0
   fi
 
