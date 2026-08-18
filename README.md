@@ -90,7 +90,7 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 `native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
 
-`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 受限时同时显示可解析的位置；YouTube Premium 的地区或页面特征互相冲突时显示无法确认，明确不可用但缺少地区时显示地区未知。
+`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 只按首页明确的可用性 marker 判断，同页唯一的三字母地区仅用于展示，不参与可用性结论；marker 缺失或冲突时显示无法确认。YouTube Premium 的地区或页面特征互相冲突时显示无法确认，明确不可用但缺少地区时显示地区未知。
 
 ## 卸载
 

@@ -2260,14 +2260,6 @@ curl_unlock_page() {
     "$url" 2>/dev/null || true
 }
 
-curl_gemini_location() {
-  curl -4 -fsSL --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
-    -A "$UNLOCK_TEST_UA" \
-    -H 'accept-language: en-US' \
-    --data-raw 'f.req=[[["K4WWud","[[0],[\"en-US\"]]",null,"generic"]]]' \
-    'https://gemini.google.com/_/BardChatUi/data/batchexecute' 2>/dev/null || true
-}
-
 extract_youtube_region() {
   local body="$1"
   python3 -c '
@@ -2291,108 +2283,73 @@ raise SystemExit(1)
 ' <<< "$body"
 }
 
-parse_gemini_location() {
-  local response="$1"
-  [ -n "$response" ] || return 1
+extract_gemini_region() {
+  local body="$1"
   python3 -c '
-import json
+import re
 import sys
 
-raw = sys.stdin.read()
-start = raw.find("[")
-if start < 0:
-    raise SystemExit(1)
-try:
-    outer, _ = json.JSONDecoder().raw_decode(raw[start:])
-except (json.JSONDecodeError, TypeError):
-    raise SystemExit(1)
-if not isinstance(outer, list):
-    raise SystemExit(1)
-for row in outer:
-    if not isinstance(row, list) or len(row) < 3:
-        continue
-    if row[0] != "wrb.fr" or row[1] != "K4WWud" or not isinstance(row[2], str):
-        continue
-    try:
-        inner = json.loads(row[2])
-    except (json.JSONDecodeError, IndexError, TypeError):
-        raise SystemExit(1)
-    if not isinstance(inner, list) or not inner or not isinstance(inner[0], list) or not inner[0]:
-        raise SystemExit(1)
-    location = inner[0][0]
-    if not isinstance(location, str):
-        raise SystemExit(1)
-    location = location.strip()
-    if len(location) < 3 or len(location) > 160 or "|" in location or any(ord(ch) < 32 for ch in location):
-        raise SystemExit(1)
-    print(location)
+body = sys.stdin.read()
+values = []
+for value in re.findall(r",2,1,200,\"([A-Z]{3})\"", body):
+    if value not in values:
+        values.append(value)
+if len(values) == 1:
+    print(values[0])
     raise SystemExit(0)
+if len(values) > 1:
+    raise SystemExit(2)
 raise SystemExit(1)
-' <<< "$response"
-}
-
-mainland_china_location() {
-  local location
-  location="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$location" in
-    *hong\ kong*|*macao*|*macau*|*taiwan*) return 1 ;;
-    china|*,\ china|*mainland\ china*|*people\'s\ republic\ of\ china*|prc|*,\ prc|*中国大陆*|中国) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-gemini_page_normal() {
-  local body="$1"
-  grep -Fq '<base href="https://gemini.google.com/">' <<< "$body" \
-    && grep -Eq 'BardChatUi|property="og:site_name" content="Gemini"' <<< "$body"
+' <<< "$body"
 }
 
 evaluate_gemini_unlock() {
   local body="$1"
-  local location_response="$2"
-  local location
-  local restricted=0
+  local region=""
+  local available=0
+  local unavailable=0
 
-  if grep -Eiq "gemini (is not|isn.t)( currently)? available in your (country|region)|not( currently)? available in your (country|region)|unavailable in your (country|region)" <<< "$body"; then
-    restricted=1
+  if [ -z "$body" ]; then
+    printf 'unknown|网络连接失败\n'
+    return 0
   fi
-  location="$(parse_gemini_location "$location_response" 2>/dev/null || true)"
-  if [ "$restricted" -eq 1 ] && gemini_page_normal "$body"; then
+
+  if grep -Fq '45631641,null,true' <<< "$body"; then
+    available=1
+  fi
+  if grep -Fq '45631641,null,false' <<< "$body"; then
+    unavailable=1
+  fi
+
+  if [ "$available" -eq 1 ] && [ "$unavailable" -eq 1 ]; then
     printf 'unknown|页面特征冲突\n'
     return 0
   fi
-  if [ "$restricted" -eq 1 ]; then
-    if [ -n "$location" ]; then
-      printf 'no|位置：%s；当前出口地区受限\n' "$location"
-    else
-      printf 'no|当前出口地区受限；位置未知\n'
-    fi
-    return 0
-  fi
-  if [ -z "$body" ] || [ -z "$location_response" ]; then
-    printf 'unknown|请求失败或未返回完整响应\n'
-    return 0
-  fi
-  if [ -z "$location" ]; then
-    printf 'unknown|位置响应无法解析\n'
-    return 0
-  fi
-  if mainland_china_location "$location"; then
-    printf 'no|位置：%s；个人版不可用，Workspace 账号例外\n' "$location"
-    return 0
-  fi
-  if ! gemini_page_normal "$body"; then
+  if [ "$available" -eq 0 ] && [ "$unavailable" -eq 0 ]; then
     printf 'unknown|页面特征不明确\n'
     return 0
   fi
-  printf 'yes|位置：%s\n' "$location"
+
+  region="$(extract_gemini_region "$body" 2>/dev/null || true)"
+  if [ "$available" -eq 1 ]; then
+    if [ -n "$region" ]; then
+      printf 'yes|地区：%s\n' "$region"
+    else
+      printf 'yes|\n'
+    fi
+    return 0
+  fi
+  if [ -n "$region" ]; then
+    printf 'no|地区：%s\n' "$region"
+  else
+    printf 'no|\n'
+  fi
 }
 
 probe_gemini_unlock() {
-  local body location_response
+  local body
   body="$(curl_unlock_page "https://gemini.google.com/")"
-  location_response="$(curl_gemini_location)"
-  evaluate_gemini_unlock "$body" "$location_response"
+  evaluate_gemini_unlock "$body"
 }
 
 evaluate_youtube_premium_unlock() {
@@ -2458,12 +2415,9 @@ probe_youtube_premium_unlock() {
 }
 
 probe_native_gemini_unlock() {
-  local body location_response
+  local body
   body="$(native_https_request GET "https://gemini.google.com/" || true)"
-  location_response="$(native_https_request POST \
-    "https://gemini.google.com/_/BardChatUi/data/batchexecute" \
-    'f.req=[[["K4WWud","[[0],[\"en-US\"]]",null,"generic"]]]' || true)"
-  evaluate_gemini_unlock "$body" "$location_response"
+  evaluate_gemini_unlock "$body"
 }
 
 probe_native_youtube_premium_unlock() {

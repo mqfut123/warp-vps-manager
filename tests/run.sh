@@ -4877,12 +4877,11 @@ test_noninteractive_swap_choices_and_failure_are_bounded() {
 
 evaluate_gemini_fixture() {
   local homepage_fixture="$1"
-  local rpc_fixture="$2"
-  local expected="$3"
+  local expected="$2"
   local actual
 
-  actual="$(evaluate_gemini_unlock "$(cat "$homepage_fixture")" "$(cat "$rpc_fixture")")"
-  assert_eq "$expected" "$actual" "Gemini fixtures $(basename "$homepage_fixture") / $(basename "$rpc_fixture")"
+  actual="$(evaluate_gemini_unlock "$(cat "$homepage_fixture")")"
+  assert_eq "$expected" "$actual" "Gemini fixture $(basename "$homepage_fixture")"
 }
 
 test_gemini_fixtures() {
@@ -4894,40 +4893,67 @@ test_gemini_fixtures() {
 
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/available.html" \
-    "${FIXTURE_DIR}/gemini/available-k4wwud.txt" \
-    'yes|位置：North York, ON, Canada' || return 1
+    'yes|地区：USA' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/china.html" \
-    "${FIXTURE_DIR}/gemini/china-k4wwud.txt" \
-    'no|位置：Beijing, Beijing, China；个人版不可用，Workspace 账号例外' || return 1
+    'yes|地区：CHN' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/unavailable.html" \
-    "${FIXTURE_DIR}/gemini/unavailable-k4wwud.txt" \
-    'no|位置：North York, ON, Canada；当前出口地区受限' || return 1
+    'no|地区：CHN' || return 1
   evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/unknown.html" \
-    "${FIXTURE_DIR}/gemini/unknown-k4wwud.txt" \
-    'unknown|位置响应无法解析' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/available.html" \
-    "${FIXTURE_DIR}/gemini/empty-k4wwud.txt" \
-    'unknown|请求失败或未返回完整响应' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/generic.html" \
-    "${FIXTURE_DIR}/gemini/available-k4wwud.txt" \
-    'unknown|页面特征不明确' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/available.html" \
-    "${FIXTURE_DIR}/gemini/malformed-inner-k4wwud.txt" \
-    'unknown|位置响应无法解析' || return 1
+    "${FIXTURE_DIR}/gemini/available-no-region.html" \
+    'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/old-false-marker.html" \
-    "${FIXTURE_DIR}/gemini/available-k4wwud.txt" \
+    'no|' || return 1
+  evaluate_gemini_fixture \
+    "${FIXTURE_DIR}/gemini/available-duplicate-region.html" \
+    'yes|地区：USA' || return 1
+  evaluate_gemini_fixture \
+    "${FIXTURE_DIR}/gemini/available-conflicting-region.html" \
+    'yes|' || return 1
+  evaluate_gemini_fixture \
+    "${FIXTURE_DIR}/gemini/unknown.html" \
+    'unknown|页面特征不明确' || return 1
+  evaluate_gemini_fixture \
+    "${FIXTURE_DIR}/gemini/generic.html" \
     'unknown|页面特征不明确' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/conflicting.html" \
-    "${FIXTURE_DIR}/gemini/available-k4wwud.txt" \
-    'unknown|页面特征冲突'
+    'unknown|页面特征冲突' || return 1
+  assert_eq \
+    'unknown|网络连接失败' \
+    "$(evaluate_gemini_unlock '')" \
+    'empty Gemini response must remain unknown'
+}
+
+test_gemini_probes_use_one_homepage_request() {
+  source_without_main "$MANAGER_SCRIPT"
+  local request_log output calls
+  request_log="$(mktemp)"
+
+  curl_unlock_page() {
+    printf '%s\n' "$*" >> "$request_log"
+    cat "${FIXTURE_DIR}/gemini/available.html"
+  }
+  output="$(probe_gemini_unlock)"
+  calls="$(< "$request_log")"
+  assert_eq 'yes|地区：USA' "$output" \
+    'the ordinary Gemini probe must evaluate the homepage marker' || return 1
+  assert_eq 'https://gemini.google.com/' "$calls" \
+    'the ordinary Gemini probe must request only the homepage' || return 1
+
+  : > "$request_log"
+  native_https_request() {
+    printf '%s\n' "$*" >> "$request_log"
+    cat "${FIXTURE_DIR}/gemini/available.html"
+  }
+  output="$(probe_native_gemini_unlock)"
+  calls="$(< "$request_log")"
+  assert_eq 'yes|地区：USA' "$output" \
+    'the native Gemini probe must evaluate the homepage marker' || return 1
+  assert_eq 'GET https://gemini.google.com/' "$calls" \
+    'the native Gemini probe must request only the homepage'
 }
 
 evaluate_youtube_fixture() {
@@ -5053,9 +5079,6 @@ test_native_unlock_trace_behavior() {
           on|plus) printf 'ip=203.0.113.8\nloc=US\nwarp=%s\n' "$trace_state" ;;
         esac
         ;;
-      *BardChatUi/data/batchexecute*|*K4WWud*)
-        cat "${FIXTURE_DIR}/gemini/available-k4wwud.txt"
-        ;;
       *gemini.google.com*)
         cat "${FIXTURE_DIR}/gemini/available.html"
         ;;
@@ -5073,10 +5096,15 @@ test_native_unlock_trace_behavior() {
   calls="$(< "$request_log")"
   assert_contains "$output" '203.0.113.8' 'native trace output must show the observed public IP' || return 1
   assert_contains "$output" 'US' 'native trace output must show the observed Cloudflare region' || return 1
-  assert_contains "$output" 'Gemini：可用' 'native Gemini output must reuse the existing parser' || return 1
+  assert_contains "$output" 'Gemini：可用（地区：USA）' \
+    'native Gemini output must reuse the homepage marker parser' || return 1
   assert_contains "$output" 'YouTube Premium：不可用（地区：US）' \
     'native YouTube output must reuse the existing parser and parsed region' || return 1
   assert_contains "$calls" 'gemini.google.com' 'the native check must request Gemini through the native transport' || return 1
+  assert_eq '1' "$(grep -Fc 'gemini.google.com' <<< "$calls")" \
+    'the native check must request the Gemini homepage once' || return 1
+  assert_not_contains "$calls" 'K4WWud' \
+    'the native check must not request the Gemini location RPC' || return 1
   assert_contains "$calls" 'youtube.com/premium' 'the native check must request YouTube through the native transport' || return 1
 
   : > "$request_log"
@@ -8822,6 +8850,7 @@ run_test 'custom Swap uses decimal input and releases failed allocation' test_cu
 run_test 'Swap rollback preserves unknown state and reverifies cleanup' test_swap_state_reader_and_rollback_failure_contract
 run_test 'noninteractive Swap choices and failures are bounded' test_noninteractive_swap_choices_and_failure_are_bounded
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
+run_test 'Gemini probes request only the homepage' test_gemini_probes_use_one_homepage_request
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'native egress selection prefers the first IPv4 and supports IPv6-only hosts' test_native_egress_selection
 run_test 'native unlock trace failures remain advisory except for confirmed WARP paths' test_native_unlock_trace_behavior
