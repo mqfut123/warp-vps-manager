@@ -2322,7 +2322,30 @@ disarm_socks_rotation_recovery() {
   SOCKS_ROTATION_RECOVERY_ARMED=0
 }
 
+pause_socks_rotation_rules() {
+  if [ "${WARP_SCOPE:-google}" != "global" ]; then
+    return 0
+  fi
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  if socks_table_absent; then
+    return 0
+  fi
+  return 1
+}
+
+resume_socks_rotation_rules() {
+  if [ "${WARP_SCOPE:-google}" != "global" ]; then
+    return 0
+  fi
+  systemctl start warp-vps.service >/dev/null 2>&1 || true
+  if service_active warp-vps.service && table_exists; then
+    return 0
+  fi
+  return 1
+}
+
 recover_socks_rotation() {
+  pause_socks_rotation_rules || return 1
   inspect_warp_registration
   if [ "$WARP_REGISTRATION_STATE" = "missing" ]; then
     create_warp_registration || return 1
@@ -2330,7 +2353,15 @@ recover_socks_rotation() {
     return 1
   fi
   configure_warp_runtime strict || return 1
-  wait_for_socks_rotation_runtime 60
+  if ! resume_socks_rotation_rules; then
+    pause_socks_rotation_rules || true
+    return 1
+  fi
+  if wait_for_socks_rotation_runtime 60; then
+    return 0
+  fi
+  pause_socks_rotation_rules || true
+  return 1
 }
 
 fail_socks_rotation_with_recovery() {
@@ -2343,6 +2374,11 @@ fail_socks_rotation_with_recovery() {
 
 rotate_socks_registration() {
   SOCKS_ROTATION_RECOVERY_ARMED=1
+  pause_socks_rotation_rules || {
+    warn "无法暂停 Socks5 全局分流规则，未更换注册"
+    fail_socks_rotation_with_recovery
+    return
+  }
   delete_warp_registration || {
     print_warp_diagnostics
     fail_socks_rotation_with_recovery
@@ -2354,6 +2390,11 @@ rotate_socks_registration() {
     return
   }
   configure_warp_runtime strict || {
+    fail_socks_rotation_with_recovery
+    return
+  }
+  resume_socks_rotation_rules || {
+    warn "更换注册后 Socks5 全局分流规则未恢复"
     fail_socks_rotation_with_recovery
     return
   }

@@ -3061,6 +3061,7 @@ test_exit_trap_success_helpers_do_not_inherit_signal_status() {
   rc=0
   MANAGER_SCRIPT="$MANAGER_SCRIPT" EVENT="$event" /bin/bash -c '
     source "$MANAGER_SCRIPT"
+    WARP_SCOPE=google
     inspection_count=0
 
     inspect_warp_registration() {
@@ -4995,6 +4996,7 @@ test_socks_rotation_orders_registration_configuration_and_data_plane() {
   source_without_main "$MANAGER_SCRIPT"
   local event rc=0
   event="$(mktemp)"
+  WARP_SCOPE=google
   WARP_SOCKS_PORT=24567
 
   delete_warp_registration() { printf 'delete\n' >> "$event"; }
@@ -5033,10 +5035,178 @@ test_socks_rotation_orders_registration_configuration_and_data_plane() {
     'failed immediate recovery must leave the exit-time recovery hook armed'
 }
 
+test_socks_global_rotation_quiesces_and_restores_rules() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event table_checks=0
+  event="$(mktemp)"
+  WARP_SCOPE=global
+  WARP_SOCKS_PORT=24567
+
+  systemctl() {
+    printf 'systemctl:%s:armed:%s\n' "$*" "$SOCKS_ROTATION_RECOVERY_ARMED" >> "$event"
+  }
+  service_active() { printf 'service:active:%s\n' "$1" >> "$event"; }
+  socks_table_absent() { printf 'rules:absent\n' >> "$event"; }
+  delete_warp_registration() { printf 'delete\n' >> "$event"; }
+  create_warp_registration() { printf 'create\n' >> "$event"; }
+  configure_warp_runtime() { printf 'configure:%s:%s\n' "${1:-}" "$WARP_SOCKS_PORT" >> "$event"; }
+  redsocks_local_ready() { printf 'redsocks\n' >> "$event"; }
+  table_exists() {
+    table_checks=$((table_checks + 1))
+    printf 'rules:present:%s\n' "$table_checks" >> "$event"
+  }
+  socks_ok() { printf 'trace\n' >> "$event"; }
+  socks_forwarding_ok() { printf 'forwarding\n' >> "$event"; }
+
+  rotate_socks_registration || {
+    fail 'a global Socks rotation should restore routing before its complete data-plane check'
+    return 1
+  }
+  assert_eq \
+    $'systemctl:stop warp-vps.service:armed:1\nrules:absent\ndelete\ncreate\nconfigure:strict:24567\nsystemctl:start warp-vps.service:armed:1\nservice:active:warp-vps.service\nrules:present:1\nredsocks\nrules:present:2\ntrace\nforwarding' \
+    "$(< "$event")" \
+    'global rotation must quiesce routing before registration and restore it before the full data plane' || return 1
+  assert_eq '0' "$SOCKS_ROTATION_RECOVERY_ARMED" \
+    'a successful global Socks rotation must disarm exit recovery'
+}
+
+test_socks_global_rotation_rule_failures_recover_before_returning() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event phase=stop rc=0
+  event="$(mktemp)"
+  WARP_SCOPE=global
+  WARP_SOCKS_PORT=24567
+
+  systemctl() { printf 'systemctl:%s\n' "$*" >> "$event"; }
+  socks_table_absent() { printf 'rules:absent:%s\n' "$phase" >> "$event"; return 1; }
+  delete_warp_registration() { printf 'delete\n' >> "$event"; }
+  create_warp_registration() { printf 'create\n' >> "$event"; }
+  configure_warp_runtime() { printf 'configure:%s\n' "${1:-}" >> "$event"; }
+  service_active() { printf 'service:active:%s\n' "$1" >> "$event"; }
+  table_exists() { printf 'rules:present:%s\n' "$phase" >> "$event"; return 1; }
+  wait_for_socks_rotation_runtime() { printf 'wait\n' >> "$event"; }
+  recover_socks_rotation() { printf 'recover\n' >> "$event"; return 0; }
+
+  rotate_socks_registration >/dev/null 2>&1 || rc=$?
+  assert_eq '1' "$rc" \
+    'failure to confirm global routing removal must return only after immediate recovery' || return 1
+  assert_eq $'systemctl:stop warp-vps.service\nrules:absent:stop\nrecover' "$(< "$event")" \
+    'global routing removal must be confirmed before registration deletion' || return 1
+  assert_eq '0' "$SOCKS_ROTATION_RECOVERY_ARMED" \
+    'successful recovery after a routing-removal failure must disarm exit recovery' || return 1
+
+  source_without_main "$MANAGER_SCRIPT"
+  : > "$event"
+  phase=start
+  rc=0
+  WARP_SCOPE=global
+  WARP_SOCKS_PORT=24567
+  systemctl() { printf 'systemctl:%s\n' "$*" >> "$event"; }
+  socks_table_absent() { printf 'rules:absent:%s\n' "$phase" >> "$event"; }
+  delete_warp_registration() { printf 'delete\n' >> "$event"; }
+  create_warp_registration() { printf 'create\n' >> "$event"; }
+  configure_warp_runtime() { printf 'configure:%s\n' "${1:-}" >> "$event"; }
+  service_active() { printf 'service:active:%s\n' "$1" >> "$event"; }
+  table_exists() { printf 'rules:present:%s\n' "$phase" >> "$event"; return 1; }
+  wait_for_socks_rotation_runtime() { printf 'wait\n' >> "$event"; }
+  recover_socks_rotation() { printf 'recover\n' >> "$event"; return 0; }
+
+  rotate_socks_registration >/dev/null 2>&1 || rc=$?
+  assert_eq '1' "$rc" \
+    'failure to confirm restored global routing must return only after immediate recovery' || return 1
+  assert_eq \
+    $'systemctl:stop warp-vps.service\nrules:absent:start\ndelete\ncreate\nconfigure:strict\nsystemctl:start warp-vps.service\nservice:active:warp-vps.service\nrules:present:start\nrecover' \
+    "$(< "$event")" \
+    'global routing restoration must be confirmed before the runtime wait' || return 1
+  assert_eq '0' "$SOCKS_ROTATION_RECOVERY_ARMED" \
+    'successful recovery after a routing-restore failure must disarm exit recovery'
+}
+
+test_socks_global_rotation_signal_reaches_rule_recovery() {
+  local event rc=0
+  event="$(mktemp)"
+
+  MANAGER_SCRIPT="$MANAGER_SCRIPT" EVENT="$event" /bin/bash -c '
+    source "$MANAGER_SCRIPT"
+    WARP_SCOPE=global
+    WARP_SOCKS_PORT=24567
+    stop_calls=0
+
+    cleanup_wireguard_rotation_live_temps() { :; }
+    uninstall_unit_is_active() { return 1; }
+    inspect_warp_registration() {
+      WARP_REGISTRATION_STATE=present
+      printf "inspect:present\n" >> "$EVENT"
+    }
+    configure_warp_runtime() { printf "configure:%s\n" "${1:-}" >> "$EVENT"; }
+    socks_table_absent() { printf "rules:absent\n" >> "$EVENT"; }
+    service_active() { printf "service:active:%s\n" "$1" >> "$EVENT"; }
+    table_exists() { printf "rules:present\n" >> "$EVENT"; }
+    wait_for_socks_rotation_runtime() { printf "wait\n" >> "$EVENT"; }
+    delete_warp_registration() { printf "unexpected-delete\n" >> "$EVENT"; }
+    disarm_socks_rotation_recovery() {
+      SOCKS_ROTATION_RECOVERY_ARMED=0
+      printf "disarm\n" >> "$EVENT"
+    }
+    systemctl() {
+      case "$*" in
+        "stop warp-vps.service")
+          stop_calls=$((stop_calls + 1))
+          printf "rules:stop:%s:armed:%s\n" "$stop_calls" "$SOCKS_ROTATION_RECOVERY_ARMED" >> "$EVENT"
+          if [ "$stop_calls" -eq 1 ]; then
+            kill -TERM "$$"
+          fi
+          ;;
+        "start warp-vps.service") printf "rules:start\n" >> "$EVENT" ;;
+        *) return 0 ;;
+      esac
+    }
+
+    begin_runtime_maintenance
+    rotate_socks_registration
+    printf "unexpected-return\n" >> "$EVENT"
+  ' >/dev/null 2>&1 || rc=$?
+
+  assert_eq '143' "$rc" \
+    'TERM after global routing stops must preserve the signal status after recovery' || return 1
+  assert_eq \
+    $'rules:stop:1:armed:1\nrules:stop:2:armed:1\nrules:absent\ninspect:present\nconfigure:strict\nrules:start\nservice:active:warp-vps.service\nrules:present\nwait\ndisarm' \
+    "$(< "$event")" \
+    'global routing must be recoverable by the EXIT trap before registration deletion'
+}
+
+test_socks_global_recovery_requiesces_rules_after_wait_failure() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event rc=0
+  event="$(mktemp)"
+  WARP_SCOPE=global
+  WARP_SOCKS_PORT=24567
+
+  systemctl() { printf 'systemctl:%s\n' "$*" >> "$event"; }
+  socks_table_absent() { printf 'rules:absent\n' >> "$event"; }
+  inspect_warp_registration() {
+    WARP_REGISTRATION_STATE=present
+    printf 'inspect:present\n' >> "$event"
+  }
+  configure_warp_runtime() { printf 'configure:%s\n' "${1:-}" >> "$event"; }
+  service_active() { printf 'service:active:%s\n' "$1" >> "$event"; }
+  table_exists() { printf 'rules:present\n' >> "$event"; }
+  wait_for_socks_rotation_runtime() { printf 'wait\n' >> "$event"; return 1; }
+
+  recover_socks_rotation || rc=$?
+  assert_eq '1' "$rc" \
+    'failed recovered data-plane convergence must fail Socks recovery' || return 1
+  assert_eq \
+    $'systemctl:stop warp-vps.service\nrules:absent\ninspect:present\nconfigure:strict\nsystemctl:start warp-vps.service\nservice:active:warp-vps.service\nrules:present\nwait\nsystemctl:stop warp-vps.service\nrules:absent' \
+    "$(< "$event")" \
+    'failed recovery convergence must remove global interception again before returning'
+}
+
 test_socks_rotation_waits_for_runtime_convergence() {
   source_without_main "$MANAGER_SCRIPT"
   local event forwarding_checks=0 recover_calls=0
   event="$(mktemp)"
+  WARP_SCOPE=google
   WARP_SOCKS_PORT=24567
 
   delete_warp_registration() { printf 'delete\n' >> "$event"; }
@@ -5078,6 +5248,7 @@ test_socks_rotation_waits_for_runtime_convergence() {
   source_without_main "$MANAGER_SCRIPT"
   : > "$event"
   forwarding_checks=0
+  WARP_SCOPE=google
   WARP_SOCKS_PORT=24567
   inspect_warp_registration() {
     WARP_REGISTRATION_STATE=present
@@ -10194,6 +10365,10 @@ run_test 'WARP readiness wins over intermediate command exit codes' test_warp_co
 run_test 'strict WARP configuration stops before connect' test_strict_warp_configuration_stops_before_connect
 run_test 'Socks change-ip requires an explicit Free registration' test_socks_change_ip_requires_an_explicit_free_registration
 run_test 'Socks rotation orders configuration and data-plane gates' test_socks_rotation_orders_registration_configuration_and_data_plane
+run_test 'Socks global rotation quiesces and restores routing' test_socks_global_rotation_quiesces_and_restores_rules
+run_test 'Socks global rotation rule failures recover before returning' test_socks_global_rotation_rule_failures_recover_before_returning
+run_test 'Socks global rotation signals reach rule recovery' test_socks_global_rotation_signal_reaches_rule_recovery
+run_test 'Socks global recovery requiesces routing after wait failure' test_socks_global_recovery_requiesces_rules_after_wait_failure
 run_test 'Socks rotation waits for runtime convergence' test_socks_rotation_waits_for_runtime_convergence
 run_test 'Socks runtime wait is bounded and reports once' test_socks_rotation_runtime_wait_is_bounded_and_reports_once
 run_test 'change-ip dispatches each mode and restores the timer' test_change_ip_dispatches_each_mode_and_finishes_the_timer
