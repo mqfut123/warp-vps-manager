@@ -3215,7 +3215,7 @@ cmd_change_ip() {
     die "当前项目管理的 WARP Client 不是可替换的 Free 注册，未执行 WARP IP 更换"
   fi
 
-  if interactive_terminal_available; then
+  if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then
     while true; do
       printf '是否要求 Gemini 与 YouTube Premium 同时明确可用？[y/N]：' >&2
       read_input unlock_choice || die "无法读取解锁条件，未更换 WARP IP"

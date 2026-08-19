@@ -5191,7 +5191,12 @@ test_change_ip_unlock_policy_prompt_contract() {
   required_runtime_units_ready() { return 0; }
   test_quiet() { return 0; }
   managed_wireguard_config_owned() { return 0; }
-  interactive_terminal_available() { [ "$tty_available" -eq 1 ]; }
+  function [ {
+    case "${1:-}:${2:-}" in
+      -t:0|-t:1|-t:2) case "$tty_available" in 1) return 0 ;; *) return 1 ;; esac ;;
+      *) builtin [ "$@" ;;
+    esac
+  }
   read_input() {
     printf 'read\n' >> "$event"
     if [ "$answer_index" -ge "${#answers[@]}" ]; then
@@ -5269,6 +5274,54 @@ test_change_ip_unlock_policy_prompt_contract() {
     'interactive EOF must stop before maintenance or registration mutation'
 }
 
+test_change_ip_prompts_only_when_all_standard_fds_are_ttys() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root event output_file fd0=1 fd1=1 fd2=1 fd_case
+  root="$(mktemp -d)"
+  event="$root/events"
+  output_file="$root/output"
+
+  function [ {
+    case "${1:-}:${2:-}" in
+      -t:0) case "$fd0" in 1) return 0 ;; *) return 1 ;; esac ;;
+      -t:1) case "$fd1" in 1) return 0 ;; *) return 1 ;; esac ;;
+      -t:2) case "$fd2" in 1) return 0 ;; *) return 1 ;; esac ;;
+      *) builtin [ "$@" ;;
+    esac
+  }
+  command() {
+    case "$*" in '-v curl'|'-v python3') return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE=wireguard; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  managed_wireguard_config_owned() { return 0; }
+  read_input() { printf 'read\n' >> "$event"; printf -v "$1" '%s' 'N'; }
+  begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
+  finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
+  rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  run_unlock_checks() { printf 'policy:%s\n' "${1:-all}" >> "$event"; }
+
+  cmd_change_ip > "$output_file" 2>&1 || {
+    fail 'change-ip with three TTY standard descriptors should accept an interactive answer'
+    return 1
+  }
+  assert_eq $'read\ntimer:begin\nrotate:1\npolicy:any\ntimer:finish' "$(< "$event")" \
+    'change-ip must prompt when stdin, stdout and stderr are all TTYs' || return 1
+
+  for fd_case in '0 1 1' '1 0 1' '1 1 0' '1 0 0'; do
+    read -r fd0 fd1 fd2 <<< "$fd_case"
+    : > "$event"
+    cmd_change_ip > "$output_file" 2>&1 || {
+      fail "change-ip should remain noninteractive for descriptor shape <$fd_case>"
+      return 1
+    }
+    assert_eq $'timer:begin\nrotate:1\npolicy:any\ntimer:finish' "$(< "$event")" \
+      "descriptor shape <$fd_case> must default to any without reading the inherited TTY" || return 1
+  done
+}
+
 test_change_ip_unlock_policy_controls_retry_success() {
   source_without_main "$MANAGER_SCRIPT"
   local root event output_file scenario=gemini tty_available=0
@@ -5285,7 +5338,12 @@ test_change_ip_unlock_policy_controls_retry_success() {
   required_runtime_units_ready() { return 0; }
   test_quiet() { return 0; }
   managed_wireguard_config_owned() { return 0; }
-  interactive_terminal_available() { [ "$tty_available" -eq 1 ]; }
+  function [ {
+    case "${1:-}:${2:-}" in
+      -t:0|-t:1|-t:2) case "$tty_available" in 1) return 0 ;; *) return 1 ;; esac ;;
+      *) builtin [ "$@" ;;
+    esac
+  }
   read_input() { printf 'read\n' >> "$event"; printf -v "$1" '%s' 'Y'; }
   begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
@@ -10140,6 +10198,7 @@ run_test 'Socks rotation waits for runtime convergence' test_socks_rotation_wait
 run_test 'Socks runtime wait is bounded and reports once' test_socks_rotation_runtime_wait_is_bounded_and_reports_once
 run_test 'change-ip dispatches each mode and restores the timer' test_change_ip_dispatches_each_mode_and_finishes_the_timer
 run_test 'change-ip unlock policy prompt handles defaults choices retries and EOF' test_change_ip_unlock_policy_prompt_contract
+run_test 'change-ip prompts only when all standard descriptors are TTYs' test_change_ip_prompts_only_when_all_standard_fds_are_ttys
 run_test 'change-ip unlock policy controls retry success' test_change_ip_unlock_policy_controls_retry_success
 run_test 'change-ip stops after ten failed unlock results' test_change_ip_stops_at_ten_failed_unlock_results
 run_test 'change-ip runtime failure stops immediately' test_change_ip_runtime_failure_stops_immediately
