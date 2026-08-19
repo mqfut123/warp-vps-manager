@@ -4893,22 +4893,22 @@ test_gemini_fixtures() {
 
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/available.html" \
-    'yes|地区：USA' || return 1
+    'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/china.html" \
-    'yes|地区：CHN' || return 1
+    'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/unavailable.html" \
-    'no|地区：CHN' || return 1
+    'unknown|页面标记不能确认是否可用' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/available-no-region.html" \
     'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/old-false-marker.html" \
-    'no|' || return 1
+    'unknown|页面标记不能确认是否可用' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/available-duplicate-region.html" \
-    'yes|地区：USA' || return 1
+    'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/available-conflicting-region.html" \
     'yes|' || return 1
@@ -4938,7 +4938,7 @@ test_gemini_probes_use_one_homepage_request() {
   }
   output="$(probe_gemini_unlock)"
   calls="$(< "$request_log")"
-  assert_eq 'yes|地区：USA' "$output" \
+  assert_eq 'yes|' "$output" \
     'the ordinary Gemini probe must evaluate the homepage marker' || return 1
   assert_eq 'https://gemini.google.com/' "$calls" \
     'the ordinary Gemini probe must request only the homepage' || return 1
@@ -4950,10 +4950,82 @@ test_gemini_probes_use_one_homepage_request() {
   }
   output="$(probe_native_gemini_unlock)"
   calls="$(< "$request_log")"
-  assert_eq 'yes|地区：USA' "$output" \
+  assert_eq 'yes|' "$output" \
     'the native Gemini probe must evaluate the homepage marker' || return 1
   assert_eq 'GET https://gemini.google.com/' "$calls" \
     'the native Gemini probe must request only the homepage'
+}
+
+test_unlock_http_transport_ignores_environment_proxies() {
+  source_without_main "$MANAGER_SCRIPT"
+  local request_log output
+  request_log="$(mktemp)"
+
+  curl() {
+    {
+      printf 'http_proxy=%s\n' "${http_proxy-}"
+      printf 'https_proxy=%s\n' "${https_proxy-}"
+      printf 'all_proxy=%s\n' "${all_proxy-}"
+      printf 'HTTP_PROXY=%s\n' "${HTTP_PROXY-}"
+      printf 'HTTPS_PROXY=%s\n' "${HTTPS_PROXY-}"
+      printf 'ALL_PROXY=%s\n' "${ALL_PROXY-}"
+      printf 'arg=%s\n' "$@"
+    } > "$request_log"
+  }
+
+  http_proxy=http://127.0.0.1:18080 \
+    https_proxy=http://127.0.0.1:18443 \
+    all_proxy=socks5://127.0.0.1:1080 \
+    HTTP_PROXY=http://127.0.0.1:28080 \
+    HTTPS_PROXY=http://127.0.0.1:28443 \
+    ALL_PROXY=socks5://127.0.0.1:2080 \
+    curl_unlock_page 'https://example.invalid/unlock' >/dev/null
+  output="$(< "$request_log")"
+
+  for proxy_name in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+    assert_contains "$output" "${proxy_name}=" \
+      "unlock request must clear ${proxy_name}" || return 1
+    assert_not_contains "$output" "${proxy_name}=http" \
+      "unlock request must not inherit ${proxy_name}" || return 1
+    assert_not_contains "$output" "${proxy_name}=socks" \
+      "unlock request must not inherit ${proxy_name}" || return 1
+  done
+  assert_contains "$output" 'arg=--noproxy' \
+    'unlock request must explicitly disable curl proxy use' || return 1
+  assert_contains "$output" 'arg=*' \
+    'unlock request must apply --noproxy to every destination' || return 1
+  assert_contains "$output" 'arg=https://example.invalid/unlock' \
+    'unlock request must preserve its target URL'
+}
+
+test_unlock_check_skips_only_youtube_without_python() {
+  source_without_main "$MANAGER_SCRIPT"
+  local request_log output
+  request_log="$(mktemp)"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl) return 0 ;;
+      python3) return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+  probe_gemini_unlock() { printf 'yes|\n'; }
+  probe_youtube_premium_unlock() {
+    printf 'called\n' > "$request_log"
+    printf 'yes|地区：US\n'
+  }
+
+  output="$(run_unlock_checks)"
+  assert_contains "$output" 'Gemini：可用' \
+    'missing Python must not block the Python-free Gemini check' || return 1
+  assert_contains "$output" '找不到 python3，无法检测 YouTube Premium' \
+    'missing Python must explain why YouTube was skipped' || return 1
+  [ ! -s "$request_log" ] || {
+    fail 'YouTube probe must not run without its region parser dependency'
+    return 1
+  }
 }
 
 evaluate_youtube_fixture() {
@@ -4983,7 +5055,7 @@ test_youtube_fixtures() {
     'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-generic-adfree.html" \
-    'yes|地区：US' || return 1
+    'unknown|页面特征不明确' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-region.html" \
     'unknown|地区信息冲突' || return 1
@@ -4992,7 +5064,7 @@ test_youtube_fixtures() {
     'no|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-cn.html" \
-    'no|地区：CN' || return 1
+    'unknown|页面特征不明确' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/unavailable-us.html" \
     'no|地区：US' || return 1
@@ -5096,7 +5168,7 @@ test_native_unlock_trace_behavior() {
   calls="$(< "$request_log")"
   assert_contains "$output" '203.0.113.8' 'native trace output must show the observed public IP' || return 1
   assert_contains "$output" 'US' 'native trace output must show the observed Cloudflare region' || return 1
-  assert_contains "$output" 'Gemini：可用（地区：USA）' \
+  assert_contains "$output" 'Gemini：可用' \
     'native Gemini output must reuse the homepage marker parser' || return 1
   assert_contains "$output" 'YouTube Premium：不可用（地区：US）' \
     'native YouTube output must reuse the existing parser and parsed region' || return 1
@@ -8851,6 +8923,8 @@ run_test 'Swap rollback preserves unknown state and reverifies cleanup' test_swa
 run_test 'noninteractive Swap choices and failures are bounded' test_noninteractive_swap_choices_and_failure_are_bounded
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
 run_test 'Gemini probes request only the homepage' test_gemini_probes_use_one_homepage_request
+run_test 'unlock HTTP requests ignore environment proxies' test_unlock_http_transport_ignores_environment_proxies
+run_test 'unlock check skips only YouTube when Python is missing' test_unlock_check_skips_only_youtube_without_python
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'native egress selection prefers the first IPv4 and supports IPv6-only hosts' test_native_egress_selection
 run_test 'native unlock trace failures remain advisory except for confirmed WARP paths' test_native_unlock_trace_behavior

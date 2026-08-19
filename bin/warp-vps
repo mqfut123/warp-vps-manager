@@ -2253,7 +2253,9 @@ print(f"{ip_value}|{loc_value}|{warp_value}")
 
 curl_unlock_page() {
   local url="$1"
-  curl -4 -fsSL --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
+  http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
+    curl -4 --noproxy '*' -fsSL \
+    --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
     -A "$UNLOCK_TEST_UA" \
     -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
     -H 'accept-language: en-US,en;q=0.9' \
@@ -2283,29 +2285,8 @@ raise SystemExit(1)
 ' <<< "$body"
 }
 
-extract_gemini_region() {
-  local body="$1"
-  python3 -c '
-import re
-import sys
-
-body = sys.stdin.read()
-values = []
-for value in re.findall(r",2,1,200,\"([A-Z]{3})\"", body):
-    if value not in values:
-        values.append(value)
-if len(values) == 1:
-    print(values[0])
-    raise SystemExit(0)
-if len(values) > 1:
-    raise SystemExit(2)
-raise SystemExit(1)
-' <<< "$body"
-}
-
 evaluate_gemini_unlock() {
   local body="$1"
-  local region=""
   local available=0
   local unavailable=0
 
@@ -2325,25 +2306,17 @@ evaluate_gemini_unlock() {
     printf 'unknown|页面特征冲突\n'
     return 0
   fi
-  if [ "$available" -eq 0 ] && [ "$unavailable" -eq 0 ]; then
-    printf 'unknown|页面特征不明确\n'
+  if [ "$available" -eq 1 ]; then
+    printf 'yes|\n'
     return 0
   fi
 
-  region="$(extract_gemini_region "$body" 2>/dev/null || true)"
-  if [ "$available" -eq 1 ]; then
-    if [ -n "$region" ]; then
-      printf 'yes|地区：%s\n' "$region"
-    else
-      printf 'yes|\n'
-    fi
+  if [ "$unavailable" -eq 1 ]; then
+    printf 'unknown|页面标记不能确认是否可用\n'
     return 0
   fi
-  if [ -n "$region" ]; then
-    printf 'no|地区：%s\n' "$region"
-  else
-    printf 'no|\n'
-  fi
+
+  printf 'unknown|页面特征不明确\n'
 }
 
 probe_gemini_unlock() {
@@ -2373,7 +2346,7 @@ evaluate_youtube_premium_unlock() {
   if grep -Fqi 'Premium is not available in your country' <<< "$body"; then
     unavailable=1
   fi
-  if grep -Eiq 'ad-free|purchaseButtonOverride|Start trial' <<< "$body"; then
+  if grep -Fq 'purchaseButtonOverride' <<< "$body"; then
     available=1
   fi
 
@@ -2388,11 +2361,6 @@ evaluate_youtube_premium_unlock() {
     else
       printf 'no|地区：未知\n'
     fi
-    return 0
-  fi
-
-  if [ "$region" = "CN" ]; then
-    printf 'no|地区：CN\n'
     return 0
   fi
 
@@ -2450,7 +2418,11 @@ run_unlock_checks() {
   fi
   info_line "正在检测 Gemini 和 YouTube Premium，请稍等"
   print_unlock_result "Gemini" "$(probe_gemini_unlock)"
-  print_unlock_result "YouTube Premium" "$(probe_youtube_premium_unlock)"
+  if command -v python3 >/dev/null 2>&1; then
+    print_unlock_result "YouTube Premium" "$(probe_youtube_premium_unlock)"
+  else
+    warn_line "找不到 python3，无法检测 YouTube Premium"
+  fi
   info_line "检测基于公开网页特征和本机 IPv4 出口；若 Google 页面或地区策略变化，可能显示无法确认。"
 }
 

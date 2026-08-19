@@ -58,9 +58,10 @@ WARP 对端使用 IPv4 还是 IPv6，只决定 WireGuard 加密包如何到达 C
 ## 运行条件
 
 - 使用 `systemd` 的 Linux VPS
+- 在 Bash（或支持进程替换的 shell）中运行，并预装 curl；安装器会补齐 Python 3 和所选模式缺少的运行依赖
 - 使用 APT、DNF 或 YUM，并能从当前配置的软件源取得所选模式的依赖
 - WireGuard 模式需要系统能够通过 `wg-quick` 创建项目网卡并允许出站 UDP；WireGuard 不会回退 TCP；全局范围同时需要 nftables
-- Socks5 模式需要 nftables `OUTPUT` NAT，并且系统与架构有可用的 Cloudflare WARP 软件包
+- Socks5 模式需要 nftables `OUTPUT` NAT，并且系统与架构位于 [Cloudflare WARP Client 当前支持范围](https://developers.cloudflare.com/warp-client/get-started/)；RHEL 9 及以上版本需要先启用 EPEL
 
 安装器按系统实际提供的包管理器和网络能力选择安装路径，不依赖固定发行版版本表。
 
@@ -90,7 +91,7 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 `native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
 
-`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 只按首页明确的可用性 marker 判断，同页唯一的三字母地区仅用于展示，不参与可用性结论；marker 缺失或冲突时显示无法确认。YouTube Premium 的地区或页面特征互相冲突时显示无法确认，明确不可用但缺少地区时显示地区未知。
+`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 只在首页返回明确的正向 marker 时显示可用，不显示地区；单独的负向 marker、marker 缺失或冲突都显示无法确认。YouTube Premium 只有出现购买入口或明确不可用页面时才给出结论，并同时显示页面地区；地区或页面特征不明确时显示无法确认。
 
 ## 卸载
 
