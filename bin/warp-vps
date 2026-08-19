@@ -1966,9 +1966,11 @@ unit_ready() {
 
 required_runtime_units_ready() {
   if [ "$WARP_MODE" = "wireguard" ]; then
-    unit_ready "wg-quick@${WG_IFACE}.service" \
-      && unit_ready warp-vps.service
-    return
+    if unit_ready "wg-quick@${WG_IFACE}.service" \
+      && unit_ready warp-vps.service; then
+      return 0
+    fi
+    return 1
   fi
   unit_ready warp-svc.service \
     && unit_ready warp-vps-redsocks.service \
@@ -2042,7 +2044,7 @@ create_warp_registration() {
   if output="$(warp_cli --accept-tos registration new 2>&1)"; then
     inspect_warp_registration
     [ "$WARP_REGISTRATION_STATE" = "present" ]
-    return
+    return $?
   fi
   remember_warp_output "registration new" "$output"
   inspect_warp_registration
@@ -2051,7 +2053,7 @@ create_warp_registration() {
   if output="$(warp_cli --accept-tos register 2>&1)"; then
     inspect_warp_registration
     [ "$WARP_REGISTRATION_STATE" = "present" ]
-    return
+    return $?
   fi
   remember_warp_output "register" "$output"
   inspect_warp_registration
@@ -2637,7 +2639,7 @@ import re
 import sys
 
 body = sys.stdin.read()
-for key in ("INNERTUBE_CONTEXT_GL", "contentRegion", "countryCode"):
+for key in ("INNERTUBE_CONTEXT_GL", "contentRegion"):
     pattern = rf"\"{key}\"\s*:\s*\"([A-Za-z]{{2}})\""
     values = []
     for value in re.findall(pattern, body):
@@ -2649,6 +2651,91 @@ for key in ("INNERTUBE_CONTEXT_GL", "contentRegion", "countryCode"):
         raise SystemExit(0)
     if len(values) > 1:
         raise SystemExit(2)
+raise SystemExit(1)
+' <<< "$body"
+}
+
+youtube_has_actionable_offer() {
+  local body="$1"
+  python3 -c '
+import json
+import re
+import sys
+from urllib.parse import urlparse
+
+body = sys.stdin.read()
+decoder = json.JSONDecoder()
+assignments = re.compile(
+    r"(?:\b(?:var|let|const)\s+)?ytInitialData\s*=\s*"
+    r"|window\s*\[\s*[\"\x27]ytInitialData[\"\x27]\s*\]\s*=\s*"
+)
+
+
+def walk(value):
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk(child)
+
+
+def premium_path(value):
+    if not isinstance(value, str) or not value:
+        return False
+    parsed = urlparse(value)
+    if parsed.hostname and parsed.hostname.lower() not in (
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+    ):
+        return False
+    return parsed.path.rstrip("/") in ("/premium", "/premiumlite", "/premium/student")
+
+
+def purchase_action(on_tap):
+    for node in walk(on_tap):
+        if not isinstance(node, dict):
+            continue
+        flow = node.get("flowNextStepCommand")
+        if (
+            isinstance(flow, dict)
+            and flow.get("targetId") == "multi_step_purchase_flow"
+            and flow.get("stepId") == "plan_selection"
+        ):
+            return True
+        browse = node.get("browseEndpoint")
+        if (
+            isinstance(browse, dict)
+            and browse.get("browseId") == "SPunlimited"
+            and browse.get("canonicalBaseUrl") in ("/premium", "/premiumlite")
+        ):
+            return True
+        endpoint = node.get("urlEndpoint")
+        if isinstance(endpoint, dict) and premium_path(endpoint.get("url")):
+            return True
+    return False
+
+
+for match in assignments.finditer(body):
+    start = match.end()
+    if start >= len(body) or body[start] != "{":
+        continue
+    try:
+        document, _ = decoder.raw_decode(body[start:])
+    except (TypeError, ValueError):
+        continue
+    for node in walk(document):
+        if not isinstance(node, dict):
+            continue
+        if node.get("accessibilityId") != "id.ypc.offer.button":
+            continue
+        if node.get("state") != "BUTTON_VIEW_MODEL_STATE_ACTIVE":
+            continue
+        on_tap = node.get("onTap")
+        if on_tap and purchase_action(on_tap):
+            raise SystemExit(0)
 raise SystemExit(1)
 ' <<< "$body"
 }
@@ -2714,7 +2801,7 @@ evaluate_youtube_premium_unlock() {
   if grep -Fqi 'Premium is not available in your country' <<< "$body"; then
     unavailable=1
   fi
-  if grep -Fq 'purchaseButtonOverride' <<< "$body"; then
+  if youtube_has_actionable_offer "$body"; then
     available=1
   fi
 
@@ -2779,6 +2866,7 @@ print_unlock_result() {
 }
 
 run_unlock_checks() {
+  local policy="${1:-all}"
   local gemini_result youtube_result
   section "服务解锁检测（IPv4）"
   if ! command -v curl >/dev/null 2>&1; then
@@ -2796,6 +2884,11 @@ run_unlock_checks() {
     warn_line "找不到 python3，无法检测 YouTube Premium"
   fi
   info_line "检测基于公开网页特征和本机 IPv4 出口；若 Google 页面或地区策略变化，可能显示无法确认。"
+  if [ "$policy" = "any" ]; then
+    [ "${gemini_result%%|*}" = "yes" ] \
+      || [ "${youtube_result%%|*}" = "yes" ]
+    return
+  fi
   [ "${gemini_result%%|*}" = "yes" ] \
     && [ "${youtube_result%%|*}" = "yes" ]
 }
@@ -3089,6 +3182,7 @@ cmd_native_unlock_check() {
 }
 
 cmd_change_ip() {
+  local attempt rotate_rc unlock_choice unlock_policy=any
   require_root
   load_config
   command -v curl >/dev/null 2>&1 || die "找不到 curl，无法检测更换后的 WARP 出口"
@@ -3105,9 +3199,25 @@ cmd_change_ip() {
     die "当前项目管理的 WARP Client 不是可替换的 Free 注册，未执行 WARP IP 更换"
   fi
 
+  if interactive_terminal_available; then
+    while true; do
+      printf '是否要求 Gemini 与 YouTube Premium 同时明确可用？[y/N]：' >&2
+      read_input unlock_choice || die "无法读取解锁条件，未更换 WARP IP"
+      case "$unlock_choice" in
+        y|Y|yes|Yes|YES) unlock_policy=all; break ;;
+        ''|n|N|no|No|NO) unlock_policy=any; break ;;
+        *) printf '输入无效，请输入 y 或 n。\n' >&2 ;;
+      esac
+    done
+  fi
+
   begin_runtime_maintenance || die "无法暂停健康检查，未更换 WARP IP"
   section "更换 WARP IP"
-  local attempt rotate_rc
+  if [ "$unlock_policy" = "all" ]; then
+    info_line "停止条件：Gemini 与 YouTube Premium 都明确可用"
+  else
+    info_line "停止条件：Gemini 或 YouTube Premium 任一项明确可用"
+  fi
   for ((attempt = 1; attempt <= CHANGE_IP_MAX_ATTEMPTS; attempt++)); do
     info_line "正在进行第 ${attempt}/${CHANGE_IP_MAX_ATTEMPTS} 次 WARP 注册更换"
     rotate_rc=0
@@ -3127,18 +3237,22 @@ cmd_change_ip() {
       die "WARP IP 更换失败；已停止后续尝试"
     fi
 
-    if run_unlock_checks; then
+    if run_unlock_checks "$unlock_policy"; then
       finish_runtime_maintenance
-      ok_line "WARP IP 更换完成，Gemini 和 YouTube Premium 均已通过检测"
+      if [ "$unlock_policy" = "all" ]; then
+        ok_line "WARP IP 更换完成，Gemini 与 YouTube Premium 均已明确通过检测"
+      else
+        ok_line "WARP IP 更换完成，Gemini 或 YouTube Premium 已有一项明确通过检测"
+      fi
       return 0
     fi
     if [ "$attempt" -lt "$CHANGE_IP_MAX_ATTEMPTS" ]; then
-      warn_line "本次注册未全部通过检测，继续更换 WARP IP"
+      warn_line "本次注册未达到所选停止条件，继续更换 WARP IP"
     fi
   done
 
   finish_runtime_maintenance
-  fail_line "已更换 ${CHANGE_IP_MAX_ATTEMPTS} 次，Gemini 和 YouTube Premium 仍未全部通过检测"
+  fail_line "已更换 ${CHANGE_IP_MAX_ATTEMPTS} 次，仍未达到所选停止条件"
   return 1
 }
 
@@ -4043,7 +4157,7 @@ usage() {
   native-unlock-check
                   通过原生 IPv4（无 IPv4 时用 IPv6）检测 Gemini / YouTube Premium
   unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
-  change-ip       最多更换 10 次 WARP 注册，每次更换后自动重新检测
+  change-ip       最多更换 10 次 WARP 注册；默认任一服务明确可用即停止
   update          更新脚本和固定规则快照
   reinstall       非交互重装并保持当前模式
   reinstall [安装选项]

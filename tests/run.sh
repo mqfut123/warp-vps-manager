@@ -3005,6 +3005,108 @@ test_runtime_maintenance_signals_run_exit_recovery() {
     'successful maintenance must disarm all recovery traps together'
 }
 
+test_exit_trap_success_helpers_do_not_inherit_signal_status() {
+  local event output rc=0
+  event="$(mktemp)"
+
+  MANAGER_SCRIPT="$MANAGER_SCRIPT" EVENT="$event" /bin/bash -c '
+    source "$MANAGER_SCRIPT"
+    WARP_MODE=wireguard
+    WG_IFACE=warp-vps-wg
+
+    unit_ready() {
+      printf "unit:%s:0\n" "$1" >> "$EVENT"
+      return 0
+    }
+    test_quiet() {
+      printf "test-quiet:0\n" >> "$EVENT"
+      return 0
+    }
+    wg_handshake_recent() {
+      printf "handshake:0\n" >> "$EVENT"
+      return 0
+    }
+    check_recovery_on_exit() {
+      local entry_rc=$? required_rc quiet_rc handshake_rc
+      trap - EXIT
+      set +e
+      printf "entry:%s\n" "$entry_rc" >> "$EVENT"
+      required_runtime_units_ready
+      required_rc=$?
+      printf "required:%s\n" "$required_rc" >> "$EVENT"
+      if [ "$required_rc" -eq 0 ]; then
+        test_quiet
+        quiet_rc=$?
+        if [ "$quiet_rc" -eq 0 ]; then
+          wg_handshake_recent
+          handshake_rc=$?
+        fi
+      fi
+      exit "$entry_rc"
+    }
+
+    trap check_recovery_on_exit EXIT
+    exit 143
+  ' >/dev/null 2>&1 || rc=$?
+
+  assert_eq '143' "$rc" \
+    'successful WireGuard recovery probes must preserve the original TERM status' || return 1
+  output="$(< "$event")"
+  assert_eq \
+    $'entry:143\nunit:wg-quick@warp-vps-wg.service:0\nunit:warp-vps.service:0\nrequired:0\ntest-quiet:0\nhandshake:0' \
+    "$output" \
+    'two ready units must return zero and allow every later data-plane probe in an EXIT trap' || return 1
+
+  : > "$event"
+  rc=0
+  MANAGER_SCRIPT="$MANAGER_SCRIPT" EVENT="$event" /bin/bash -c '
+    source "$MANAGER_SCRIPT"
+    inspection_count=0
+
+    inspect_warp_registration() {
+      inspection_count=$((inspection_count + 1))
+      if [ "$inspection_count" -eq 1 ]; then
+        WARP_REGISTRATION_STATE=missing
+      else
+        WARP_REGISTRATION_STATE=present
+      fi
+      printf "inspect:%s\n" "$WARP_REGISTRATION_STATE" >> "$EVENT"
+    }
+    warp_cli() {
+      printf "warp-cli:%s\n" "$*" >> "$EVENT"
+      return 0
+    }
+    configure_warp_runtime() {
+      printf "configure:%s\n" "${1:-}" >> "$EVENT"
+      return 0
+    }
+    socks_rotation_runtime_ok() {
+      printf "socks-runtime:0\n" >> "$EVENT"
+      return 0
+    }
+    check_recovery_on_exit() {
+      local entry_rc=$? recover_rc
+      trap - EXIT
+      set +e
+      printf "entry:%s\n" "$entry_rc" >> "$EVENT"
+      recover_socks_rotation
+      recover_rc=$?
+      printf "recover:%s\n" "$recover_rc" >> "$EVENT"
+      exit "$entry_rc"
+    }
+
+    trap check_recovery_on_exit EXIT
+    exit 143
+  ' >/dev/null 2>&1 || rc=$?
+
+  assert_eq '143' "$rc" \
+    'successful Socks recovery must preserve the original TERM status' || return 1
+  assert_eq \
+    $'entry:143\ninspect:missing\nwarp-cli:--accept-tos registration new\ninspect:present\nconfigure:strict\nsocks-runtime:0\nrecover:0' \
+    "$(< "$event")" \
+    'registration new success must return zero and continue through Socks configuration in an EXIT trap'
+}
+
 test_wireguard_endpoint_candidates_preserve_hostname_config() {
   source_without_main "$MANAGER_SCRIPT"
   local root output original body
@@ -4970,6 +5072,165 @@ test_change_ip_dispatches_each_mode_and_finishes_the_timer() {
     'Socks change-ip must use only its backend and restore the timer'
 }
 
+test_change_ip_unlock_policy_prompt_contract() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root event output_file output expected_policy supplied_answer
+  local answer_index=0 tty_available=1 rc=0
+  local -a answers=()
+  root="$(mktemp -d)"
+  event="$root/events"
+  output_file="$root/output"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE=wireguard; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  managed_wireguard_config_owned() { return 0; }
+  interactive_terminal_available() { [ "$tty_available" -eq 1 ]; }
+  read_input() {
+    printf 'read\n' >> "$event"
+    if [ "$answer_index" -ge "${#answers[@]}" ]; then
+      return 1
+    fi
+    printf -v "$1" '%s' "${answers[$answer_index]}"
+    answer_index=$((answer_index + 1))
+  }
+  begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
+  finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
+  rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  run_unlock_checks() { printf 'policy:%s\n' "${1:-all}" >> "$event"; }
+
+  for supplied_answer in '' Y N; do
+    case "$supplied_answer" in
+      Y) expected_policy=all ;;
+      *) expected_policy=any ;;
+    esac
+    : > "$event"
+    : > "$output_file"
+    answers=("$supplied_answer")
+    answer_index=0
+    tty_available=1
+    cmd_change_ip > "$output_file" 2>&1 || {
+      fail "interactive change-ip choice <$supplied_answer> should be accepted"
+      return 1
+    }
+    output="$(< "$output_file")"
+    assert_contains "$output" \
+      '是否要求 Gemini 与 YouTube Premium 同时明确可用？[y/N]' \
+      'interactive change-ip must ask the explicit unlock strictness question' || return 1
+    assert_eq \
+      "$(printf 'read\ntimer:begin\nrotate:1\npolicy:%s\ntimer:finish' "$expected_policy")" \
+      "$(< "$event")" \
+      "interactive choice <$supplied_answer> must select the expected unlock policy" || return 1
+  done
+
+  : > "$event"
+  : > "$output_file"
+  answers=(invalid Y)
+  answer_index=0
+  tty_available=1
+  cmd_change_ip > "$output_file" 2>&1 || {
+    fail 'an invalid strictness choice followed by Y should retry and continue'
+    return 1
+  }
+  output="$(< "$output_file")"
+  assert_contains "$output" '输入无效' \
+    'an invalid strictness choice must explain that another answer is required' || return 1
+  assert_eq $'read\nread\ntimer:begin\nrotate:1\npolicy:all\ntimer:finish' "$(< "$event")" \
+    'an invalid strictness choice must retry before maintenance begins' || return 1
+
+  : > "$event"
+  : > "$output_file"
+  answers=()
+  answer_index=0
+  tty_available=0
+  cmd_change_ip > "$output_file" 2>&1 || {
+    fail 'noninteractive change-ip should use the any-service policy without prompting'
+    return 1
+  }
+  assert_eq $'timer:begin\nrotate:1\npolicy:any\ntimer:finish' "$(< "$event")" \
+    'noninteractive change-ip must default to any explicit yes and skip input' || return 1
+
+  : > "$event"
+  answers=()
+  answer_index=0
+  tty_available=1
+  rc=0
+  output="$(cmd_change_ip 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'interactive EOF must fail change-ip explicitly' || return 1
+  assert_contains "$output" '无法读取' \
+    'interactive EOF must explain why change-ip stopped' || return 1
+  assert_eq 'read' "$(< "$event")" \
+    'interactive EOF must stop before maintenance or registration mutation'
+}
+
+test_change_ip_unlock_policy_controls_retry_success() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root event output_file scenario=gemini tty_available=0
+  root="$(mktemp -d)"
+  event="$root/events"
+  output_file="$root/output"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE=wireguard; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  managed_wireguard_config_owned() { return 0; }
+  interactive_terminal_available() { [ "$tty_available" -eq 1 ]; }
+  read_input() { printf 'read\n' >> "$event"; printf -v "$1" '%s' 'Y'; }
+  begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
+  finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
+  rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  probe_gemini_unlock() {
+    printf 'gemini\n' >> "$event"
+    if [ "$scenario" = youtube ]; then
+      printf 'no|页面标记为不可用\n'
+    else
+      printf 'yes|\n'
+    fi
+  }
+  probe_youtube_premium_unlock() {
+    local calls
+    printf 'youtube\n' >> "$event"
+    calls="$(grep -c '^youtube$' "$event")"
+    case "$scenario:$calls" in
+      gemini:*|all:1) printf 'no|地区：US\n' ;;
+      *) printf 'yes|地区：US\n' ;;
+    esac
+  }
+
+  for scenario in gemini youtube; do
+    : > "$event"
+    tty_available=0
+    cmd_change_ip > "$output_file" 2>&1 || {
+      fail "noninteractive any-service policy should accept a ${scenario}-only yes"
+      return 1
+    }
+    assert_eq $'timer:begin\nrotate:1\ngemini\nyoutube\ntimer:finish' "$(< "$event")" \
+      "any-service policy must stop after a fresh ${scenario}-only yes" || return 1
+  done
+
+  : > "$event"
+  scenario=all
+  tty_available=1
+  cmd_change_ip > "$output_file" 2>&1 || {
+    fail 'strict policy should continue until both services explicitly pass'
+    return 1
+  }
+  assert_eq \
+    $'read\ntimer:begin\nrotate:1\ngemini\nyoutube\nrotate:2\ngemini\nyoutube\ntimer:finish' \
+    "$(< "$event")" \
+    'strict policy must reject one yes and stop only after a fresh two-yes result'
+}
+
 test_change_ip_stops_at_ten_failed_unlock_results() {
   source_without_main "$MANAGER_SCRIPT"
   local event rc=0 rotations detections
@@ -5683,6 +5944,40 @@ test_unlock_check_requires_both_services() {
   done
 }
 
+test_unlock_policy_is_local_and_each_service_is_still_reported() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event any_output unlock_output any_rc=0
+  event="$(mktemp)"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  probe_gemini_unlock() { printf 'gemini\n' >> "$event"; printf 'yes|\n'; }
+  probe_youtube_premium_unlock() {
+    printf 'youtube\n' >> "$event"
+    printf 'no|地区：US\n'
+  }
+
+  any_output="$(run_unlock_checks any)" || any_rc=$?
+  assert_eq '0' "$any_rc" \
+    'the change-ip any policy should accept one explicit yes' || return 1
+  assert_contains "$any_output" 'Gemini：可用' \
+    'any policy must still report the Gemini result' || return 1
+  assert_contains "$any_output" 'YouTube Premium：不可用' \
+    'any policy must still report the YouTube Premium result' || return 1
+
+  unlock_output="$(cmd_unlock_check)"
+  assert_contains "$unlock_output" 'Gemini：可用' \
+    'unlock-check must continue to report Gemini separately' || return 1
+  assert_contains "$unlock_output" 'YouTube Premium：不可用' \
+    'unlock-check must continue to report YouTube Premium separately' || return 1
+  assert_contains "$unlock_output" '当前 WARP 出口未全部通过检测' \
+    'change-ip any policy must not weaken the standalone unlock-check aggregate' || return 1
+  assert_eq $'gemini\nyoutube\ngemini\nyoutube' "$(< "$event")" \
+    'both policies must execute both fresh service probes'
+}
+
 test_unlock_check_missing_curl_is_not_a_pass() {
   source_without_main "$MANAGER_SCRIPT"
   local request_log output rc=0
@@ -5757,15 +6052,30 @@ test_youtube_fixtures() {
 
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-google-cn.html" \
-    'yes|地区：US' || return 1
+    'unknown|页面特征不明确' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-unrelated-country.html" \
-    'yes|地区：US' || return 1
+    'unknown|页面特征不明确' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us.html" \
-    'yes|地区：US' || return 1
+    'unknown|页面特征不明确' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-generic-adfree.html" \
+    'unknown|页面特征不明确' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us-flow-offer.html" \
+    'yes|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us-premiumlite-browse.html" \
+    'yes|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us-student-url.html" \
+    'yes|地区：US' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/active-go-to-youtube.html" \
+    'unknown|页面特征不明确' || return 1
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/premium-navigation-outside-offer-button.html" \
     'unknown|页面特征不明确' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-region.html" \
@@ -8190,20 +8500,22 @@ test_readme_documents_route_scope_contract() {
 test_readme_documents_change_ip_contract() {
   assert_file_matches "$README_FILE" 'warp-vps change-ip` \| 最多更换 10 次 WARP 注册' \
     'README must expose the new bounded command' || return 1
-  assert_file_matches "$README_FILE" '只有 Gemini 与 YouTube Premium 都明确可用才算全部通过' \
-    'README must state the strict two-service aggregate' || return 1
   assert_file_matches "$README_FILE" '未全部通过时只提示运行 `warp-vps change-ip`，不会在安装流程中自动更换' \
     'README must distinguish the post-install prompt from explicit mutation' || return 1
   assert_file_matches "$README_FILE" '保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口' \
     'README must document the persisted mode, scope and port contract' || return 1
+  assert_file_matches "$README_FILE" \
+    '交互运行时先询问是否要求两项都明确可用，默认只要任一项明确可用就停止，非交互运行也使用该默认值' \
+    'README must document both interactive and noninteractive change-ip defaults' || return 1
   assert_file_matches "$README_FILE" 'Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户' \
     'README must document the safe Socks account boundary' || return 1
 
   local help_output
   source_without_main "$MANAGER_SCRIPT"
   help_output="$(usage)"
-  assert_contains "$help_output" 'change-ip       最多更换 10 次 WARP 注册' \
-    'CLI help must expose the same bounded replacement command'
+  assert_contains "$help_output" \
+    'change-ip       最多更换 10 次 WARP 注册；默认任一服务明确可用即停止' \
+    'CLI help must expose the bounded replacement command and its default stop policy'
 }
 
 test_reinstall_accepts_legacy_socks_rule_cleanup() {
@@ -9686,6 +9998,7 @@ run_test 'WireGuard rotation accepts a healthy restore after start failure' test
 run_test 'WireGuard rotation keeps backup when restored runtime stays unhealthy' test_wireguard_rotation_keeps_backup_when_restored_runtime_stays_unhealthy
 run_test 'WireGuard rotation credentials are runtime scoped and cleared' test_wireguard_rotation_credentials_are_runtime_scoped_and_cleared
 run_test 'runtime maintenance signals run exit recovery' test_runtime_maintenance_signals_run_exit_recovery
+run_test 'EXIT trap success helpers do not inherit signal status' test_exit_trap_success_helpers_do_not_inherit_signal_status
 run_test 'WireGuard endpoint candidates preserve hostname config' test_wireguard_endpoint_candidates_preserve_hostname_config
 run_test 'WireGuard endpoint selection falls back and requires dual stack' test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack
 run_test 'WireGuard endpoint selection retries the same endpoint' test_wireguard_endpoint_selection_retries_the_same_endpoint
@@ -9720,6 +10033,8 @@ run_test 'strict WARP configuration stops before connect' test_strict_warp_confi
 run_test 'Socks change-ip requires an explicit Free registration' test_socks_change_ip_requires_an_explicit_free_registration
 run_test 'Socks rotation orders configuration and data-plane gates' test_socks_rotation_orders_registration_configuration_and_data_plane
 run_test 'change-ip dispatches each mode and restores the timer' test_change_ip_dispatches_each_mode_and_finishes_the_timer
+run_test 'change-ip unlock policy prompt handles defaults choices retries and EOF' test_change_ip_unlock_policy_prompt_contract
+run_test 'change-ip unlock policy controls retry success' test_change_ip_unlock_policy_controls_retry_success
 run_test 'change-ip stops after ten failed unlock results' test_change_ip_stops_at_ten_failed_unlock_results
 run_test 'change-ip runtime failure stops immediately' test_change_ip_runtime_failure_stops_immediately
 run_test 'Socks readiness rejects unowned and invalid listeners' test_socks_local_readiness_rejects_unowned_or_invalid_listeners
@@ -9737,6 +10052,7 @@ run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
 run_test 'Gemini probes request only the homepage' test_gemini_probes_use_one_homepage_request
 run_test 'unlock HTTP requests ignore environment proxies' test_unlock_http_transport_ignores_environment_proxies
 run_test 'unlock aggregate requires both services' test_unlock_check_requires_both_services
+run_test 'unlock policy stays local and reports each service' test_unlock_policy_is_local_and_each_service_is_still_reported
 run_test 'unlock check rejects a missing curl dependency' test_unlock_check_missing_curl_is_not_a_pass
 run_test 'unlock check skips only YouTube when Python is missing' test_unlock_check_skips_only_youtube_without_python
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
