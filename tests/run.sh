@@ -2685,6 +2685,7 @@ test_wireguard_rotation_prepares_a_fresh_validated_stage() {
   event="$root/events"
   STATE_DIR="$root/state"
   WG_IFACE=warp-vps-wg
+  WGCF_BIN="$root/wgcf-missing"
   : > "$event"
 
   install() {
@@ -2717,6 +2718,47 @@ test_wireguard_rotation_prepares_a_fresh_validated_stage() {
     'the fresh account must remain isolated in the stage' || return 1
   assert_eq "$(< "${FIXTURE_DIR}/wireguard/valid.conf")" "$(< "${stage}/${WG_IFACE}.conf")" \
     'the validated managed config must remain paired with the staged account'
+}
+
+test_wireguard_rotation_reuses_an_existing_wgcf_binary() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root stage event
+  root="$(mktemp -d)"
+  stage="$root/stage"
+  event="$root/events"
+  STATE_DIR="$root/state"
+  WG_IFACE=warp-vps-wg
+  WGCF_BIN="$root/wgcf"
+  printf '#!/usr/bin/env bash\n' > "$WGCF_BIN"
+  chmod +x "$WGCF_BIN"
+  : > "$event"
+
+  install() {
+    if [ "$1" = '-d' ]; then
+      command mkdir -p "$stage" "${STATE_DIR}/wgcf"
+      return 0
+    fi
+    return 1
+  }
+  install_wgcf_binary() { printf 'unexpected-install\n' >> "$event"; }
+  run_wgcf_command() {
+    printf '%s\n' "$*" >> "$event"
+    case "$1" in
+      register) printf 'new-account\n' > wgcf-account.toml ;;
+      generate) command cp "${FIXTURE_DIR}/wireguard/valid.conf" wgcf-profile.conf ;;
+    esac
+  }
+  write_managed_wg_config() {
+    printf 'validate\n' >> "$event"
+    command cp "$1" "$2"
+  }
+
+  prepare_fresh_wgcf_stage "$stage" || {
+    fail 'an existing executable wgcf binary should prepare a fresh rotation stage'
+    return 1
+  }
+  assert_eq $'register --accept-tos\ngenerate\nvalidate' "$(< "$event")" \
+    'change-ip staging must reuse an existing executable WGCF_BIN'
 }
 
 test_wireguard_rotation_restores_the_original_pair_on_failure() {
@@ -2795,6 +2837,92 @@ test_wireguard_rotation_restores_the_original_pair_on_failure() {
     'a successful rollback must disarm the exit-time rollback hook'
 }
 
+test_wireguard_rotation_accepts_a_healthy_restore_after_start_failure() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event backup stage
+  event="$(mktemp)"
+  backup="/run/${APP_NAME}/wgcf-backup.test"
+  stage="/run/${APP_NAME}/wgcf-stage.test"
+  WG_IFACE=warp-vps-wg
+  WG_ROTATION_ROLLBACK_ARMED=1
+  WG_ROTATION_BACKUP="$backup"
+  WG_ROTATION_STAGE="$stage"
+  : > "$event"
+
+  systemctl() {
+    case "$*" in
+      "start wg-quick@${WG_IFACE}.service")
+        printf 'wg-started\n' >> "$event"
+        return 0
+        ;;
+      'restart warp-vps.service')
+        printf 'warp-vps-restart-failed\n' >> "$event"
+        return 1
+        ;;
+      *) return 0 ;;
+    esac
+  }
+  remove_wireguard_interface() { return 0; }
+  restore_wgcf_backup() { printf 'restore:%s\n' "$1" >> "$event"; }
+  wait_for_wg_ready() { printf 'wg-ready\n' >> "$event"; }
+  required_runtime_units_ready() { printf 'units-ready\n' >> "$event"; }
+  test_quiet() { printf 'route-ready\n' >> "$event"; }
+  wg_handshake_recent() { printf 'handshake-ready\n' >> "$event"; }
+  cleanup_wireguard_rotation_live_temps() { printf 'cleanup-live-temps\n' >> "$event"; }
+  cleanup_wireguard_rotation_path() { printf 'cleanup:%s\n' "$1" >> "$event"; }
+
+  rollback_wireguard_rotation_now "$backup" || {
+    fail 'a restored WireGuard data plane that becomes healthy after start failure should succeed'
+    return 1
+  }
+  assert_eq \
+    "$(printf 'restore:%s\nwg-started\nwg-ready\nwarp-vps-restart-failed\nunits-ready\nroute-ready\nhandshake-ready\ncleanup-live-temps\ncleanup:%s\ncleanup:%s' "$backup" "$stage" "$backup")" \
+    "$(< "$event")" \
+    'rollback must verify the recovered data plane before clearing its staged credentials' || return 1
+  assert_eq '0' "$WG_ROTATION_ROLLBACK_ARMED" \
+    'a healthy post-start restore must disarm rollback' || return 1
+  assert_eq '' "$WG_ROTATION_STAGE" \
+    'a healthy post-start restore must clear the staged credential path' || return 1
+  assert_eq '' "$WG_ROTATION_BACKUP" \
+    'a healthy post-start restore must clear the backup credential path'
+}
+
+test_wireguard_rotation_keeps_backup_when_restored_runtime_stays_unhealthy() {
+  source_without_main "$MANAGER_SCRIPT"
+  local backup checks=0 cleanup_called=0 rc=0 stage
+  backup="/run/${APP_NAME}/wgcf-backup.test"
+  stage="/run/${APP_NAME}/wgcf-stage.test"
+  WG_IFACE=warp-vps-wg
+  WG_ROTATION_ROLLBACK_ARMED=1
+  WG_ROTATION_BACKUP="$backup"
+  WG_ROTATION_STAGE="$stage"
+
+  systemctl() { return 1; }
+  remove_wireguard_interface() { return 0; }
+  restore_wgcf_backup() { return 0; }
+  wait_for_wg_ready() { return 0; }
+  required_runtime_units_ready() { checks=$((checks + 1)); return 1; }
+  test_quiet() { fail 'route check must not run after units remain unhealthy'; return 1; }
+  wg_handshake_recent() { fail 'handshake check must not run after units remain unhealthy'; return 1; }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  clear_wireguard_rotation_artifacts() { cleanup_called=1; }
+
+  SECONDS=0
+  rollback_wireguard_rotation_now "$backup" || rc=$?
+  assert_eq '1' "$rc" \
+    'a restored WireGuard runtime that remains unhealthy must fail' || return 1
+  assert_eq '11' "$checks" \
+    'the final runtime postcondition must use its bounded ten-second window' || return 1
+  assert_eq '0' "$cleanup_called" \
+    'a failed restore must retain rollback credentials' || return 1
+  assert_eq '1' "$WG_ROTATION_ROLLBACK_ARMED" \
+    'a failed restore must keep exit-time rollback armed' || return 1
+  assert_eq "$stage" "$WG_ROTATION_STAGE" \
+    'a failed restore must retain the staged credential path' || return 1
+  assert_eq "$backup" "$WG_ROTATION_BACKUP" \
+    'a failed restore must retain the backup credential path'
+}
+
 test_wireguard_rotation_credentials_are_runtime_scoped_and_cleared() {
   local rotation_body cleanup_body disarm_body exit_body
   rotation_body="$(function_body "$MANAGER_SCRIPT" rotate_wireguard_registration)"
@@ -2870,6 +2998,9 @@ test_runtime_maintenance_signals_run_exit_recovery() {
     'maintenance must convert TERM into an EXIT-trap recovery' || return 1
   assert_contains "$begin_body" "trap 'runtime_maintenance_signal_exit HUP' HUP" \
     'maintenance must convert HUP into an EXIT-trap recovery' || return 1
+  assert_contains "$(function_body "$MANAGER_SCRIPT" restore_health_timer_on_exit)" \
+    "trap ':' INT TERM HUP" \
+    'exit recovery must absorb repeat signals without making child processes inherit ignored signals' || return 1
   assert_contains "$finish_body" 'trap - EXIT INT TERM HUP' \
     'successful maintenance must disarm all recovery traps together'
 }
@@ -7897,6 +8028,44 @@ test_uninstall_scope_controls_dependency_and_fallback_cleanup() {
     'all uninstall must permanently delete an owned source-built redsocks binary'
 }
 
+test_uninstall_all_lists_and_removes_the_runtime_directory() {
+  source_without_main "$MANAGER_SCRIPT"
+
+  local root output_file output removed_paths=''
+  root="$(mktemp -d)"
+  output_file="$root/output"
+  require_root() { :; }
+  load_uninstall_config() {
+    WARP_MODE=socks
+    WG_IFACE=warp-vps-wg
+    WG_CONFIG=/etc/wireguard/warp-vps-wg.conf
+    MANAGED_WARP_SVC=0
+    UNINSTALL_WIREGUARD_PRESENT=0
+    UNINSTALL_RUNTIME_IDENTIFIED=1
+  }
+  recover_uninstall_runtime_from_unit() { :; }
+  managed_redsocks_fallback_exists() { return 1; }
+  deactivate_runtime_for_uninstall() { :; }
+  section() { :; }
+  info_line() { :; }
+  print_remove_target_if_exists() { printf '%s\n' "$1"; }
+  uninstall_project_dependencies() { :; }
+  uninstall_managed_swap() { :; }
+  remove_file_if_exists() { removed_paths="${removed_paths}${1}"$'\n'; }
+  remove_tree_if_exists() { removed_paths="${removed_paths}${1}"$'\n'; }
+  systemctl() { :; }
+
+  cmd_uninstall all > "$output_file" || {
+    fail 'uninstall all should complete with mocked owned resources'
+    return 1
+  }
+  output="$(< "$output_file")"
+  assert_contains "$output" "/run/${APP_NAME}" \
+    'uninstall all must list the volatile rotation directory for deletion' || return 1
+  assert_contains "$removed_paths" "/run/${APP_NAME}" \
+    'uninstall all must remove the volatile rotation directory'
+}
+
 test_dependency_failure_stops_before_file_deletion() {
   source_without_main "$MANAGER_SCRIPT"
 
@@ -9511,7 +9680,10 @@ run_test 'WireGuard support uses a real runtime preflight' test_wireguard_uses_r
 run_test 'wgcf fixed release atomically replaces old executables' test_wgcf_fixed_binary_replaces_old_copy_atomically
 run_test 'WireGuard generation recovers from partial state' test_wireguard_config_generation_is_retryable
 run_test 'WireGuard rotation prepares a fresh validated stage' test_wireguard_rotation_prepares_a_fresh_validated_stage
+run_test 'WireGuard rotation reuses an existing wgcf binary' test_wireguard_rotation_reuses_an_existing_wgcf_binary
 run_test 'WireGuard rotation restores the original pair on failure' test_wireguard_rotation_restores_the_original_pair_on_failure
+run_test 'WireGuard rotation accepts a healthy restore after start failure' test_wireguard_rotation_accepts_a_healthy_restore_after_start_failure
+run_test 'WireGuard rotation keeps backup when restored runtime stays unhealthy' test_wireguard_rotation_keeps_backup_when_restored_runtime_stays_unhealthy
 run_test 'WireGuard rotation credentials are runtime scoped and cleared' test_wireguard_rotation_credentials_are_runtime_scoped_and_cleared
 run_test 'runtime maintenance signals run exit recovery' test_runtime_maintenance_signals_run_exit_recovery
 run_test 'WireGuard endpoint candidates preserve hostname config' test_wireguard_endpoint_candidates_preserve_hostname_config
@@ -9616,6 +9788,7 @@ run_test 'dependency services stop independently' test_dependency_services_stop_
 run_test 'dependency uninstall requires an absent postcondition' test_dependency_uninstall_requires_absent_postcondition
 run_test 'RPM dependency postcondition parsing fails closed' test_rpm_dependency_postcondition_parser_fails_closed
 run_test 'uninstall scope controls dependency and fallback cleanup' test_uninstall_scope_controls_dependency_and_fallback_cleanup
+run_test 'uninstall all lists and removes the runtime directory' test_uninstall_all_lists_and_removes_the_runtime_directory
 run_test 'dependency failure stops before file deletion' test_dependency_failure_stops_before_file_deletion
 run_test 'post-delete daemon reload failure is only a warning' test_uninstall_daemon_reload_failure_is_post_commit_warning
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes

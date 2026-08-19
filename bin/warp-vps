@@ -647,7 +647,7 @@ PY
 write_managed_wg_config() {
   local profile="$1"
   local output="$2"
-  python3 - "$profile" "$output" <<'PY'
+  python3 - "$profile" "$output" <<'PY' || return 1
 import pathlib
 import sys
 
@@ -670,7 +670,7 @@ if not inserted:
     raise SystemExit("WireGuard 配置缺少 [Interface]")
 dst.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 PY
-  chmod 0600 "$output"
+  chmod 0600 "$output" || return 1
   wg_config_valid "$output"
 }
 
@@ -756,7 +756,7 @@ prepare_fresh_wgcf_stage() {
   local wgcf_rc=0
 
   install -d -m 0700 /etc/wireguard "${STATE_DIR}/wgcf" "$stage" || return 1
-  install_wgcf_binary
+  [ -x "$WGCF_BIN" ] || install_wgcf_binary
   (
     cd "$stage"
     run_wgcf_command register --accept-tos >/dev/null
@@ -1890,7 +1890,8 @@ ensure_health_timer() {
 
 restore_health_timer_on_exit() {
   local rc=$?
-  trap - EXIT INT TERM HUP
+  trap - EXIT
+  trap ':' INT TERM HUP
   set +e
   cleanup_wireguard_rotation_live_temps
   if [ "$WG_ROTATION_ROLLBACK_ARMED" -eq 1 ] && [ -n "$WG_ROTATION_BACKUP" ]; then
@@ -2141,12 +2142,20 @@ configure_warp_runtime() {
 }
 
 start_wireguard_rotation_runtime() {
+  local deadline
   systemctl reset-failed "wg-quick@${WG_IFACE}.service" warp-vps.service \
     >/dev/null 2>&1 || true
-  systemctl start "wg-quick@${WG_IFACE}.service" || return 1
+  systemctl start "wg-quick@${WG_IFACE}.service" || true
   wait_for_wg_ready 20 || return 1
-  systemctl restart warp-vps.service || return 1
-  required_runtime_units_ready && test_quiet && wg_handshake_recent
+  systemctl restart warp-vps.service || true
+  deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -le "$deadline" ]; do
+    if required_runtime_units_ready && test_quiet && wg_handshake_recent; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 cleanup_wireguard_rotation_path() {
@@ -3980,6 +3989,7 @@ cmd_uninstall() {
   print_remove_target_if_exists "$ETC_DIR"
   print_remove_target_if_exists "$APP_DIR"
   print_remove_target_if_exists "$STATE_DIR"
+  print_remove_target_if_exists "/run/${APP_NAME}"
   print_remove_target_if_exists "$BIN_PATH"
   if [ "$remove_managed_redsocks" -eq 1 ]; then
     print_remove_target_if_exists "$REDSOCKS_FALLBACK_BIN"
@@ -4009,6 +4019,7 @@ cmd_uninstall() {
   remove_tree_if_exists "$ETC_DIR"
   remove_tree_if_exists "$APP_DIR"
   remove_tree_if_exists "$STATE_DIR"
+  remove_tree_if_exists "/run/${APP_NAME}"
   remove_file_if_exists "$BIN_PATH"
   systemctl daemon-reload \
     || warn "项目文件已删除，但 systemd 重新加载失败；请稍后执行 systemctl daemon-reload"
