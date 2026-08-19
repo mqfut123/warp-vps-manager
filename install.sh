@@ -2143,6 +2143,7 @@ print_installer_menu() {
   printf '  7. 重装或切换路由范围 / 运行模式\n'
   printf '  8. 查看最近日志\n'
   printf '  9. 卸载\n'
+  printf ' 10. 更换 WARP IP\n'
   printf '  0. 退出\n'
 }
 
@@ -2236,12 +2237,16 @@ installer_menu() {
         fi
         finish_menu_action "卸载" || return 0
         ;;
+      10)
+        run_menu_manager_action change-ip
+        finish_menu_action "WARP IP 更换" || return 0
+        ;;
       0)
         printf '已退出管理菜单。\n'
         return 0
         ;;
       *)
-        printf '输入无效，请输入 0-9。\n' >&2
+        printf '输入无效，请输入 0-10。\n' >&2
         ;;
     esac
   done
@@ -2599,7 +2604,7 @@ main() {
     printf '路由范围：精准分流 Google 服务\n'
   fi
   printf '交互菜单：warp-vps\n'
-  printf '显式命令：warp-vps {status|test|native-unlock-check|unlock-check|restart|update|reinstall|switch|logs|uninstall}\n'
+  printf '显式命令：warp-vps {status|test|native-unlock-check|unlock-check|change-ip|restart|update|reinstall|switch|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ] && [ "$selected_scope" = "global" ]; then
     printf 'Socks5 全局模式会把 VPS 主动发起的公网 IPv4 TCP 透明转发到 WARP；入站连接回包保持原生路径，Google IPv4 UDP/443（QUIC）和 Google IPv6 继续拒绝。\n'
   elif [ "$selected_mode" = "socks" ]; then

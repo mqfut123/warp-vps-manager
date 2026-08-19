@@ -837,7 +837,7 @@ test_real_no_tty_installer_requests_are_bounded() {
 test_installer_menu_maps_public_actions_and_recovers() {
   source_without_main "$INSTALL_SCRIPT"
   local answer_index=0 calls='' renders=0
-  local answers=('1' '' '2' '' '3' '' '4' '' '5' '' '8' '' '10' '0')
+  local answers=('1' '' '2' '' '3' '' '4' '' '5' '' '8' '' '10' '' '11' '0')
   require_root() { :; }
   print_installer_menu() { renders=$((renders + 1)); }
   read_input() {
@@ -852,9 +852,9 @@ test_installer_menu_maps_public_actions_and_recovers() {
   }
 
   installer_menu >/dev/null 2>&1
-  assert_eq 'status test native-unlock-check unlock-check restart logs ' "$calls" \
+  assert_eq 'status test native-unlock-check unlock-check restart logs change-ip ' "$calls" \
     'menu choices must map to the existing public manager commands' || return 1
-  assert_eq '8' "$renders" \
+  assert_eq '9' "$renders" \
     'successful, failed, and invalid ordinary actions should all return to the same menu'
 }
 
@@ -976,6 +976,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   cmd_test() { calls="${calls}test "; }
   cmd_native_unlock_check() { calls="${calls}native-unlock-check "; }
   cmd_unlock_check() { calls="${calls}unlock-check "; }
+  cmd_change_ip() { calls="${calls}change-ip "; }
   cmd_restart() { calls="${calls}restart "; }
   cmd_update() { calls="${calls}update "; }
   cmd_logs() { calls="${calls}logs "; }
@@ -992,13 +993,14 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   main test
   main native-unlock-check
   main unlock-check
+  main change-ip
   main restart
   main update
   main logs
   main uninstall --yes
   main reinstall --mode socks
   main switch wireguard --swap none
-  assert_eq 'status test native-unlock-check unlock-check lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
+  assert_eq 'status test native-unlock-check unlock-check lock:wait change-ip lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
     "$calls" 'all public CLI commands must retain their dispatcher and arguments' || return 1
   assert_contains "$calls" 'reinstall:--mode socks ' \
     'noninteractive reinstall arguments must reach their dispatcher' || return 1
@@ -1025,6 +1027,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   cmd_test() { calls="${calls}test "; }
   cmd_native_unlock_check() { calls="${calls}native-unlock "; }
   cmd_unlock_check() { calls="${calls}unlock "; }
+  cmd_change_ip() { calls="${calls}change-ip "; }
   cmd_restart() { calls="${calls}restart "; }
   cmd_update() { calls="${calls}update "; }
   cmd_logs() { calls="${calls}logs "; }
@@ -1039,7 +1042,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   install_systemd() { calls="${calls}systemd "; }
   run_with_runtime_lock() { shift; "$@"; }
 
-  for cmd in menu status test native-unlock-check unlock-check restart update logs heal apply start-rules stop-rules \
+  for cmd in menu status test native-unlock-check unlock-check change-ip restart update logs heal apply start-rules stop-rules \
     configure-warp setup-wireguard preflight-wireguard wait-wireguard install-systemd help; do
     calls=''
     rc=0
@@ -1214,9 +1217,10 @@ test_installer_operation_lock_bounds_live_mutation() {
 
 test_manager_operation_lock_policies() {
   source_without_main "$MANAGER_SCRIPT"
-  local flock_available=1 busy=1 action_calls=0 unlock_calls=0
-  local output_file output rc=0 main_body
+  local flock_available=1 busy=1 unlock_calls=0
+  local output_file action_log output rc=0 main_body
   RUNTIME_LOCK_FILE="$(mktemp)"
+  action_log="$(mktemp)"
   require_root() { :; }
   command() {
     if [ "${1:-}" = '-v' ] && [ "${2:-}" = flock ]; then
@@ -1233,14 +1237,14 @@ test_manager_operation_lock_policies() {
     esac
   }
   locked_action() {
-    action_calls=$((action_calls + 1))
+    printf 'action\n' >> "$action_log"
     printf 'EVENT:action\n'
   }
 
   output_file="$(mktemp)"
   run_with_runtime_lock skip locked_action > "$output_file" 2>&1 || return 1
   output="$(< "$output_file")"
-  assert_eq '0' "$action_calls" \
+  assert_eq '0' "$(grep -c '^action$' "$action_log" || true)" \
     'a busy heal lock should skip the repair body' || return 1
   assert_contains "$output" '本次健康检查跳过' \
     'a busy heal lock should be a visible successful skip' || return 1
@@ -1255,7 +1259,7 @@ test_manager_operation_lock_policies() {
 
   busy=0
   run_with_runtime_lock wait locked_action >/dev/null || return 1
-  assert_eq '1' "$action_calls" \
+  assert_eq '1' "$(grep -c '^action$' "$action_log" || true)" \
     'an available wait lock should execute the mutation body exactly once' || return 1
   assert_eq '1' "$unlock_calls" \
     'a completed mutation should explicitly release its operation lock' || return 1
@@ -1270,12 +1274,14 @@ test_manager_operation_lock_policies() {
 
   flock_available=0
   run_with_runtime_lock wait locked_action >/dev/null || return 1
-  assert_eq '2' "$action_calls" \
+  assert_eq '2' "$(grep -c '^action$' "$action_log" || true)" \
     'hosts without flock must still run the requested operation'
 
   main_body="$(function_body "$MANAGER_SCRIPT" main)"
   assert_contains "$main_body" 'run_with_runtime_lock wait cmd_restart' \
     'restart must use the shared short-wait operation lock' || return 1
+  assert_contains "$main_body" 'run_with_runtime_lock wait cmd_change_ip' \
+    'change-ip must use the shared short-wait operation lock' || return 1
   assert_contains "$main_body" 'run_with_runtime_lock wait cmd_update' \
     'update must use the shared short-wait operation lock' || return 1
   assert_contains "$main_body" 'run_with_runtime_lock wait cmd_uninstall' \
@@ -1286,6 +1292,60 @@ test_manager_operation_lock_policies() {
     'installer-internal WARP setup must not recursively acquire the same operation lock' || return 1
   assert_not_contains "$main_body" 'configure-warp) run_with_runtime_lock' \
     'installer-internal WARP setup must not self-deadlock on the shared lock'
+}
+
+test_runtime_lock_preserves_top_level_fail_fast() {
+  local root functions_file harness fake_flock event flock_log output rc=0
+  root="$(mktemp -d)"
+  functions_file="$root/manager-functions.sh"
+  harness="$root/harness.sh"
+  fake_flock="$root/flock"
+  event="$root/events"
+  flock_log="$root/flock-events"
+  output="$root/output"
+  : > "$event"
+  : > "$flock_log"
+
+  sed \
+    -e '/^if \[ "${BASH_SOURCE\[0\]:-\$0}" = "\$0" \]; then$/,/^fi$/d' \
+    -e '/^main "\$@"$/d' \
+    "$MANAGER_SCRIPT" > "$functions_file"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'source "$WARP_TEST_MANAGER_FUNCTIONS"' \
+    'require_root() { :; }' \
+    'RUNTIME_LOCK_FILE="$WARP_TEST_LOCK_FILE"' \
+    'fragile_action() {' \
+    '  printf "before\\n" >> "$WARP_TEST_EVENT"' \
+    '  false' \
+    '  printf "after\\n" >> "$WARP_TEST_EVENT"' \
+    '}' \
+    'run_with_runtime_lock wait fragile_action' \
+    'printf "wrapper-after\\n" >> "$WARP_TEST_EVENT"' \
+    > "$harness"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\\n" "$*" >> "$WARP_TEST_FLOCK_LOG"' \
+    'exit 0' \
+    > "$fake_flock"
+  chmod 0755 "$harness" "$fake_flock"
+
+  export WARP_TEST_MANAGER_FUNCTIONS="$functions_file"
+  export WARP_TEST_LOCK_FILE="$root/runtime.lock"
+  export WARP_TEST_EVENT="$event"
+  export WARP_TEST_FLOCK_LOG="$flock_log"
+  set +e
+  PATH="$root:/usr/bin:/bin:/usr/sbin:/sbin" bash "$harness" > "$output" 2>&1
+  rc=$?
+  set -e
+
+  assert_eq '1' "$rc" \
+    'a fragile mutation must terminate the independent top-level manager process' || return 1
+  assert_eq 'before' "$(< "$event")" \
+    'top-level fail-fast must stop both the action tail and wrapper tail' || return 1
+  assert_eq '-w 10 9' "$(< "$flock_log")" \
+    'the regression must exercise a real external flock acquisition before failure'
 }
 
 test_assets_are_staged_before_runtime_stops() {
@@ -2462,13 +2522,25 @@ test_wireguard_config_generation_is_retryable() {
     'a validated WireGuard config should be activated atomically' || return 1
 
   source_without_main "$MANAGER_SCRIPT"
-  local timeout_args='' rc=0
+  local timeout_args='' timeout_environment='' rc=0
   WGCF_BIN=/opt/warp-vps-manager/bin/wgcf
-  timeout() { timeout_args="$*"; return 124; }
+  timeout() {
+    timeout_args="$*"
+    timeout_environment="${http_proxy-}|${https_proxy-}|${all_proxy-}|${HTTP_PROXY-}|${HTTPS_PROXY-}|${ALL_PROXY-}|${no_proxy-}|${NO_PROXY-}"
+    return 124
+  }
+  http_proxy=http://127.0.0.1:18080
+  https_proxy=http://127.0.0.1:18443
+  all_proxy=socks5://127.0.0.1:1080
+  HTTP_PROXY=http://127.0.0.1:28080
+  HTTPS_PROXY=http://127.0.0.1:28443
+  ALL_PROXY=socks5://127.0.0.1:2080
   run_wgcf_command register --accept-tos >/dev/null 2>&1 || rc=$?
   assert_eq '124' "$rc" 'a wgcf timeout must propagate to the installation transaction' || return 1
   assert_eq '-k 5 120 /opt/warp-vps-manager/bin/wgcf register --accept-tos' "$timeout_args" \
     'wgcf must have both a total deadline and a forced-kill deadline' || return 1
+  assert_eq '||||||*|*' "$timeout_environment" \
+    'wgcf registration must ignore inherited proxy endpoints while allowing direct access' || return 1
 
   root="$(mktemp -d)"
   event="$root/wgcf-events"
@@ -2603,6 +2675,203 @@ test_wireguard_config_generation_is_retryable() {
     fail 'a WireGuard peer without IPv4 AllowedIPs must not be reused'
     return 1
   fi
+}
+
+test_wireguard_rotation_prepares_a_fresh_validated_stage() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root stage event
+  root="$(mktemp -d)"
+  stage="$root/stage"
+  event="$root/events"
+  STATE_DIR="$root/state"
+  WG_IFACE=warp-vps-wg
+  : > "$event"
+
+  install() {
+    if [ "$1" = '-d' ]; then
+      command mkdir -p "$stage" "${STATE_DIR}/wgcf"
+      return 0
+    fi
+    return 1
+  }
+  install_wgcf_binary() { printf 'binary\n' >> "$event"; }
+  run_wgcf_command() {
+    printf '%s\n' "$*" >> "$event"
+    case "$1" in
+      register) printf 'new-account\n' > wgcf-account.toml ;;
+      generate) command cp "${FIXTURE_DIR}/wireguard/valid.conf" wgcf-profile.conf ;;
+    esac
+  }
+  write_managed_wg_config() {
+    printf 'validate\n' >> "$event"
+    command cp "$1" "$2"
+  }
+
+  prepare_fresh_wgcf_stage "$stage" || {
+    fail 'a fresh wgcf registration and profile should prepare a rotation stage'
+    return 1
+  }
+  assert_eq $'binary\nregister --accept-tos\ngenerate\nvalidate' "$(< "$event")" \
+    'the rotation stage must register, generate and validate before live activation' || return 1
+  assert_eq 'new-account' "$(< "${stage}/wgcf-account.toml")" \
+    'the fresh account must remain isolated in the stage' || return 1
+  assert_eq "$(< "${FIXTURE_DIR}/wireguard/valid.conf")" "$(< "${stage}/${WG_IFACE}.conf")" \
+    'the validated managed config must remain paired with the staged account'
+}
+
+test_wireguard_rotation_restores_the_original_pair_on_failure() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root event starts=0 rc=0 real_stage real_backup
+  root="$(/usr/bin/mktemp -d)"
+  event="$root/events"
+  real_stage="$root/stage"
+  real_backup="$root/backup"
+  STATE_DIR="$root/state"
+  WGCF_ACCOUNT="${STATE_DIR}/wgcf/wgcf-account.toml"
+  WG_CONFIG="$root/warp-vps-wg.conf"
+  WG_IFACE=warp-vps-wg
+  command mkdir -p "${STATE_DIR}/wgcf"
+  printf 'old-account\n' > "$WGCF_ACCOUNT"
+  printf 'old-config\n' > "$WG_CONFIG"
+  : > "$event"
+
+  install() {
+    if [ "$1" = '-d' ] && [ "${*: -1}" = "/run/${APP_NAME}" ]; then
+      return 0
+    fi
+    /usr/bin/install "$@"
+  }
+  mktemp() {
+    case "${*: -1}" in
+      */wgcf-stage.*) command mkdir -p "$real_stage"; printf '%s\n' "$real_stage" ;;
+      */wgcf-backup.*) command mkdir -p "$real_backup"; printf '%s\n' "$real_backup" ;;
+      *) return 1 ;;
+    esac
+  }
+  clear_wireguard_rotation_artifacts() {
+    printf 'clear-artifacts\n' >> "$event"
+    WG_ROTATION_STAGE=""
+    WG_ROTATION_BACKUP=""
+    return 0
+  }
+
+  prepare_fresh_wgcf_stage() {
+    local stage="$1"
+    command mkdir -p "$stage"
+    printf 'new-account\n' > "${stage}/wgcf-account.toml"
+    printf 'new-config\n' > "${stage}/${WG_IFACE}.conf"
+    printf 'prepare\n' >> "$event"
+  }
+  systemctl() {
+    printf 'systemctl:%s\n' "$*" >> "$event"
+    return 0
+  }
+  remove_wireguard_interface() {
+    printf 'remove-interface\n' >> "$event"
+    return 0
+  }
+  start_wireguard_rotation_runtime() {
+    starts=$((starts + 1))
+    if [ "$starts" -eq 1 ]; then
+      printf 'new-pair:%s|%s\n' "$(< "$WGCF_ACCOUNT")" "$(< "$WG_CONFIG")" >> "$event"
+      return 1
+    fi
+    printf 'restored-pair:%s|%s\n' "$(< "$WGCF_ACCOUNT")" "$(< "$WG_CONFIG")" >> "$event"
+    return 0
+  }
+
+  rotate_wireguard_registration 1 >/dev/null 2>&1 || rc=$?
+  assert_eq '1' "$rc" \
+    'a new WireGuard registration without a working data plane must fail the attempt' || return 1
+  assert_contains "$(< "$event")" 'new-pair:new-account|new-config' \
+    'the staged account and config must activate as one tested pair' || return 1
+  assert_contains "$(< "$event")" 'restored-pair:old-account|old-config' \
+    'a failed new data plane must restore the original account and config together' || return 1
+  assert_eq 'old-account' "$(< "$WGCF_ACCOUNT")" \
+    'the failed attempt must leave the original account live' || return 1
+  assert_eq 'old-config' "$(< "$WG_CONFIG")" \
+    'the failed attempt must leave the original config live' || return 1
+  assert_eq '0' "$WG_ROTATION_ROLLBACK_ARMED" \
+    'a successful rollback must disarm the exit-time rollback hook'
+}
+
+test_wireguard_rotation_credentials_are_runtime_scoped_and_cleared() {
+  local rotation_body cleanup_body disarm_body exit_body
+  rotation_body="$(function_body "$MANAGER_SCRIPT" rotate_wireguard_registration)"
+  cleanup_body="$(function_body "$MANAGER_SCRIPT" clear_wireguard_rotation_artifacts)"
+  disarm_body="$(function_body "$MANAGER_SCRIPT" disarm_wireguard_rotation_rollback)"
+  exit_body="$(function_body "$MANAGER_SCRIPT" restore_health_timer_on_exit)"
+
+  assert_contains "$rotation_body" 'rotation_root="/run/${APP_NAME}"' \
+    'rotation credentials must use the volatile runtime filesystem' || return 1
+  assert_contains "$rotation_body" 'mktemp -d "${rotation_root}/wgcf-stage.' \
+    'the fresh registration must use a private runtime directory' || return 1
+  assert_contains "$rotation_body" 'mktemp -d "${rotation_root}/wgcf-backup.' \
+    'the rollback pair must use a separate private runtime directory' || return 1
+  assert_not_contains "$rotation_body" '${STATE_DIR}/wgcf-rotation' \
+    'rotation credentials must not persist under the project state directory' || return 1
+  assert_contains "$cleanup_body" 'cleanup_wireguard_rotation_live_temps' \
+    'normal cleanup must remove beside-live temporary credential files' || return 1
+  assert_contains "$cleanup_body" 'cleanup_wireguard_rotation_path "$WG_ROTATION_STAGE"' \
+    'normal cleanup must remove the fresh registration directory' || return 1
+  assert_contains "$cleanup_body" 'cleanup_wireguard_rotation_path "$WG_ROTATION_BACKUP"' \
+    'normal cleanup must remove the rollback credential directory' || return 1
+  assert_contains "$disarm_body" 'clear_wireguard_rotation_artifacts' \
+    'a committed rotation must clear both credential directories' || return 1
+  assert_contains "$exit_body" 'cleanup_wireguard_rotation_live_temps' \
+    'the exit trap must clean partial beside-live credential files'
+}
+
+test_runtime_maintenance_signals_run_exit_recovery() {
+  local event rc=0 output begin_body finish_body
+  event="$(mktemp)"
+
+  (
+    source_without_main "$MANAGER_SCRIPT"
+    local active_checks=0
+    systemctl() {
+      printf 'systemctl:%s\n' "$*" >> "$event"
+      return 0
+    }
+    uninstall_unit_is_active() {
+      if [ "$1" = warp-vps-health.timer ] && [ "$active_checks" -eq 0 ]; then
+        active_checks=1
+        return 0
+      fi
+      return 1
+    }
+    cleanup_wireguard_rotation_live_temps() { :; }
+    recover_socks_rotation() {
+      printf 'recover-socks\n' >> "$event"
+      return 0
+    }
+    begin_runtime_maintenance
+    eval 'SOCKS_ROTATION_RECOVERY_ARMED=1'
+    printf 'signal\n' >> "$event"
+    /bin/sh -c 'kill -TERM "$PPID"'
+    printf 'after-signal\n' >> "$event"
+  ) >/dev/null 2>&1 || rc=$?
+
+  assert_eq '143' "$rc" \
+    'TERM during registration replacement must retain the signal exit status' || return 1
+  output="$(< "$event")"
+  assert_contains "$output" 'recover-socks' \
+    'TERM must route through the common EXIT recovery before process exit' || return 1
+  assert_contains "$output" 'systemctl:start warp-vps-health.timer' \
+    'TERM must restore a health timer that was active before maintenance' || return 1
+  assert_not_contains "$output" 'after-signal' \
+    'the interrupted operation must not continue after recovery' || return 1
+
+  begin_body="$(function_body "$MANAGER_SCRIPT" begin_runtime_maintenance)"
+  finish_body="$(function_body "$MANAGER_SCRIPT" finish_runtime_maintenance)"
+  assert_contains "$begin_body" "trap 'runtime_maintenance_signal_exit INT' INT" \
+    'maintenance must convert INT into an EXIT-trap recovery' || return 1
+  assert_contains "$begin_body" "trap 'runtime_maintenance_signal_exit TERM' TERM" \
+    'maintenance must convert TERM into an EXIT-trap recovery' || return 1
+  assert_contains "$begin_body" "trap 'runtime_maintenance_signal_exit HUP' HUP" \
+    'maintenance must convert HUP into an EXIT-trap recovery' || return 1
+  assert_contains "$finish_body" 'trap - EXIT INT TERM HUP' \
+    'successful maintenance must disarm all recovery traps together'
 }
 
 test_wireguard_endpoint_candidates_preserve_hostname_config() {
@@ -4406,6 +4675,241 @@ test_warp_command_errors_defer_to_real_readiness() {
     'an unknown registration state must not trigger speculative registration'
 }
 
+test_strict_warp_configuration_stops_before_connect() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event rc=0
+  event="$(mktemp)"
+
+  command() { [ "$1" = '-v' ] && [ "$2" = warp-cli ]; }
+  systemctl() { return 0; }
+  inspect_warp_registration() { WARP_REGISTRATION_STATE=present; }
+  try_warp_command() {
+    printf '%s\n' "$*" >> "$event"
+    case "$*" in *'mode proxy'*) return 1 ;; *) return 0 ;; esac
+  }
+  print_warp_diagnostics() { printf 'diagnostics\n' >> "$event"; }
+  wait_for_warp_proxy_ready() { printf 'wait\n' >> "$event"; return 0; }
+  WARP_SOCKS_PORT=24567
+
+  configure_warp_runtime strict >/dev/null 2>&1 || rc=$?
+  assert_eq '1' "$rc" \
+    'strict rotation setup must reject a failed proxy-mode write' || return 1
+  assert_contains "$(< "$event")" 'proxy port 24567' \
+    'strict setup should still apply every required setting for complete diagnostics' || return 1
+  assert_contains "$(< "$event")" 'diagnostics' \
+    'strict setting failure must emit the existing WARP diagnostics' || return 1
+  assert_not_contains "$(< "$event")" 'connect' \
+    'strict setting failure must stop before connecting a partly configured client' || return 1
+  assert_not_contains "$(< "$event")" 'wait' \
+    'strict setting failure must not mistake a stale listener for the new configuration'
+}
+
+test_socks_change_ip_requires_an_explicit_free_registration() {
+  source_without_main "$MANAGER_SCRIPT"
+  local registration_output output event rc=0 managed=1
+  event="$(mktemp)"
+  registration_output='Account Type: Free'
+  timeout() { printf '%s\n' "$registration_output"; }
+
+  assert_eq 'free' "$(warp_registration_account_type)" \
+    'the official Free account field should authorize Socks registration replacement' || return 1
+
+  registration_output=$'Account Type: Free\nType: Free'
+  rc=0
+  output="$(warp_registration_account_type)" || rc=$?
+  assert_eq '1' "$rc" \
+    'duplicate account-type fields must not authorize registration deletion' || return 1
+
+  registration_output='Plan: Free'
+  rc=0
+  output="$(warp_registration_account_type)" || rc=$?
+  assert_eq '1' "$rc" \
+    'unrelated Free text must not authorize registration deletion' || return 1
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE=socks; MANAGED_WARP_SVC="$managed"; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  warp_registration_account_type() { printf 'unlimited\n'; }
+  begin_runtime_maintenance() { printf 'begin\n' >> "$event"; }
+  rotate_socks_registration() { printf 'rotate\n' >> "$event"; }
+
+  rc=0
+  output="$(cmd_change_ip 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'an Unlimited or organization registration must be rejected' || return 1
+  assert_contains "$output" '不是可替换的 Free 注册' \
+    'the rejected Socks account must explain the supported account boundary' || return 1
+  assert_eq '' "$(< "$event")" \
+    'the Free-account gate must run before timer or registration mutation' || return 1
+
+  warp_registration_account_type() { printf 'free\n'; }
+  managed=0
+  rc=0
+  output="$(cmd_change_ip 2>&1)" || rc=$?
+  assert_eq '1' "$rc" \
+    'a user-owned Free registration must not be replaced' || return 1
+  assert_contains "$output" '不属于本项目管理' \
+    'the ownership rejection must identify the protected WARP Client' || return 1
+  assert_eq '' "$(< "$event")" \
+    'the ownership gate must run before timer or registration mutation'
+}
+
+test_socks_rotation_orders_registration_configuration_and_data_plane() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event rc=0
+  event="$(mktemp)"
+  WARP_SOCKS_PORT=24567
+
+  delete_warp_registration() { printf 'delete\n' >> "$event"; }
+  create_warp_registration() { printf 'create\n' >> "$event"; }
+  configure_warp_runtime() { printf 'configure:%s:%s\n' "${1:-}" "$WARP_SOCKS_PORT" >> "$event"; }
+  redsocks_local_ready() { printf 'redsocks\n' >> "$event"; }
+  table_exists() { printf 'rules\n' >> "$event"; }
+  socks_ok() { printf 'trace\n' >> "$event"; }
+  socks_forwarding_ok() { printf 'forwarding\n' >> "$event"; }
+
+  rotate_socks_registration || {
+    fail 'a fully restored Socks data plane should complete one registration rotation'
+    return 1
+  }
+  assert_eq $'delete\ncreate\nconfigure:strict:24567\nredsocks\nrules\ntrace\nforwarding' "$(< "$event")" \
+    'Socks rotation must preserve the port and validate each boundary in strict order' || return 1
+
+  : > "$event"
+  socks_ok() { printf 'trace\n' >> "$event"; return 1; }
+  recover_socks_rotation() { printf 'recover\n' >> "$event"; return 0; }
+  rc=0
+  rotate_socks_registration >/dev/null 2>&1 || rc=$?
+  assert_eq '1' "$rc" 'a failed WARP trace must fail the Socks rotation' || return 1
+  assert_eq $'delete\ncreate\nconfigure:strict:24567\nredsocks\nrules\ntrace\nrecover' "$(< "$event")" \
+    'a failed Socks data-plane gate must recover before returning and skip forwarding validation' || return 1
+  assert_eq '0' "$SOCKS_ROTATION_RECOVERY_ARMED" \
+    'successful Socks recovery must disarm the exit-time recovery hook' || return 1
+
+  : > "$event"
+  recover_socks_rotation() { printf 'recover\n' >> "$event"; return 1; }
+  rc=0
+  rotate_socks_registration >/dev/null 2>&1 || rc=$?
+  assert_eq '2' "$rc" \
+    'a failed Socks recovery must retain the distinct exit-trap recovery status' || return 1
+  assert_eq '1' "$SOCKS_ROTATION_RECOVERY_ARMED" \
+    'failed immediate recovery must leave the exit-time recovery hook armed'
+}
+
+test_change_ip_dispatches_each_mode_and_finishes_the_timer() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event mode
+  event="$(mktemp)"
+  mode=wireguard
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE="$mode"; MANAGED_WARP_SVC=1; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  managed_wireguard_config_owned() { return 0; }
+  warp_registration_account_type() { printf 'free\n'; }
+  begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
+  finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
+  rotate_wireguard_registration() { printf 'wireguard:%s\n' "$1" >> "$event"; }
+  rotate_socks_registration() { printf 'socks\n' >> "$event"; }
+  run_unlock_checks() { printf 'detect\n' >> "$event"; return 0; }
+
+  cmd_change_ip >/dev/null || {
+    fail 'the first healthy WireGuard registration should complete change-ip'
+    return 1
+  }
+  assert_eq $'timer:begin\nwireguard:1\ndetect\ntimer:finish' "$(< "$event")" \
+    'WireGuard change-ip must rotate once, detect once and restore the timer' || return 1
+
+  : > "$event"
+  mode=socks
+  cmd_change_ip >/dev/null || {
+    fail 'the first healthy Free Socks registration should complete change-ip'
+    return 1
+  }
+  assert_eq $'timer:begin\nsocks\ndetect\ntimer:finish' "$(< "$event")" \
+    'Socks change-ip must use only its backend and restore the timer'
+}
+
+test_change_ip_stops_at_ten_failed_unlock_results() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event rc=0 rotations detections
+  event="$(mktemp)"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE=wireguard; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  managed_wireguard_config_owned() { return 0; }
+  begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
+  finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
+  rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  run_unlock_checks() { printf 'detect\n' >> "$event"; return 1; }
+
+  cmd_change_ip >/dev/null || rc=$?
+  assert_eq '1' "$rc" 'ten healthy but unsupported exits must return failure' || return 1
+  rotations="$(grep -c '^rotate:' "$event")"
+  detections="$(grep -c '^detect$' "$event")"
+  assert_eq '10' "$rotations" 'change-ip must perform exactly ten bounded rotations' || return 1
+  assert_eq '10' "$detections" 'every successful rotation must receive one fresh detection' || return 1
+  assert_contains "$(< "$event")" 'rotate:10' \
+    'the final allowed rotation must remain the live registration' || return 1
+  assert_eq '1' "$(grep -c '^timer:begin$' "$event")" \
+    'the ten-attempt loop must pause health automation once' || return 1
+  assert_eq '1' "$(grep -c '^timer:finish$' "$event")" \
+    'the exhausted loop must restore health automation once'
+}
+
+test_change_ip_runtime_failure_stops_immediately() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event output rc=0
+  event="$(mktemp)"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE=socks; MANAGED_WARP_SVC=1; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  warp_registration_account_type() { printf 'free\n'; }
+  begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
+  finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
+  rotate_socks_registration() { printf 'rotate\n' >> "$event"; return 1; }
+  run_unlock_checks() { printf 'detect\n' >> "$event"; return 0; }
+
+  output="$(cmd_change_ip 2>&1)" || rc=$?
+  assert_eq '1' "$rc" 'a backend operation failure must fail change-ip' || return 1
+  assert_contains "$output" '已停止后续尝试' \
+    'the backend failure must report that retrying stopped' || return 1
+  assert_eq $'timer:begin\nrotate\ntimer:finish' "$(< "$event")" \
+    'a backend failure must skip detection and restore the timer immediately' || return 1
+
+  : > "$event"
+  rotate_socks_registration() { printf 'rotate\n' >> "$event"; return 2; }
+  rc=0
+  output="$(cmd_change_ip 2>&1)" || rc=$?
+  assert_eq '1' "$rc" \
+    'an unrecovered Socks failure must terminate through the armed EXIT path' || return 1
+  assert_contains "$output" '退出清理将再次尝试' \
+    'the pre-EXIT error must not claim that the final recovery already failed' || return 1
+  assert_eq $'timer:begin\nrotate' "$(< "$event")" \
+    'an unrecovered Socks failure must not disarm maintenance before EXIT recovery'
+}
+
 test_socks_local_readiness_rejects_unowned_or_invalid_listeners() {
   source_without_main "$MANAGER_SCRIPT"
   local listener_pid="$$" python_rc=0 python_args='' python_body='' python3_path
@@ -4994,13 +5498,87 @@ test_unlock_http_transport_ignores_environment_proxies() {
     'unlock request must explicitly disable curl proxy use' || return 1
   assert_contains "$output" 'arg=*' \
     'unlock request must apply --noproxy to every destination' || return 1
+  assert_contains "$output" 'arg=cache-control: no-cache' \
+    'unlock requests must ask intermediaries not to reuse a cached page' || return 1
+  assert_contains "$output" 'arg=pragma: no-cache' \
+    'unlock requests must retain the legacy no-cache request directive' || return 1
+  assert_not_contains "$output" 'arg=-fsSL' \
+    'unlock requests must retain HTTP error response bodies for strict parsing' || return 1
+  assert_not_contains "$output" 'arg=--fail' \
+    'unlock requests must not discard explicit 4xx or 5xx service pages' || return 1
+  assert_not_contains "$output" 'arg=--cookie' \
+    'unlock requests must not persist or replay cookies between registrations' || return 1
+  assert_not_contains "$output" 'arg=--cookie-jar' \
+    'unlock requests must not create a shared cookie jar' || return 1
   assert_contains "$output" 'arg=https://example.invalid/unlock' \
     'unlock request must preserve its target URL'
 }
 
+test_unlock_check_requires_both_services() {
+  source_without_main "$MANAGER_SCRIPT"
+  local request_log case_spec mock_gemini_result mock_youtube_result expected_rc actual_rc calls
+  request_log="$(mktemp)"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl|python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  probe_gemini_unlock() {
+    printf 'gemini\n' >> "$request_log"
+    printf '%s\n' "$mock_gemini_result"
+  }
+  probe_youtube_premium_unlock() {
+    printf 'youtube\n' >> "$request_log"
+    printf '%s\n' "$mock_youtube_result"
+  }
+
+  for case_spec in \
+    'yes|;yes|地区：US;0' \
+    'yes|;no|地区：US;1' \
+    'yes|;unknown|页面特征不明确;1' \
+    'no|页面标记不能确认是否可用;yes|地区：US;1'; do
+    IFS=';' read -r mock_gemini_result mock_youtube_result expected_rc <<< "$case_spec"
+    : > "$request_log"
+    actual_rc=0
+    run_unlock_checks >/dev/null || actual_rc=$?
+    assert_eq "$expected_rc" "$actual_rc" \
+      "unlock aggregate must require two explicit yes results: $case_spec" || return 1
+    calls="$(< "$request_log")"
+    assert_eq $'gemini\nyoutube' "$calls" \
+      'each aggregate decision must issue one fresh request per service' || return 1
+  done
+}
+
+test_unlock_check_missing_curl_is_not_a_pass() {
+  source_without_main "$MANAGER_SCRIPT"
+  local request_log output rc=0
+  request_log="$(mktemp)"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in
+      curl) return 1 ;;
+      python3) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  probe_gemini_unlock() { printf 'gemini\n' >> "$request_log"; printf 'yes|\n'; }
+  probe_youtube_premium_unlock() { printf 'youtube\n' >> "$request_log"; printf 'yes|地区：US\n'; }
+
+  output="$(run_unlock_checks)" || rc=$?
+  assert_eq '1' "$rc" 'missing curl must not be reported as a passed unlock check' || return 1
+  assert_contains "$output" '找不到 curl' \
+    'the missing transport dependency should remain actionable' || return 1
+  assert_eq '' "$(< "$request_log")" \
+    'no service probe may run without the shared HTTP transport'
+}
+
 test_unlock_check_skips_only_youtube_without_python() {
   source_without_main "$MANAGER_SCRIPT"
-  local request_log output
+  local request_log output rc=0
   request_log="$(mktemp)"
 
   command() {
@@ -5017,7 +5595,9 @@ test_unlock_check_skips_only_youtube_without_python() {
     printf 'yes|地区：US\n'
   }
 
-  output="$(run_unlock_checks)"
+  output="$(run_unlock_checks)" || rc=$?
+  assert_eq '1' "$rc" \
+    'missing Python must keep the two-service aggregate from passing' || return 1
   assert_contains "$output" 'Gemini：可用' \
     'missing Python must not block the Python-free Gemini check' || return 1
   assert_contains "$output" '找不到 python3，无法检测 YouTube Premium' \
@@ -5329,6 +5909,10 @@ test_native_https_request_socket_redirect_and_deadline_contract() {
     '301/302/303 redirects must convert POST to GET without changing 307/308 semantics' || return 1
   assert_contains "$body" 'max_response_bytes = 8 * 1024 * 1024' \
     'native HTTPS must bound response memory' || return 1
+  assert_contains "$body" '"Cache-Control": "no-cache"' \
+    'native unlock requests must not reuse a cached service page' || return 1
+  assert_contains "$body" '"Pragma": "no-cache"' \
+    'native unlock requests must carry the legacy no-cache directive' || return 1
 
   assert_contains "$body" 'timeout -k 1 "$UNLOCK_MAX_TIME" python3' \
     'native HTTPS must retain the outer wall-clock deadline' || return 1
@@ -5516,9 +6100,10 @@ test_status_and_healthy_timer_stay_local() {
 
 test_http_probe_accepts_http_error_responses() {
   source_without_main "$MANAGER_SCRIPT"
-  local curl_calls='' simulated_http_status=429 arg
+  local curl_calls='' curl_environment='' simulated_http_status=429 arg
   curl() {
     curl_calls="${curl_calls}$*\n"
+    curl_environment="${http_proxy-}|${https_proxy-}|${all_proxy-}|${HTTP_PROXY-}|${HTTPS_PROXY-}|${ALL_PROXY-}|${no_proxy-}|${NO_PROXY-}"
     for arg in "$@"; do
       case "$arg" in
         --fail|--fail-with-body|-*[fF]*) return 22 ;;
@@ -5527,6 +6112,14 @@ test_http_probe_accepts_http_error_responses() {
     [ "$simulated_http_status" -eq 429 ] || return 1
     return 0
   }
+  http_proxy=http://127.0.0.1:18080
+  https_proxy=http://127.0.0.1:18443
+  all_proxy=socks5://127.0.0.1:1080
+  HTTP_PROXY=http://127.0.0.1:28080
+  HTTPS_PROXY=http://127.0.0.1:28443
+  ALL_PROXY=socks5://127.0.0.1:2080
+  no_proxy=localhost
+  NO_PROXY=localhost
   google_http_probe -4 || {
     fail 'an HTTP error response should still prove network reachability'
     return 1
@@ -5534,11 +6127,15 @@ test_http_probe_accepts_http_error_responses() {
   assert_not_contains "$curl_calls" ' -f' \
     'the connectivity probe must not convert HTTP 429 into a transport failure' || return 1
   assert_not_contains "$curl_calls" '--fail' \
-    'the connectivity probe must not use a long curl failure option for HTTP 429'
+    'the connectivity probe must not use a long curl failure option for HTTP 429' || return 1
+  assert_contains "$curl_calls" '--noproxy *' \
+    'the connectivity probe must explicitly bypass every configured proxy' || return 1
+  assert_eq '||||||*|*' "$curl_environment" \
+    'the connectivity probe process must receive no inherited proxy endpoint'
 }
 
 test_install_unlock_check_is_post_success_and_nonblocking() {
-  local body complete_line disarm_line success_line unlock_line
+  local body complete_line disarm_line success_line unlock_line output rc=0
   body="$(function_body "$INSTALL_SCRIPT" main)"
   complete_line="$(line_number "$body" 'INSTALL_COMPLETE=1')"
   disarm_line="$(line_number "$body" 'trap - EXIT')"
@@ -5559,7 +6156,20 @@ test_install_unlock_check_is_post_success_and_nonblocking() {
   assert_not_contains "$body" '"$BIN_PATH" status' \
     'installer completion must not be blocked by diagnostic status output' || return 1
   assert_not_contains "$body" '"$BIN_PATH" native-unlock-check' \
-    'the native-exit unlock check must remain manual and never join installation completion'
+    'the native-exit unlock check must remain manual and never join installation completion' || return 1
+
+  source_without_main "$MANAGER_SCRIPT"
+  run_unlock_checks() { return 1; }
+  output="$(cmd_unlock_check)" || rc=$?
+  assert_eq '0' "$rc" \
+    'the public post-install unlock command must remain advisory' || return 1
+  assert_contains "$output" 'warp-vps change-ip' \
+    'an incomplete post-install result must offer the explicit IP replacement command' || return 1
+
+  run_unlock_checks() { return 0; }
+  output="$(cmd_unlock_check)"
+  assert_not_contains "$output" 'warp-vps change-ip' \
+    'a fully passed post-install result must not suggest replacing the working exit'
 }
 
 test_old_runtime_restore_does_not_call_status() {
@@ -7408,6 +8018,25 @@ test_readme_documents_route_scope_contract() {
     'README must preserve the noninteractive mode contract'
 }
 
+test_readme_documents_change_ip_contract() {
+  assert_file_matches "$README_FILE" 'warp-vps change-ip` \| 最多更换 10 次 WARP 注册' \
+    'README must expose the new bounded command' || return 1
+  assert_file_matches "$README_FILE" '只有 Gemini 与 YouTube Premium 都明确可用才算全部通过' \
+    'README must state the strict two-service aggregate' || return 1
+  assert_file_matches "$README_FILE" '未全部通过时只提示运行 `warp-vps change-ip`，不会在安装流程中自动更换' \
+    'README must distinguish the post-install prompt from explicit mutation' || return 1
+  assert_file_matches "$README_FILE" '保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口' \
+    'README must document the persisted mode, scope and port contract' || return 1
+  assert_file_matches "$README_FILE" 'Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户' \
+    'README must document the safe Socks account boundary' || return 1
+
+  local help_output
+  source_without_main "$MANAGER_SCRIPT"
+  help_output="$(usage)"
+  assert_contains "$help_output" 'change-ip       最多更换 10 次 WARP 注册' \
+    'CLI help must expose the same bounded replacement command'
+}
+
 test_reinstall_accepts_legacy_socks_rule_cleanup() {
   source_without_main "$INSTALL_SCRIPT"
   PREVIOUS_MODE=socks
@@ -8851,6 +9480,7 @@ run_test 'menu contract reuses switching and is documented' test_menu_contract_i
 run_test 'all interactive input precedes installation side effects' test_inputs_precede_side_effects
 run_test 'installer operation lock bounds live mutation' test_installer_operation_lock_bounds_live_mutation
 run_test 'manager operation lock policies preserve availability and status' test_manager_operation_lock_policies
+run_test 'runtime lock preserves top-level fail-fast behavior' test_runtime_lock_preserves_top_level_fail_fast
 run_test 'project assets stage before the old runtime stops' test_assets_are_staged_before_runtime_stops
 run_test 'staged rules validate before the old runtime stops' test_staged_rules_are_validated_before_runtime_stops
 run_test 'failed installation stops only project runtime' test_failed_install_arms_runtime_cleanup
@@ -8880,6 +9510,10 @@ run_test 'iptables CLI is not an installation dependency' test_no_iptables_packa
 run_test 'WireGuard support uses a real runtime preflight' test_wireguard_uses_runtime_capability
 run_test 'wgcf fixed release atomically replaces old executables' test_wgcf_fixed_binary_replaces_old_copy_atomically
 run_test 'WireGuard generation recovers from partial state' test_wireguard_config_generation_is_retryable
+run_test 'WireGuard rotation prepares a fresh validated stage' test_wireguard_rotation_prepares_a_fresh_validated_stage
+run_test 'WireGuard rotation restores the original pair on failure' test_wireguard_rotation_restores_the_original_pair_on_failure
+run_test 'WireGuard rotation credentials are runtime scoped and cleared' test_wireguard_rotation_credentials_are_runtime_scoped_and_cleared
+run_test 'runtime maintenance signals run exit recovery' test_runtime_maintenance_signals_run_exit_recovery
 run_test 'WireGuard endpoint candidates preserve hostname config' test_wireguard_endpoint_candidates_preserve_hostname_config
 run_test 'WireGuard endpoint selection falls back and requires dual stack' test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack
 run_test 'WireGuard endpoint selection retries the same endpoint' test_wireguard_endpoint_selection_retries_the_same_endpoint
@@ -8910,6 +9544,12 @@ run_test 'SSH peer protection preserves the rule-check status' test_ssh_peer_rou
 run_test 'existing WARP registration is reused safely' test_existing_warp_registration_is_reused
 run_test 'WARP registration distinguishes present missing and unknown' test_warp_registration_has_three_states
 run_test 'WARP readiness wins over intermediate command exit codes' test_warp_command_errors_defer_to_real_readiness
+run_test 'strict WARP configuration stops before connect' test_strict_warp_configuration_stops_before_connect
+run_test 'Socks change-ip requires an explicit Free registration' test_socks_change_ip_requires_an_explicit_free_registration
+run_test 'Socks rotation orders configuration and data-plane gates' test_socks_rotation_orders_registration_configuration_and_data_plane
+run_test 'change-ip dispatches each mode and restores the timer' test_change_ip_dispatches_each_mode_and_finishes_the_timer
+run_test 'change-ip stops after ten failed unlock results' test_change_ip_stops_at_ten_failed_unlock_results
+run_test 'change-ip runtime failure stops immediately' test_change_ip_runtime_failure_stops_immediately
 run_test 'Socks readiness rejects unowned and invalid listeners' test_socks_local_readiness_rejects_unowned_or_invalid_listeners
 run_test 'reused Socks port conflicts stop before runtime mutation' test_reused_socks_port_conflict_stops_before_runtime_mutation
 run_test 'Socks readiness waits use wall-clock deadlines' test_socks_waits_use_wall_clock_deadlines
@@ -8924,6 +9564,8 @@ run_test 'noninteractive Swap choices and failures are bounded' test_noninteract
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
 run_test 'Gemini probes request only the homepage' test_gemini_probes_use_one_homepage_request
 run_test 'unlock HTTP requests ignore environment proxies' test_unlock_http_transport_ignores_environment_proxies
+run_test 'unlock aggregate requires both services' test_unlock_check_requires_both_services
+run_test 'unlock check rejects a missing curl dependency' test_unlock_check_missing_curl_is_not_a_pass
 run_test 'unlock check skips only YouTube when Python is missing' test_unlock_check_skips_only_youtube_without_python
 run_test 'YouTube parser is covered by offline fixtures' test_youtube_fixtures
 run_test 'native egress selection prefers the first IPv4 and supports IPv6-only hosts' test_native_egress_selection
@@ -8978,6 +9620,7 @@ run_test 'dependency failure stops before file deletion' test_dependency_failure
 run_test 'post-delete daemon reload failure is only a warning' test_uninstall_daemon_reload_failure_is_post_commit_warning
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
 run_test 'README documents route scope behavior' test_readme_documents_route_scope_contract
+run_test 'README documents the change-ip contract' test_readme_documents_change_ip_contract
 run_test 'reinstall accepts legacy Socks cleanup' test_reinstall_accepts_legacy_socks_rule_cleanup
 run_test 'reinstall quiesces health and optional backends' test_reinstall_quiesces_health_and_optional_backends
 run_test 'main executes both mode switches and ignores unlock failures' test_main_executes_bidirectional_mode_switches

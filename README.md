@@ -38,7 +38,7 @@ Google 精准分流和全局 WARP 都可以搭配 WireGuard 或 Socks5，切换�
 - **全局走 WARP**：WireGuard 接管公网 IPv4、IPv6 与全部协议；Socks5 接管 VPS 主动发起的公网 IPv4 TCP。
 - **不改代理配置**：在系统出站层完成分流，无需修改 Xray、sing-box、Hysteria 或 3x-ui。
 - **两种运行模式**：WireGuard 完整承载双栈与 UDP；Socks5 适合更轻量的 TCP 透明代理。
-- **自带管理工具**：状态、诊断、解锁检测、更新、切换模式、日志和卸载统一由 `warp-vps` 管理。
+- **自带管理工具**：状态、诊断、解锁检测、WARP IP 更换、更新、切换模式、日志和卸载统一由 `warp-vps` 管理。
 
 WireGuard 全局模式让未绑定原生源地址的公网 IPv4、IPv6、TCP、UDP 和 QUIC 全部走 WARP；现有及新入站连接回包、显式绑定 VPS 原生源地址的流量和局域网路由保留原生路径。Socks5 不承载 UDP 或 IPv6；其全局模式接管 VPS 主动发起的公网 IPv4 TCP，入站连接回包保持原生路径，并继续拒绝 Google IPv4 UDP/443（QUIC）和 Google IPv6；其他非 Google UDP 与 IPv6 仍使用 VPS 原生出口。
 
@@ -79,6 +79,7 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 | `warp-vps test` | 运行分流与外部连通性诊断 |
 | `warp-vps native-unlock-check` | 绕过 WARP 分流，检测原生出口的 Gemini 和 YouTube Premium |
 | `warp-vps unlock-check` | 检测当前 WARP IPv4 出口的 Gemini 和 YouTube Premium |
+| `warp-vps change-ip` | 最多更换 10 次 WARP 注册，每次更换后自动重新检测 |
 | `warp-vps restart` | 重启 WARP 分流链路 |
 | `warp-vps update` | 更新程序与 Google IP 规则；不安装或升级运行依赖，旧版规则差异不会阻止更新 |
 | `warp-vps reinstall --scope global` | 保持运行模式并切换到全局 WARP |
@@ -91,7 +92,9 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 `native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
 
-`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 只在首页返回明确的正向 marker 时显示可用，不显示地区；单独的负向 marker、marker 缺失或冲突都显示无法确认。YouTube Premium 只有出现购买入口或明确不可用页面时才给出结论，并同时显示页面地区；地区或页面特征不明确时显示无法确认。
+`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 只在首页返回明确的正向 marker 时显示可用，不显示地区；单独的负向 marker、marker 缺失或冲突都显示无法确认。YouTube Premium 只有出现购买入口或明确不可用页面时才给出结论，并同时显示页面地区；地区或页面特征不明确时显示无法确认。检测请求不使用环境代理或本地缓存；只有 Gemini 与 YouTube Premium 都明确可用才算全部通过。
+
+安装完成后会自动运行一次当前 WARP 出口检测。未全部通过时只提示运行 `warp-vps change-ip`，不会在安装流程中自动更换。`change-ip` 保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口，通过重新注册 WARP 获取新出口；每轮恢复当前数据面后立即复检，通过即停止，最多尝试 10 次。Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户。
 
 ## 卸载
 

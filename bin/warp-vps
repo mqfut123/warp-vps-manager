@@ -32,6 +32,7 @@ REDSOCKS_MANAGED_VERSION="redsocks/0.5-${REDSOCKS_SOURCE_COMMIT}"
 UNLOCK_TEST_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 UNLOCK_CONNECT_TIMEOUT=5
 UNLOCK_MAX_TIME=12
+CHANGE_IP_MAX_ATTEMPTS=10
 NATIVE_FAMILY=""
 NATIVE_IFACE=""
 NATIVE_SOURCE_IP=""
@@ -50,6 +51,10 @@ UNINSTALL_WIREGUARD_PRESENT=0
 UNINSTALL_RUNTIME_IDENTIFIED=0
 HEALTH_MAINTENANCE_ARMED=0
 HEALTH_TIMER_WAS_ACTIVE=0
+WG_ROTATION_ROLLBACK_ARMED=0
+WG_ROTATION_BACKUP=""
+WG_ROTATION_STAGE=""
+SOCKS_ROTATION_RECOVERY_ARMED=0
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -512,7 +517,9 @@ install_wgcf_binary() {
 
 run_wgcf_command() {
   command -v timeout >/dev/null 2>&1 || die "找不到 timeout，无法限制 wgcf 执行时间"
-  timeout -k 5 "$WGCF_OPERATION_TIMEOUT" "$WGCF_BIN" "$@"
+  http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
+    no_proxy='*' NO_PROXY='*' \
+    timeout -k 5 "$WGCF_OPERATION_TIMEOUT" "$WGCF_BIN" "$@"
 }
 
 wg_config_valid() {
@@ -637,6 +644,36 @@ for peer in peers:
 PY
 }
 
+write_managed_wg_config() {
+  local profile="$1"
+  local output="$2"
+  python3 - "$profile" "$output" <<'PY'
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1])
+dst = pathlib.Path(sys.argv[2])
+lines = src.read_text(encoding="utf-8").splitlines()
+out = []
+inserted = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("DNS"):
+        continue
+    if stripped.startswith("Table"):
+        continue
+    out.append(line)
+    if stripped == "[Interface]" and not inserted:
+        out.append("Table = off")
+        inserted = True
+if not inserted:
+    raise SystemExit("WireGuard 配置缺少 [Interface]")
+dst.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+PY
+  chmod 0600 "$output"
+  wg_config_valid "$output"
+}
+
 generate_wg_config() {
   if [ -r "$WG_CONFIG" ] && wg_config_valid "$WG_CONFIG"; then
     return 0
@@ -700,31 +737,8 @@ generate_wg_config() {
 
   [ -s "${profile_dir}/wgcf-account.toml" ] || die "wgcf 没有生成账户文件"
   [ -s "${profile_dir}/wgcf-profile.conf" ] || die "wgcf 没有生成 WireGuard 配置"
-  python3 - "${profile_dir}/wgcf-profile.conf" "$config_stage" <<'PY'
-import pathlib
-import sys
-
-src = pathlib.Path(sys.argv[1])
-dst = pathlib.Path(sys.argv[2])
-lines = src.read_text(encoding="utf-8").splitlines()
-out = []
-inserted = False
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith("DNS"):
-        continue
-    if stripped.startswith("Table"):
-        continue
-    out.append(line)
-    if stripped == "[Interface]" and not inserted:
-        out.append("Table = off")
-        inserted = True
-if not inserted:
-    raise SystemExit("WireGuard 配置缺少 [Interface]")
-dst.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
-PY
-  chmod 0600 "$config_stage"
-  wg_config_valid "$config_stage" || die "wgcf 生成的 WireGuard 配置无法被 wg-quick 解析"
+  write_managed_wg_config "${profile_dir}/wgcf-profile.conf" "$config_stage" \
+    || die "wgcf 生成的 WireGuard 配置无法被 wg-quick 解析"
 
   if [ -e "$WG_CONFIG" ]; then
     install -d -m 0700 "$backup_dir"
@@ -734,6 +748,91 @@ PY
 
   install -m 0600 "$config_stage" "$config_tmp"
   mv "$config_tmp" "$WG_CONFIG"
+}
+
+prepare_fresh_wgcf_stage() {
+  local stage="$1"
+  local config_stage="${stage}/${WG_IFACE}.conf"
+  local wgcf_rc=0
+
+  install -d -m 0700 /etc/wireguard "${STATE_DIR}/wgcf" "$stage" || return 1
+  install_wgcf_binary
+  (
+    cd "$stage"
+    run_wgcf_command register --accept-tos >/dev/null
+  ) || wgcf_rc=$?
+  if [ "$wgcf_rc" -ne 0 ]; then
+    case "$wgcf_rc" in
+      124|137) warn "wgcf 注册新 WireGuard 账户超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
+      *) warn "wgcf 注册新 WireGuard 账户失败" ;;
+    esac
+    return 1
+  fi
+  [ -s "${stage}/wgcf-account.toml" ] || {
+    warn "wgcf 没有生成新账户文件"
+    return 1
+  }
+
+  wgcf_rc=0
+  (
+    cd "$stage"
+    run_wgcf_command generate >/dev/null
+  ) || wgcf_rc=$?
+  if [ "$wgcf_rc" -ne 0 ]; then
+    case "$wgcf_rc" in
+      124|137) warn "wgcf 生成新 WireGuard 配置超时（${WGCF_OPERATION_TIMEOUT} 秒）" ;;
+      *) warn "wgcf 生成新 WireGuard 配置失败" ;;
+    esac
+    return 1
+  fi
+  [ -s "${stage}/wgcf-profile.conf" ] || {
+    warn "wgcf 没有生成新 WireGuard 配置"
+    return 1
+  }
+  write_managed_wg_config "${stage}/wgcf-profile.conf" "$config_stage" || {
+    warn "wgcf 生成的新 WireGuard 配置无法被 wg-quick 解析"
+    return 1
+  }
+}
+
+activate_wgcf_stage() {
+  local stage="$1"
+  local account_tmp="${WGCF_ACCOUNT}.new.$$"
+  local config_tmp="${WG_CONFIG}.new.$$"
+
+  install -m 0600 "${stage}/wgcf-account.toml" "$account_tmp" || return 1
+  if ! install -m 0600 "${stage}/${WG_IFACE}.conf" "$config_tmp"; then
+    rm -f -- "$account_tmp"
+    return 1
+  fi
+  if ! mv "$account_tmp" "$WGCF_ACCOUNT"; then
+    rm -f -- "$account_tmp" "$config_tmp"
+    return 1
+  fi
+  if ! mv "$config_tmp" "$WG_CONFIG"; then
+    rm -f -- "$config_tmp"
+    return 1
+  fi
+}
+
+restore_wgcf_backup() {
+  local backup="$1"
+  local account_tmp="${WGCF_ACCOUNT}.restore.$$"
+  local config_tmp="${WG_CONFIG}.restore.$$"
+
+  install -m 0600 "${backup}/wgcf-account.toml" "$account_tmp" || return 1
+  if ! install -m 0600 "${backup}/${WG_IFACE}.conf" "$config_tmp"; then
+    rm -f -- "$account_tmp"
+    return 1
+  fi
+  if ! mv "$account_tmp" "$WGCF_ACCOUNT"; then
+    rm -f -- "$account_tmp" "$config_tmp"
+    return 1
+  fi
+  if ! mv "$config_tmp" "$WG_CONFIG"; then
+    rm -f -- "$config_tmp"
+    return 1
+  fi
 }
 
 wireguard_endpoint_candidates() {
@@ -1791,13 +1890,43 @@ ensure_health_timer() {
 
 restore_health_timer_on_exit() {
   local rc=$?
-  trap - EXIT
+  trap - EXIT INT TERM HUP
   set +e
+  cleanup_wireguard_rotation_live_temps
+  if [ "$WG_ROTATION_ROLLBACK_ARMED" -eq 1 ] && [ -n "$WG_ROTATION_BACKUP" ]; then
+    if restore_wireguard_rotation "$WG_ROTATION_BACKUP"; then
+      disarm_wireguard_rotation_rollback
+      log "退出清理已恢复原 WireGuard 注册和运行态"
+    else
+      cleanup_wireguard_rotation_path "$WG_ROTATION_STAGE" || true
+      WG_ROTATION_STAGE=""
+      warn "维护操作中断后无法恢复原 WireGuard 注册和运行态；回滚文件保留在 ${WG_ROTATION_BACKUP}"
+    fi
+  elif [ -n "$WG_ROTATION_STAGE" ] || [ -n "$WG_ROTATION_BACKUP" ]; then
+    clear_wireguard_rotation_artifacts
+  fi
+  if [ "$SOCKS_ROTATION_RECOVERY_ARMED" -eq 1 ]; then
+    if recover_socks_rotation; then
+      disarm_socks_rotation_recovery
+      log "退出清理已恢复 WARP Client 注册和 Socks5 数据面"
+    else
+      warn "维护操作中断后无法恢复 WARP Client 注册和 Socks5 数据面"
+    fi
+  fi
   if [ "$HEALTH_MAINTENANCE_ARMED" -eq 1 ] && [ "$HEALTH_TIMER_WAS_ACTIVE" -eq 1 ]; then
     systemctl start warp-vps-health.timer >/dev/null 2>&1 \
       || warn "维护操作结束后无法恢复健康检查定时器"
   fi
   exit "$rc"
+}
+
+runtime_maintenance_signal_exit() {
+  case "$1" in
+    INT) exit 130 ;;
+    TERM) exit 143 ;;
+    HUP) exit 129 ;;
+    *) exit 1 ;;
+  esac
 }
 
 begin_runtime_maintenance() {
@@ -1808,6 +1937,9 @@ begin_runtime_maintenance() {
     fi
     HEALTH_MAINTENANCE_ARMED=1
     trap restore_health_timer_on_exit EXIT
+    trap 'runtime_maintenance_signal_exit INT' INT
+    trap 'runtime_maintenance_signal_exit TERM' TERM
+    trap 'runtime_maintenance_signal_exit HUP' HUP
   fi
   systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
@@ -1824,7 +1956,7 @@ finish_runtime_maintenance() {
   ensure_health_timer
   HEALTH_MAINTENANCE_ARMED=0
   HEALTH_TIMER_WAS_ACTIVE=0
-  trap - EXIT
+  trap - EXIT INT TERM HUP
 }
 
 unit_ready() {
@@ -1879,6 +2011,24 @@ inspect_warp_registration() {
   return 0
 }
 
+warp_registration_account_type() {
+  local output
+  output="$(timeout 10 warp-cli --accept-tos registration show 2>/dev/null)" || return 1
+  awk -F: '
+    {
+      key=tolower($1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key == "account type" || key == "type") {
+        value=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        print tolower(value)
+        found++
+      }
+    }
+    END { if (found != 1) exit 1 }
+  ' <<< "$output"
+}
+
 remember_warp_output() {
   local label="$1"
   local output="$2"
@@ -1890,7 +2040,8 @@ create_warp_registration() {
   local output
   if output="$(warp_cli --accept-tos registration new 2>&1)"; then
     inspect_warp_registration
-    return 0
+    [ "$WARP_REGISTRATION_STATE" = "present" ]
+    return
   fi
   remember_warp_output "registration new" "$output"
   inspect_warp_registration
@@ -1898,7 +2049,8 @@ create_warp_registration() {
   [ "$WARP_REGISTRATION_STATE" = "missing" ] || return 1
   if output="$(warp_cli --accept-tos register 2>&1)"; then
     inspect_warp_registration
-    return 0
+    [ "$WARP_REGISTRATION_STATE" = "present" ]
+    return
   fi
   remember_warp_output "register" "$output"
   inspect_warp_registration
@@ -1936,6 +2088,8 @@ print_warp_diagnostics() {
 }
 
 configure_warp_runtime() {
+  local settings_policy="${1:-advisory}"
+  local settings_failed=0
   command -v warp-cli >/dev/null 2>&1 || {
     warn "找不到 warp-cli"
     return 1
@@ -1958,13 +2112,17 @@ configure_warp_runtime() {
 
   try_warp_command "mode proxy" --accept-tos mode proxy \
     || try_warp_command "mode proxy" mode proxy \
-    || true
+    || settings_failed=1
   try_warp_command "tunnel protocol set MASQUE" --accept-tos tunnel protocol set MASQUE \
     || try_warp_command "tunnel protocol set MASQUE" tunnel protocol set MASQUE \
-    || true
+    || settings_failed=1
   try_warp_command "proxy port ${WARP_SOCKS_PORT}" --accept-tos proxy port "$WARP_SOCKS_PORT" \
     || try_warp_command "proxy port ${WARP_SOCKS_PORT}" proxy port "$WARP_SOCKS_PORT" \
-    || true
+    || settings_failed=1
+  if [ "$settings_policy" = "strict" ] && [ "$settings_failed" -eq 1 ]; then
+    print_warp_diagnostics
+    return 1
+  fi
 
   local attempt
   for ((attempt = 1; attempt <= 3; attempt++)); do
@@ -1980,6 +2138,203 @@ configure_warp_runtime() {
   fi
   print_warp_diagnostics
   return 1
+}
+
+start_wireguard_rotation_runtime() {
+  systemctl reset-failed "wg-quick@${WG_IFACE}.service" warp-vps.service \
+    >/dev/null 2>&1 || true
+  systemctl start "wg-quick@${WG_IFACE}.service" || return 1
+  wait_for_wg_ready 20 || return 1
+  systemctl restart warp-vps.service || return 1
+  required_runtime_units_ready && test_quiet && wg_handshake_recent
+}
+
+cleanup_wireguard_rotation_path() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  case "$path" in
+    "/run/${APP_NAME}/"*) ;;
+    *) warn "拒绝清理非运行时的 WireGuard 更换目录：$path"; return 1 ;;
+  esac
+  rm -rf -- "$path" || return 1
+  [ ! -e "$path" ] && [ ! -L "$path" ]
+}
+
+cleanup_wireguard_rotation_live_temps() {
+  rm -f -- \
+    "${WGCF_ACCOUNT}.new.$$" "${WGCF_ACCOUNT}.restore.$$" \
+    "${WG_CONFIG}.new.$$" "${WG_CONFIG}.restore.$$"
+}
+
+clear_wireguard_rotation_artifacts() {
+  local failed=0
+  cleanup_wireguard_rotation_live_temps || failed=1
+  cleanup_wireguard_rotation_path "$WG_ROTATION_STAGE" || failed=1
+  cleanup_wireguard_rotation_path "$WG_ROTATION_BACKUP" || failed=1
+  WG_ROTATION_STAGE=""
+  WG_ROTATION_BACKUP=""
+  if [ "$failed" -eq 1 ]; then
+    warn "无法清理 WARP IP 更换产生的临时凭据"
+  fi
+  return 0
+}
+
+restore_wireguard_rotation() {
+  local backup="$1"
+  systemctl stop warp-vps.service >/dev/null 2>&1 || true
+  systemctl stop "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
+  remove_wireguard_interface || return 1
+  restore_wgcf_backup "$backup" || return 1
+  start_wireguard_rotation_runtime
+}
+
+disarm_wireguard_rotation_rollback() {
+  WG_ROTATION_ROLLBACK_ARMED=0
+  clear_wireguard_rotation_artifacts
+}
+
+rollback_wireguard_rotation_now() {
+  local backup="$1"
+  if restore_wireguard_rotation "$backup"; then
+    disarm_wireguard_rotation_rollback
+    return 0
+  fi
+  return 1
+}
+
+rotate_wireguard_registration() {
+  local attempt="$1"
+  local rotation_root stage backup
+  rotation_root="/run/${APP_NAME}"
+  install -d -m 0700 "$rotation_root" || return 1
+  stage="$(mktemp -d "${rotation_root}/wgcf-stage.${attempt}.XXXXXX")" || return 1
+  WG_ROTATION_STAGE="$stage"
+
+  if ! prepare_fresh_wgcf_stage "$stage"; then
+    clear_wireguard_rotation_artifacts
+    return 1
+  fi
+  backup="$(mktemp -d "${rotation_root}/wgcf-backup.${attempt}.XXXXXX")" || {
+    clear_wireguard_rotation_artifacts
+    return 1
+  }
+  WG_ROTATION_BACKUP="$backup"
+  if ! install -m 0600 "$WGCF_ACCOUNT" "${backup}/wgcf-account.toml" \
+    || ! install -m 0600 "$WG_CONFIG" "${backup}/${WG_IFACE}.conf"; then
+    clear_wireguard_rotation_artifacts
+    return 1
+  fi
+
+  WG_ROTATION_ROLLBACK_ARMED=1
+  if ! systemctl stop warp-vps.service; then
+    warn "无法暂停 WireGuard 分流服务"
+    rollback_wireguard_rotation_now "$backup" || return 2
+    return 1
+  fi
+  systemctl stop "wg-quick@${WG_IFACE}.service" >/dev/null 2>&1 || true
+  if ! remove_wireguard_interface; then
+    warn "无法停止当前 WireGuard 网卡"
+    rollback_wireguard_rotation_now "$backup" || return 2
+    return 1
+  fi
+
+  if ! activate_wgcf_stage "$stage" || ! start_wireguard_rotation_runtime; then
+    warn "新 WireGuard 注册未能建立有效数据面，正在恢复原注册"
+    rollback_wireguard_rotation_now "$backup" || return 2
+    return 1
+  fi
+
+  disarm_wireguard_rotation_rollback
+  return 0
+}
+
+delete_warp_registration() {
+  local output
+  WARP_RUNTIME_DETAILS=""
+  if output="$(warp_cli --accept-tos registration delete 2>&1)"; then
+    :
+  elif output="$(warp_cli registration delete 2>&1)"; then
+    :
+  else
+    remember_warp_output "registration delete" "$output"
+  fi
+  inspect_warp_registration
+  [ "$WARP_REGISTRATION_STATE" = "missing" ]
+}
+
+socks_forwarding_ok() {
+  local before after
+  before="$(google_counter)" || return 1
+  case "$before" in ''|*[!0-9]*) return 1 ;; esac
+  google_http_probe -4 || return 1
+  after="$(google_counter)" || return 1
+  case "$after" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$after" -gt "$before" ]
+}
+
+socks_rotation_runtime_ok() {
+  redsocks_local_ready || {
+    warn "更换注册后本地透明转发服务没有正确监听"
+    return 1
+  }
+  table_exists || {
+    warn "更换注册后系统分流规则未加载"
+    return 1
+  }
+  socks_ok || {
+    warn "更换注册后 Cloudflare WARP SOCKS 外部出口未就绪"
+    return 1
+  }
+  socks_forwarding_ok || {
+    warn "更换注册后 Google IPv4 透明转发数据面未返回"
+    return 1
+  }
+}
+
+disarm_socks_rotation_recovery() {
+  SOCKS_ROTATION_RECOVERY_ARMED=0
+}
+
+recover_socks_rotation() {
+  inspect_warp_registration
+  if [ "$WARP_REGISTRATION_STATE" = "missing" ]; then
+    create_warp_registration || return 1
+  elif [ "$WARP_REGISTRATION_STATE" != "present" ]; then
+    return 1
+  fi
+  configure_warp_runtime strict || return 1
+  socks_rotation_runtime_ok
+}
+
+fail_socks_rotation_with_recovery() {
+  if recover_socks_rotation; then
+    disarm_socks_rotation_recovery
+    return 1
+  fi
+  return 2
+}
+
+rotate_socks_registration() {
+  SOCKS_ROTATION_RECOVERY_ARMED=1
+  delete_warp_registration || {
+    print_warp_diagnostics
+    fail_socks_rotation_with_recovery
+    return
+  }
+  create_warp_registration || {
+    print_warp_diagnostics
+    fail_socks_rotation_with_recovery
+    return
+  }
+  configure_warp_runtime strict || {
+    fail_socks_rotation_with_recovery
+    return
+  }
+  socks_rotation_runtime_ok || {
+    fail_socks_rotation_with_recovery
+    return
+  }
+  disarm_socks_rotation_recovery
 }
 
 test_quiet() {
@@ -2184,7 +2539,9 @@ for redirect_count in range(6):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "identity",
         "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
         "Connection": "close",
+        "Pragma": "no-cache",
         "User-Agent": user_agent,
     }
     if current_method == "POST":
@@ -2254,11 +2611,13 @@ print(f"{ip_value}|{loc_value}|{warp_value}")
 curl_unlock_page() {
   local url="$1"
   http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
-    curl -4 --noproxy '*' -fsSL \
+    curl -4 --noproxy '*' -sSL \
     --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
     -A "$UNLOCK_TEST_UA" \
     -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
     -H 'accept-language: en-US,en;q=0.9' \
+    -H 'cache-control: no-cache' \
+    -H 'pragma: no-cache' \
     "$url" 2>/dev/null || true
 }
 
@@ -2411,19 +2770,25 @@ print_unlock_result() {
 }
 
 run_unlock_checks() {
+  local gemini_result youtube_result
   section "服务解锁检测（IPv4）"
   if ! command -v curl >/dev/null 2>&1; then
     warn_line "找不到 curl，无法检测 Gemini 和 YouTube Premium"
-    return 0
+    return 1
   fi
   info_line "正在检测 Gemini 和 YouTube Premium，请稍等"
-  print_unlock_result "Gemini" "$(probe_gemini_unlock)"
+  gemini_result="$(probe_gemini_unlock)"
+  print_unlock_result "Gemini" "$gemini_result"
   if command -v python3 >/dev/null 2>&1; then
-    print_unlock_result "YouTube Premium" "$(probe_youtube_premium_unlock)"
+    youtube_result="$(probe_youtube_premium_unlock)"
+    print_unlock_result "YouTube Premium" "$youtube_result"
   else
+    youtube_result='unknown|找不到 python3'
     warn_line "找不到 python3，无法检测 YouTube Premium"
   fi
   info_line "检测基于公开网页特征和本机 IPv4 出口；若 Google 页面或地区策略变化，可能显示无法确认。"
+  [ "${gemini_result%%|*}" = "yes" ] \
+    && [ "${youtube_result%%|*}" = "yes" ]
 }
 
 run_native_unlock_checks() {
@@ -2479,8 +2844,10 @@ run_native_unlock_checks() {
 
 google_http_probe() {
   local family="$1"
-  curl "$family" -sS --connect-timeout 5 --max-time 12 -o /dev/null \
-    https://www.google.com/generate_204 >/dev/null 2>&1
+  http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
+    no_proxy='*' NO_PROXY='*' \
+    curl "$family" --noproxy '*' -sS --connect-timeout 5 --max-time 12 -o /dev/null \
+      https://www.google.com/generate_204 >/dev/null 2>&1
 }
 
 run_external_diagnostics() {
@@ -2699,13 +3066,71 @@ cmd_status() {
 }
 
 cmd_unlock_check() {
-  run_unlock_checks
+  if run_unlock_checks; then
+    return 0
+  fi
+  warn_line "当前 WARP 出口未全部通过检测；可运行 warp-vps change-ip 更换注册后重试。"
+  return 0
 }
 
 cmd_native_unlock_check() {
   require_root
   load_config
   run_native_unlock_checks
+}
+
+cmd_change_ip() {
+  require_root
+  load_config
+  command -v curl >/dev/null 2>&1 || die "找不到 curl，无法检测更换后的 WARP 出口"
+  command -v python3 >/dev/null 2>&1 || die "找不到 python3，无法检测更换后的 WARP 出口"
+  if ! required_runtime_units_ready || ! test_quiet; then
+    die "当前 WARP 分流运行态异常；请先运行 warp-vps restart"
+  fi
+  if [ "$WARP_MODE" = "wireguard" ]; then
+    managed_wireguard_config_owned \
+      || die "当前 WireGuard 账户与配置不属于同一项目注册，不能自动更换"
+  elif [ "$MANAGED_WARP_SVC" != "1" ]; then
+    die "当前 WARP Client 不属于本项目管理，未执行 WARP IP 更换"
+  elif [ "$(warp_registration_account_type 2>/dev/null || true)" != "free" ]; then
+    die "当前项目管理的 WARP Client 不是可替换的 Free 注册，未执行 WARP IP 更换"
+  fi
+
+  begin_runtime_maintenance || die "无法暂停健康检查，未更换 WARP IP"
+  section "更换 WARP IP"
+  local attempt rotate_rc
+  for ((attempt = 1; attempt <= CHANGE_IP_MAX_ATTEMPTS; attempt++)); do
+    info_line "正在进行第 ${attempt}/${CHANGE_IP_MAX_ATTEMPTS} 次 WARP 注册更换"
+    rotate_rc=0
+    if [ "$WARP_MODE" = "wireguard" ]; then
+      rotate_wireguard_registration "$attempt" || rotate_rc=$?
+    else
+      rotate_socks_registration || rotate_rc=$?
+    fi
+    if [ "$rotate_rc" -ne 0 ]; then
+      if [ "$rotate_rc" -eq 2 ]; then
+        if [ "$WARP_MODE" = "wireguard" ]; then
+          die "WARP IP 更换失败，原 WireGuard 注册即时恢复未成功；退出清理将再次尝试"
+        fi
+        die "WARP IP 更换失败，WARP Client 注册和 Socks5 数据面即时恢复未成功；退出清理将再次尝试"
+      fi
+      finish_runtime_maintenance
+      die "WARP IP 更换失败；已停止后续尝试"
+    fi
+
+    if run_unlock_checks; then
+      finish_runtime_maintenance
+      ok_line "WARP IP 更换完成，Gemini 和 YouTube Premium 均已通过检测"
+      return 0
+    fi
+    if [ "$attempt" -lt "$CHANGE_IP_MAX_ATTEMPTS" ]; then
+      warn_line "本次注册未全部通过检测，继续更换 WARP IP"
+    fi
+  done
+
+  finish_runtime_maintenance
+  fail_line "已更换 ${CHANGE_IP_MAX_ATTEMPTS} 次，Gemini 和 YouTube Premium 仍未全部通过检测"
+  return 1
 }
 
 cmd_configure_warp() {
@@ -3607,6 +4032,7 @@ usage() {
   native-unlock-check
                   通过原生 IPv4（无 IPv4 时用 IPv6）检测 Gemini / YouTube Premium
   unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
+  change-ip       最多更换 10 次 WARP 注册，每次更换后自动重新检测
   update          更新脚本和固定规则快照
   reinstall       非交互重装并保持当前模式
   reinstall [安装选项]
@@ -3681,6 +4107,7 @@ main() {
     test) [ "$#" -eq 0 ] || { cli_error "test 不接受参数"; return 2; }; cmd_test ;;
     native-unlock-check) [ "$#" -eq 0 ] || { cli_error "native-unlock-check 不接受参数"; return 2; }; cmd_native_unlock_check ;;
     unlock-check) [ "$#" -eq 0 ] || { cli_error "unlock-check 不接受参数"; return 2; }; cmd_unlock_check ;;
+    change-ip) [ "$#" -eq 0 ] || { cli_error "change-ip 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_change_ip ;;
     restart) [ "$#" -eq 0 ] || { cli_error "restart 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_restart ;;
     update) [ "$#" -eq 0 ] || { cli_error "update 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_update ;;
     reinstall) cmd_reinstall "$@" ;;
@@ -3701,7 +4128,7 @@ main() {
       if interactive_terminal_available; then
         cmd_menu
       else
-        cli_error "当前没有交互终端；请指定 status、test、native-unlock-check、unlock-check、restart、update、reinstall、switch、logs 或 uninstall"
+        cli_error "当前没有交互终端；请指定 status、test、native-unlock-check、unlock-check、change-ip、restart、update、reinstall、switch、logs 或 uninstall"
         return 2
       fi
       ;;
