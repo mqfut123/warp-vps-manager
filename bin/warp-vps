@@ -2284,22 +2284,38 @@ socks_forwarding_ok() {
 }
 
 socks_rotation_runtime_ok() {
+  local diagnostics="${1:-report}"
   redsocks_local_ready || {
-    warn "更换注册后本地透明转发服务没有正确监听"
+    [ "$diagnostics" = "quiet" ] \
+      || warn "更换注册后本地透明转发服务没有正确监听"
     return 1
   }
   table_exists || {
-    warn "更换注册后系统分流规则未加载"
+    [ "$diagnostics" = "quiet" ] \
+      || warn "更换注册后系统分流规则未加载"
     return 1
   }
   socks_ok || {
-    warn "更换注册后 Cloudflare WARP SOCKS 外部出口未就绪"
+    [ "$diagnostics" = "quiet" ] \
+      || warn "更换注册后 Cloudflare WARP SOCKS 外部出口未就绪"
     return 1
   }
   socks_forwarding_ok || {
-    warn "更换注册后 Google IPv4 透明转发数据面未返回"
+    [ "$diagnostics" = "quiet" ] \
+      || warn "更换注册后 Google IPv4 透明转发数据面未返回"
     return 1
   }
+}
+
+wait_for_socks_rotation_runtime() {
+  local max_wait="${1:-60}"
+  local deadline=$((SECONDS + max_wait))
+  while [ "$SECONDS" -le "$deadline" ]; do
+    socks_rotation_runtime_ok quiet && return 0
+    [ "$SECONDS" -ge "$deadline" ] && break
+    sleep 2
+  done
+  socks_rotation_runtime_ok
 }
 
 disarm_socks_rotation_recovery() {
@@ -2314,7 +2330,7 @@ recover_socks_rotation() {
     return 1
   fi
   configure_warp_runtime strict || return 1
-  socks_rotation_runtime_ok
+  wait_for_socks_rotation_runtime 60
 }
 
 fail_socks_rotation_with_recovery() {
@@ -2341,7 +2357,7 @@ rotate_socks_registration() {
     fail_socks_rotation_with_recovery
     return
   }
-  socks_rotation_runtime_ok || {
+  wait_for_socks_rotation_runtime 60 || {
     fail_socks_rotation_with_recovery
     return
   }

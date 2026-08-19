@@ -5013,13 +5013,13 @@ test_socks_rotation_orders_registration_configuration_and_data_plane() {
     'Socks rotation must preserve the port and validate each boundary in strict order' || return 1
 
   : > "$event"
-  socks_ok() { printf 'trace\n' >> "$event"; return 1; }
+  wait_for_socks_rotation_runtime() { printf 'wait\n' >> "$event"; return 1; }
   recover_socks_rotation() { printf 'recover\n' >> "$event"; return 0; }
   rc=0
   rotate_socks_registration >/dev/null 2>&1 || rc=$?
-  assert_eq '1' "$rc" 'a failed WARP trace must fail the Socks rotation' || return 1
-  assert_eq $'delete\ncreate\nconfigure:strict:24567\nredsocks\nrules\ntrace\nrecover' "$(< "$event")" \
-    'a failed Socks data-plane gate must recover before returning and skip forwarding validation' || return 1
+  assert_eq '1' "$rc" 'an exhausted runtime wait must fail the Socks rotation' || return 1
+  assert_eq $'delete\ncreate\nconfigure:strict:24567\nwait\nrecover' "$(< "$event")" \
+    'an exhausted Socks runtime wait must recover before returning' || return 1
   assert_eq '0' "$SOCKS_ROTATION_RECOVERY_ARMED" \
     'successful Socks recovery must disarm the exit-time recovery hook' || return 1
 
@@ -5031,6 +5031,107 @@ test_socks_rotation_orders_registration_configuration_and_data_plane() {
     'a failed Socks recovery must retain the distinct exit-trap recovery status' || return 1
   assert_eq '1' "$SOCKS_ROTATION_RECOVERY_ARMED" \
     'failed immediate recovery must leave the exit-time recovery hook armed'
+}
+
+test_socks_rotation_waits_for_runtime_convergence() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event forwarding_checks=0 recover_calls=0
+  event="$(mktemp)"
+  WARP_SOCKS_PORT=24567
+
+  delete_warp_registration() { printf 'delete\n' >> "$event"; }
+  create_warp_registration() { printf 'create\n' >> "$event"; }
+  configure_warp_runtime() { printf 'configure:%s:%s\n' "${1:-}" "$WARP_SOCKS_PORT" >> "$event"; }
+  redsocks_local_ready() { printf 'redsocks\n' >> "$event"; }
+  table_exists() { printf 'rules\n' >> "$event"; }
+  socks_ok() { printf 'trace\n' >> "$event"; }
+  socks_forwarding_ok() {
+    forwarding_checks=$((forwarding_checks + 1))
+    printf 'forwarding:%s\n' "$forwarding_checks" >> "$event"
+    [ "$forwarding_checks" -ge 3 ]
+  }
+  sleep() {
+    printf 'sleep:%s\n' "$1" >> "$event"
+    SECONDS=$((SECONDS + $1))
+  }
+  recover_socks_rotation() {
+    recover_calls=$((recover_calls + 1))
+    printf 'unexpected-recover\n' >> "$event"
+  }
+
+  SECONDS=0
+  rotate_socks_registration || {
+    fail 'Socks rotation should wait for the third successful data-plane probe'
+    return 1
+  }
+  assert_eq \
+    $'delete\ncreate\nconfigure:strict:24567\nredsocks\nrules\ntrace\nforwarding:1\nsleep:2\nredsocks\nrules\ntrace\nforwarding:2\nsleep:2\nredsocks\nrules\ntrace\nforwarding:3' \
+    "$(< "$event")" \
+    'rotation must keep one registration and retry the complete data plane in order' || return 1
+  assert_eq '0' "$recover_calls" \
+    'a data plane that converges during the wait must not trigger registration recovery' || return 1
+  assert_eq '1' "$(grep -c '^delete$' "$event")" \
+    'a converging data plane must not delete another registration' || return 1
+  assert_eq '0' "$SOCKS_ROTATION_RECOVERY_ARMED" \
+    'a converged rotation must disarm exit-time recovery' || return 1
+
+  source_without_main "$MANAGER_SCRIPT"
+  : > "$event"
+  forwarding_checks=0
+  WARP_SOCKS_PORT=24567
+  inspect_warp_registration() {
+    WARP_REGISTRATION_STATE=present
+    printf 'inspect:present\n' >> "$event"
+  }
+  create_warp_registration() { printf 'unexpected-create\n' >> "$event"; }
+  delete_warp_registration() { printf 'unexpected-delete\n' >> "$event"; }
+  configure_warp_runtime() { printf 'configure:%s:%s\n' "${1:-}" "$WARP_SOCKS_PORT" >> "$event"; }
+  redsocks_local_ready() { printf 'redsocks\n' >> "$event"; }
+  table_exists() { printf 'rules\n' >> "$event"; }
+  socks_ok() { printf 'trace\n' >> "$event"; }
+  socks_forwarding_ok() {
+    forwarding_checks=$((forwarding_checks + 1))
+    printf 'forwarding:%s\n' "$forwarding_checks" >> "$event"
+    [ "$forwarding_checks" -ge 3 ]
+  }
+  sleep() {
+    printf 'sleep:%s\n' "$1" >> "$event"
+    SECONDS=$((SECONDS + $1))
+  }
+
+  SECONDS=0
+  recover_socks_rotation || {
+    fail 'Socks recovery should wait for the third successful data-plane probe'
+    return 1
+  }
+  assert_eq \
+    $'inspect:present\nconfigure:strict:24567\nredsocks\nrules\ntrace\nforwarding:1\nsleep:2\nredsocks\nrules\ntrace\nforwarding:2\nsleep:2\nredsocks\nrules\ntrace\nforwarding:3' \
+    "$(< "$event")" \
+    'recovery must wait for the same complete data-plane convergence without replacing a present registration'
+}
+
+test_socks_rotation_runtime_wait_is_bounded_and_reports_once() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event rc=0
+  event="$(mktemp)"
+
+  socks_rotation_runtime_ok() {
+    printf 'probe:%s:%s\n' "${1:-report}" "$SECONDS" >> "$event"
+    return 1
+  }
+  sleep() {
+    printf 'sleep:%s\n' "$1" >> "$event"
+    SECONDS=$((SECONDS + $1))
+  }
+
+  SECONDS=0
+  wait_for_socks_rotation_runtime 4 || rc=$?
+  assert_eq '1' "$rc" \
+    'an unconverged Socks data plane must fail after the requested wait window' || return 1
+  assert_eq \
+    $'probe:quiet:0\nsleep:2\nprobe:quiet:2\nsleep:2\nprobe:quiet:4\nprobe:report:4' \
+    "$(< "$event")" \
+    'Socks runtime wait must bound quiet probes and emit one final reporting probe at the deadline'
 }
 
 test_change_ip_dispatches_each_mode_and_finishes_the_timer() {
@@ -10035,6 +10136,8 @@ run_test 'WARP readiness wins over intermediate command exit codes' test_warp_co
 run_test 'strict WARP configuration stops before connect' test_strict_warp_configuration_stops_before_connect
 run_test 'Socks change-ip requires an explicit Free registration' test_socks_change_ip_requires_an_explicit_free_registration
 run_test 'Socks rotation orders configuration and data-plane gates' test_socks_rotation_orders_registration_configuration_and_data_plane
+run_test 'Socks rotation waits for runtime convergence' test_socks_rotation_waits_for_runtime_convergence
+run_test 'Socks runtime wait is bounded and reports once' test_socks_rotation_runtime_wait_is_bounded_and_reports_once
 run_test 'change-ip dispatches each mode and restores the timer' test_change_ip_dispatches_each_mode_and_finishes_the_timer
 run_test 'change-ip unlock policy prompt handles defaults choices retries and EOF' test_change_ip_unlock_policy_prompt_contract
 run_test 'change-ip unlock policy controls retry success' test_change_ip_unlock_policy_controls_retry_success
