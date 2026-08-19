@@ -6081,6 +6081,9 @@ test_youtube_fixtures() {
     "${FIXTURE_DIR}/youtube/conflicting-region.html" \
     'unknown|地区信息冲突' || return 1
   evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/unavailable-conflicting-region.html" \
+    'no|地区：未知' || return 1
+  evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-signals.html" \
     'no|地区：US' || return 1
   evaluate_youtube_fixture \

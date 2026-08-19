@@ -2805,17 +2805,17 @@ evaluate_youtube_premium_unlock() {
     available=1
   fi
 
-  if [ "$region_status" -eq 2 ]; then
-    printf 'unknown|地区信息冲突\n'
-    return 0
-  fi
-
   if [ "$unavailable" -eq 1 ]; then
     if [ -n "$region" ]; then
       printf 'no|地区：%s\n' "$region"
     else
       printf 'no|地区：未知\n'
     fi
+    return 0
+  fi
+
+  if [ "$region_status" -eq 2 ]; then
+    printf 'unknown|地区信息冲突\n'
     return 0
   fi
 
