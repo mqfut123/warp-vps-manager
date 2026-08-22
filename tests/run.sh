@@ -6130,6 +6130,9 @@ test_gemini_fixtures() {
     "${FIXTURE_DIR}/gemini/available-no-region.html" \
     'yes|' || return 1
   evaluate_gemini_fixture \
+    "${FIXTURE_DIR}/gemini/available-legacy-marker.html" \
+    'yes|' || return 1
+  evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/old-false-marker.html" \
     'unknown|页面标记不能确认是否可用' || return 1
   evaluate_gemini_fixture \

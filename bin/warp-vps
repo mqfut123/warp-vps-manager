@@ -2807,7 +2807,8 @@ evaluate_gemini_unlock() {
     return 0
   fi
 
-  if grep -Fq '45631641,null,true' <<< "$body"; then
+  if grep -Fq '45631641,null,true' <<< "$body" \
+    || grep -Fq '45617354,null,true' <<< "$body"; then
     available=1
   fi
   if grep -Fq '45631641,null,false' <<< "$body"; then
