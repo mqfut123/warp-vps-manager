@@ -314,7 +314,7 @@ jobs:
           strict_rc=0
           strict_output="$(run_native_https_probe \
             wireguard google '/native/wireguard-google-strict-rpf' 3 2>/dev/null)" || strict_rc=$?
-          [ "$strict_rc" -eq 0 ]
+          [ "$strict_rc" -ne 0 ]
           [ -z "$strict_output" ]
           if grep -Fq '|/native/wireguard-google-strict-rpf' "$https_log"; then
             printf 'strict rp_filter unexpectedly admitted the native HTTPS reply\n' >&2
