@@ -6125,7 +6125,7 @@ test_gemini_fixtures() {
     'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/unavailable.html" \
-    'unknown|页面标记不能确认是否可用' || return 1
+    'no|地区：CHN' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/available-no-region.html" \
     'yes|' || return 1
@@ -6150,6 +6150,22 @@ test_gemini_fixtures() {
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/conflicting.html" \
     'unknown|页面特征冲突' || return 1
+  assert_eq \
+    'yes|地区：USA' \
+    "$(evaluate_gemini_unlock ',2,1,200,"USA"')" \
+    'a supported Gemini region must be accepted without a marker' || return 1
+  assert_eq \
+    'yes|地区：AFG' \
+    "$(evaluate_gemini_unlock ',2,1,200,"AFG"')" \
+    'a non-blocked Gemini region must be accepted without a marker' || return 1
+  assert_eq \
+    'no|地区：CHN' \
+    "$(evaluate_gemini_unlock ',2,1,200,"CHN"')" \
+    'a blocked Gemini region without a positive marker must be rejected' || return 1
+  assert_eq \
+    'unknown|地区信息冲突' \
+    "$(evaluate_gemini_unlock ',2,1,200,"USA"],2,1,200,"CAN"')" \
+    'conflicting Gemini region-only signals must remain unknown' || return 1
   assert_eq \
     'unknown|网络连接失败' \
     "$(evaluate_gemini_unlock '')" \
@@ -6385,16 +6401,16 @@ test_youtube_fixtures() {
 
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-google-cn.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-unrelated-country.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-generic-adfree.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-flow-offer.html" \
     'yes|地区：US' || return 1
@@ -6406,13 +6422,13 @@ test_youtube_fixtures() {
     'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/active-go-to-youtube.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/premium-navigation-outside-offer-button.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-region.html" \
-    'unknown|地区信息冲突' || return 1
+    'yes|' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/unavailable-conflicting-region.html" \
     'no|地区：未知' || return 1
@@ -6421,7 +6437,7 @@ test_youtube_fixtures() {
     'no|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-cn.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：CN' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/unavailable-us.html" \
     'no|地区：US' || return 1
@@ -6431,10 +6447,56 @@ test_youtube_fixtures() {
     'an explicit unavailable response without a region must say that the region is unknown' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-only.html" \
-    'unknown|页面特征不明确' || return 1
+    'yes|地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/offer-without-region.html" \
-    'unknown|未取到地区' || return 1
+    'yes|' || return 1
+  for marker in \
+    'premiumPurchaseButton' \
+    'manageSubscriptionButton' \
+    'purchaseButtonOverride' \
+    'Start trial' \
+    'ad-free' \
+    '/month' \
+    '/月' \
+    '"browseId": "SPunlimited"'; do
+    assert_eq \
+      'yes|' \
+      "$(evaluate_youtube_premium_unlock "$marker")" \
+      "YouTube Premium marker must be accepted: $marker" || return 1
+  done
+  for region_body in \
+    '"GL":"US"' \
+    '"countryCode":"US"' \
+    '"country_code":"US"' \
+    '"locationCountryCode":"US"' \
+    '<span id="country-code">US</span>'; do
+    assert_eq \
+      'yes|地区：US' \
+      "$(evaluate_youtube_premium_unlock "$region_body")" \
+      "YouTube region signal must be accepted: $region_body" || return 1
+  done
+  for unavailable_text in \
+    'YouTube Premium is not available in your country' \
+    'Premium is not available in your country' \
+    'Premium is not available in your region'; do
+    assert_eq \
+      'no|地区：未知' \
+      "$(evaluate_youtube_premium_unlock "$unavailable_text Start trial ad-free")" \
+      "explicit YouTube unavailability must outrank positive text: $unavailable_text" || return 1
+  done
+  assert_eq \
+    'no|地区：CN' \
+    "$(evaluate_youtube_premium_unlock 'https://www.google.cn/')" \
+    'a Google China response without a Premium signal must be rejected' || return 1
+  assert_eq \
+    'unknown|地区信息冲突' \
+    "$(evaluate_youtube_premium_unlock '"INNERTUBE_CONTEXT_GL":"US","INNERTUBE_CONTEXT_GL":"CN"')" \
+    'conflicting region-only YouTube signals must remain unknown' || return 1
+  assert_eq \
+    'unknown|页面特征不明确' \
+    "$(evaluate_youtube_premium_unlock 'YouTube Premium')" \
+    'a generic YouTube Premium title must not count as an unlock signal' || return 1
   assert_eq \
     'unknown|网络连接失败' \
     "$(evaluate_youtube_premium_unlock '')" \

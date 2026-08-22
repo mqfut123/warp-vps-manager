@@ -92,7 +92,7 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 `native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
 
-`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 只在首页返回明确的正向 marker 时显示可用，不显示地区；单独的负向 marker、marker 缺失或冲突都显示无法确认。YouTube Premium 只在 `ytInitialData` 中存在仍可操作且指向 Premium 购买流程的按钮时确认可用；明确不可用页面优先，并同时显示页面地区。只有 `ad-free` 文案、购买容器名、地区或页面特征冲突时不会误报为可用。检测请求不使用环境代理、Cookie 或本地缓存。单独运行 `unlock-check` 时仍会逐项显示结果，只有两项都明确可用才报告全部通过。
+`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 首页返回任一已知正向 marker 时显示可用；没有正向 marker 时，页面地区属于明确受限地区则显示不可用，其他有效地区显示可用，地区缺失、冲突或只有旧负向 marker 时显示无法确认。YouTube Premium 的明确不可用文案优先；否则，页面包含可操作购买流程、Premium 专属购买/订阅/试用/免广告/月付标记，或有效服务地区时显示可用。`www.google.cn` 只有在没有 Premium 正向信号时才作为中国区不可用响应；单纯 HTTP 成功或普通 `YouTube Premium` 标题仍不能证明解锁。检测请求不使用环境代理、Cookie 或本地缓存。单独运行 `unlock-check` 时仍会逐项显示结果，只有两项都明确可用才报告全部通过。
 
 安装完成后会自动运行一次当前 WARP 出口检测。未全部通过时只提示运行 `warp-vps change-ip`，不会在安装流程中自动更换。`change-ip` 保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口，通过重新注册 WARP 获取新出口；交互运行时先询问是否要求两项都明确可用，默认只要任一项明确可用就停止，非交互运行也使用该默认值；每轮恢复当前数据面后立即复检，最多尝试 10 次。Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户。Socks5 全局范围更换注册时会先暂停项目透明分流，避免 WARP Client 注册请求被旧规则重定向；完成注册和本地代理配置后恢复原范围，并验证完整数据面。
 

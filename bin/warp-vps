@@ -2696,7 +2696,14 @@ import re
 import sys
 
 body = sys.stdin.read()
-for key in ("INNERTUBE_CONTEXT_GL", "contentRegion"):
+for key in (
+    "INNERTUBE_CONTEXT_GL",
+    "contentRegion",
+    "GL",
+    "countryCode",
+    "country_code",
+    "locationCountryCode",
+):
     pattern = rf"\"{key}\"\s*:\s*\"([A-Za-z]{{2}})\""
     values = []
     for value in re.findall(pattern, body):
@@ -2708,6 +2715,20 @@ for key in ("INNERTUBE_CONTEXT_GL", "contentRegion"):
         raise SystemExit(0)
     if len(values) > 1:
         raise SystemExit(2)
+html_values = []
+for value in re.findall(
+    r"id=[\"\x27]country-code[\"\x27][^>]*>\s*([A-Za-z]{2})\s*<",
+    body,
+    re.IGNORECASE,
+):
+    value = value.upper()
+    if value not in html_values:
+        html_values.append(value)
+if len(html_values) == 1:
+    print(html_values[0])
+    raise SystemExit(0)
+if len(html_values) > 1:
+    raise SystemExit(2)
 raise SystemExit(1)
 ' <<< "$body"
 }
@@ -2797,10 +2818,62 @@ raise SystemExit(1)
 ' <<< "$body"
 }
 
+youtube_has_unlock_signal() {
+  local body="$1"
+
+  if youtube_has_actionable_offer "$body"; then
+    return 0
+  fi
+  if grep -Fqi 'premiumPurchaseButton' <<< "$body" \
+    || grep -Fqi 'manageSubscriptionButton' <<< "$body" \
+    || grep -Fqi 'purchaseButtonOverride' <<< "$body" \
+    || grep -Fqi 'Start trial' <<< "$body" \
+    || grep -Fqi 'ad-free' <<< "$body" \
+    || grep -Fqi '/month' <<< "$body" \
+    || grep -Fq '/月' <<< "$body" \
+    || grep -Eq '"browseId"[[:space:]]*:[[:space:]]*"SPunlimited"' <<< "$body"; then
+    return 0
+  fi
+  return 1
+}
+
+youtube_has_unavailable_signal() {
+  local body="$1"
+
+  grep -Fqi 'YouTube Premium is not available in your country' <<< "$body" \
+    || grep -Fqi 'Premium is not available in your country' <<< "$body" \
+    || grep -Fqi 'Premium is not available in your region' <<< "$body"
+}
+
+extract_gemini_region() {
+  local body="$1"
+  local regions count
+
+  regions="$(
+    grep -oE ',2,1,200,"[A-Z]{3}"' <<< "$body" \
+      | sed -E 's/.*"([A-Z]{3})"/\1/' \
+      | awk '!seen[$0]++' \
+      || true
+  )"
+  [ -n "$regions" ] || return 1
+  count="$(awk 'END { print NR }' <<< "$regions")"
+  [ "$count" -eq 1 ] || return 2
+  printf '%s\n' "$regions"
+}
+
+gemini_region_is_blocked() {
+  case "$1" in
+    CHN|RUS|BLR|CUB|IRN|PRK|SYR|HKG|MAC) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 evaluate_gemini_unlock() {
   local body="$1"
   local available=0
   local unavailable=0
+  local region=""
+  local region_status=0
 
   if [ -z "$body" ]; then
     printf 'unknown|网络连接失败\n'
@@ -2815,12 +2888,31 @@ evaluate_gemini_unlock() {
     unavailable=1
   fi
 
+  if region="$(extract_gemini_region "$body" 2>/dev/null)"; then
+    :
+  else
+    region_status=$?
+  fi
+
   if [ "$available" -eq 1 ] && [ "$unavailable" -eq 1 ]; then
     printf 'unknown|页面特征冲突\n'
     return 0
   fi
   if [ "$available" -eq 1 ]; then
     printf 'yes|\n'
+    return 0
+  fi
+
+  if [ "$region_status" -eq 2 ]; then
+    printf 'unknown|地区信息冲突\n'
+    return 0
+  fi
+  if [ -n "$region" ]; then
+    if gemini_region_is_blocked "$region"; then
+      printf 'no|地区：%s\n' "$region"
+    else
+      printf 'yes|地区：%s\n' "$region"
+    fi
     return 0
   fi
 
@@ -2842,8 +2934,6 @@ evaluate_youtube_premium_unlock() {
   local body="$1"
   local region=""
   local region_status=0
-  local unavailable=0
-  local available=0
 
   if [ -z "$body" ]; then
     printf 'unknown|网络连接失败\n'
@@ -2856,14 +2946,7 @@ evaluate_youtube_premium_unlock() {
     region_status=$?
   fi
 
-  if grep -Fqi 'Premium is not available in your country' <<< "$body"; then
-    unavailable=1
-  fi
-  if youtube_has_actionable_offer "$body"; then
-    available=1
-  fi
-
-  if [ "$unavailable" -eq 1 ]; then
+  if youtube_has_unavailable_signal "$body"; then
     if [ -n "$region" ]; then
       printf 'no|地区：%s\n' "$region"
     else
@@ -2872,21 +2955,31 @@ evaluate_youtube_premium_unlock() {
     return 0
   fi
 
+  if youtube_has_unlock_signal "$body"; then
+    if [ -n "$region" ]; then
+      printf 'yes|地区：%s\n' "$region"
+    else
+      printf 'yes|\n'
+    fi
+    return 0
+  fi
+
+  if grep -Fq 'www.google.cn' <<< "$body"; then
+    printf 'no|地区：CN\n'
+    return 0
+  fi
+
   if [ "$region_status" -eq 2 ]; then
     printf 'unknown|地区信息冲突\n'
     return 0
   fi
 
-  if [ -n "$region" ] && [ "$available" -eq 1 ]; then
+  if [ -n "$region" ]; then
     printf 'yes|地区：%s\n' "$region"
     return 0
   fi
 
-  if [ -z "$region" ]; then
-    printf 'unknown|未取到地区\n'
-  else
-    printf 'unknown|页面特征不明确\n'
-  fi
+  printf 'unknown|页面特征不明确\n'
 }
 
 probe_youtube_premium_unlock() {
