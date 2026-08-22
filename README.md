@@ -78,8 +78,8 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 | `warp-vps status` | 查看配置、服务、接口、端口和分流服务运行态 |
 | `warp-vps test` | 运行分流与外部连通性诊断 |
 | `warp-vps native-unlock-check` | 绕过 WARP 分流，检测原生出口的 Gemini 和 YouTube Premium |
-| `warp-vps unlock-check` | 检测当前 WARP IPv4 出口的 Gemini 和 YouTube Premium |
-| `warp-vps change-ip` | 最多更换 10 次 WARP 注册；默认任一服务明确可用即停止 |
+| `warp-vps unlock-check [--strict-exit]` | 检测当前 WARP IPv4 出口的 Gemini 和 YouTube Premium；严格退出模式仅在两项均明确可用时成功 |
+| `warp-vps change-ip [--policy all\|any]` | 最多更换 10 次 WARP 注册；默认两项服务均明确可用才停止 |
 | `warp-vps restart` | 重启 WARP 分流链路 |
 | `warp-vps update` | 更新程序与 Google IP 规则；不安装或升级运行依赖，旧版规则差异不会阻止更新 |
 | `warp-vps reinstall --scope global` | 保持运行模式并切换到全局 WARP |
@@ -92,9 +92,11 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 `native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
 
-`unlock-check` 与 `native-unlock-check` 共用相同的页面判定：Gemini 首页返回任一已知正向 marker 时显示可用；没有正向 marker 时，页面地区属于明确受限地区则显示不可用，其他有效地区显示可用，地区缺失、冲突或只有旧负向 marker 时显示无法确认。YouTube Premium 的明确不可用文案优先；否则，页面包含可操作购买流程、Premium 专属购买/订阅/试用/免广告/月付标记，或有效服务地区时显示可用。`www.google.cn` 只有在没有 Premium 正向信号时才作为中国区不可用响应；单纯 HTTP 成功或普通 `YouTube Premium` 标题仍不能证明解锁。检测请求不使用环境代理、Cookie 或本地缓存。单独运行 `unlock-check` 时仍会逐项显示结果，只有两项都明确可用才报告全部通过。
+`unlock-check`、安装完成检测、`change-ip` 与 `native-unlock-check` 共用相同的页面判定。每项使用首个成功的 HTTP 响应，只有传输失败时才重试一次，不合并两份成功页面。Gemini 返回 403 / 451 或受限地区时显示不可用；否则，命中两个已知正向 marker 中任意一个，或页面返回受支持地区时显示可用，其余情况显示无法确认；Gemini 地区码只参与内部判断，不在结果中展示。YouTube Premium 的三种明确不可用文案或最终重定向到 `google.cn` 域名时优先显示不可用；否则，只有 HTTP 2xx 响应包含 `premiumPurchaseButton`、`manageSubscriptionButton`、月付标记、`ad-free` 或精确的 `SPunlimited` browseId 任一信号时才显示可用。YouTube 的页面地区只用于结果说明，不作为 Premium 可用证据；单纯 HTTP 成功或普通标题也不能证明解锁。检测请求不使用环境代理、Cookie 或本地缓存。单独运行 `unlock-check` 时仍会逐项显示结果；默认作为只读诊断返回成功，增加 `--strict-exit` 后只有两项都明确可用才返回成功。
 
-安装完成后会自动运行一次当前 WARP 出口检测。未全部通过时只提示运行 `warp-vps change-ip`，不会在安装流程中自动更换。`change-ip` 保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口，通过重新注册 WARP 获取新出口；交互运行时先询问是否要求两项都明确可用，默认只要任一项明确可用就停止，非交互运行也使用该默认值；每轮恢复当前数据面后立即复检，最多尝试 10 次。Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户。Socks5 全局范围更换注册时会先暂停项目透明分流，避免 WARP Client 注册请求被旧规则重定向；完成注册和本地代理配置后恢复原范围，并验证完整数据面。
+安装成功后会运行一次 `unlock-check --strict-exit`。两项均明确可用时直接结束；未全部通过时始终提示稍后可运行 `warp-vps change-ip`。交互安装会再询问是否立即更换，提示为 `[Y/n]`，直接回车或输入 Y / yes 会执行 `warp-vps change-ip --policy all`，其他输入或读取结束则不更换；非交互安装不读取输入，也不自动更换。检测或更换失败不会改变已经完成的安装结果。
+
+`change-ip` 保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口，通过重新注册 WARP 获取新出口。默认停止策略为 `all`，要求 Gemini 与 YouTube Premium 均明确可用；交互运行且未指定策略时以 `[Y/n]` 确认该默认值，选择 n 改为任一项明确可用即可停止。非交互运行同样默认 `all`，自动化可通过 `--policy all` 或 `--policy any` 明确指定。每轮恢复当前数据面后立即复检，最多尝试 10 次。Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户。Socks5 全局范围更换注册时会先暂停项目透明分流，避免 WARP Client 注册请求被旧规则重定向；完成注册和本地代理配置后恢复原范围，并验证完整数据面。
 
 ## 卸载
 

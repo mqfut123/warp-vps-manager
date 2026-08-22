@@ -2488,6 +2488,7 @@ native_https_request() {
   local method="$1"
   local url="$2"
   local body="${3-}"
+  local output_mode="${4:-body}"
   local bind_iface=""
   local socket_mark=0
   local target_uid=0
@@ -2496,7 +2497,7 @@ native_https_request() {
   if [ "${WARP_MODE:-}" = "socks" ]; then
     target_uid="$REDSOCKS_UID"
     target_gid="$(id -g "$REDSOCKS_USER" 2>/dev/null || true)"
-    case "$target_gid" in ''|*[!0-9]*) return 0 ;; esac
+    case "$target_gid" in ''|*[!0-9]*) return 1 ;; esac
   else
     bind_iface="${NATIVE_IFACE:-}"
     if [ "${WARP_SCOPE:-}" = "global" ]; then
@@ -2526,8 +2527,13 @@ target_gid = int(sys.argv[10])
 connect_timeout = float(sys.argv[11])
 max_time = float(sys.argv[12])
 user_agent = sys.argv[13]
+output_mode = sys.argv[14]
 
-if method not in ("GET", "POST") or family_number not in (4, 6):
+if (
+    method not in ("GET", "POST")
+    or family_number not in (4, 6)
+    or output_mode not in ("body", "unlock")
+):
     raise SystemExit(1)
 family = socket.AF_INET if family_number == 4 else socket.AF_INET6
 source = ipaddress.ip_address(source_ip)
@@ -2640,14 +2646,18 @@ for redirect_count in range(6):
             current_method = "GET"
             current_body = None
         continue
-    if status < 200 or status >= 300:
-        raise SystemExit(1)
-    sys.stdout.buffer.write(response_body)
+    if output_mode == "unlock":
+        metadata = f"{status}\t{current_url}\n".encode("utf-8")
+        sys.stdout.buffer.write(metadata + response_body)
+    else:
+        if status < 200 or status >= 300:
+            raise SystemExit(1)
+        sys.stdout.buffer.write(response_body)
     raise SystemExit(0)
 raise SystemExit(1)
 ' "$method" "$url" "$body" "${NATIVE_FAMILY:-}" "${NATIVE_SOURCE_IP:-}" \
       "$bind_iface" "$socket_mark" "${WARP_MODE:-}" "$target_uid" "$target_gid" \
-      "$UNLOCK_CONNECT_TIMEOUT" "$UNLOCK_MAX_TIME" "$UNLOCK_TEST_UA" 2>/dev/null || true
+      "$UNLOCK_CONNECT_TIMEOUT" "$UNLOCK_MAX_TIME" "$UNLOCK_TEST_UA" "$output_mode" 2>/dev/null
 }
 
 parse_cloudflare_trace() {
@@ -2678,15 +2688,108 @@ print(f"{ip_value}|{loc_value}|{warp_value}")
 
 curl_unlock_page() {
   local url="$1"
-  http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
-    curl -4 --noproxy '*' -sSL \
-    --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
-    -A "$UNLOCK_TEST_UA" \
-    -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
-    -H 'accept-language: en-US,en;q=0.9' \
-    -H 'cache-control: no-cache' \
-    -H 'pragma: no-cache' \
-    "$url" 2>/dev/null || true
+  local raw metadata body status final_url
+
+  if ! raw="$(
+    http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
+      curl -4 --noproxy '*' -sSL \
+      --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
+      -A "$UNLOCK_TEST_UA" \
+      -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+      -H 'accept-language: en-US,en;q=0.9' \
+      -H 'cache-control: no-cache' \
+      -H 'pragma: no-cache' \
+      --write-out $'\n%{http_code}\t%{url_effective}' \
+      "$url" 2>/dev/null
+  )"; then
+    return 1
+  fi
+
+  metadata="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  status="${metadata%%$'\t'*}"
+  final_url="${metadata#*$'\t'}"
+  case "$status" in
+    [0-9][0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  [ "$final_url" != "$metadata" ] && [ -n "$final_url" ] || return 1
+  printf '%s\t%s\n%s' "$status" "$final_url" "$body"
+}
+
+native_unlock_page() {
+  native_https_request GET "$1" '' unlock
+}
+
+request_unlock_response() {
+  local request_function="$1"
+  local attempt response
+  shift
+
+  for attempt in 1 2; do
+    if response="$("$request_function" "$@")"; then
+      printf '%s' "$response"
+      return 0
+    fi
+  done
+  return 1
+}
+
+parse_unlock_response() {
+  local response="$1"
+  local metadata body status final_url
+
+  if [[ "$response" == *$'\n'* ]]; then
+    metadata="${response%%$'\n'*}"
+    body="${response#*$'\n'}"
+  else
+    metadata="$response"
+    body=""
+  fi
+  status="${metadata%%$'\t'*}"
+  final_url="${metadata#*$'\t'}"
+  case "$status" in
+    [0-9][0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  [ "$final_url" != "$metadata" ] && [ -n "$final_url" ] || return 1
+
+  UNLOCK_RESPONSE_STATUS="$status"
+  UNLOCK_RESPONSE_FINAL_URL="$final_url"
+  UNLOCK_RESPONSE_BODY="$body"
+}
+
+unlock_url_host_is_google_cn() {
+  local url="$1"
+  local authority host
+
+  authority="${url#*://}"
+  [ "$authority" != "$url" ] || return 1
+  authority="${authority%%[/?#]*}"
+  authority="${authority##*@}"
+  host="${authority%%:*}"
+  host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    google.cn|*.google.cn) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+unlock_url_is_google_sorry() {
+  local url="$1"
+  local remainder request_path
+
+  remainder="${url#*://}"
+  [ "$remainder" != "$url" ] || return 1
+  case "$remainder" in
+    */*) request_path="/${remainder#*/}" ;;
+    *) request_path="/" ;;
+  esac
+  request_path="${request_path%%[?#]*}"
+  case "$request_path" in
+    /sorry|/sorry/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 extract_youtube_region() {
@@ -2696,6 +2799,7 @@ import re
 import sys
 
 body = sys.stdin.read()
+values = []
 for key in (
     "INNERTUBE_CONTEXT_GL",
     "contentRegion",
@@ -2705,115 +2809,23 @@ for key in (
     "locationCountryCode",
 ):
     pattern = rf"\"{key}\"\s*:\s*\"([A-Za-z]{{2}})\""
-    values = []
     for value in re.findall(pattern, body):
         value = value.upper()
         if value not in values:
             values.append(value)
-    if len(values) == 1:
-        print(values[0])
-        raise SystemExit(0)
-    if len(values) > 1:
-        raise SystemExit(2)
-html_values = []
 for value in re.findall(
     r"id=[\"\x27]country-code[\"\x27][^>]*>\s*([A-Za-z]{2})\s*<",
     body,
     re.IGNORECASE,
 ):
     value = value.upper()
-    if value not in html_values:
-        html_values.append(value)
-if len(html_values) == 1:
-    print(html_values[0])
+    if value not in values:
+        values.append(value)
+if len(values) == 1:
+    print(values[0])
     raise SystemExit(0)
-if len(html_values) > 1:
+if len(values) > 1:
     raise SystemExit(2)
-raise SystemExit(1)
-' <<< "$body"
-}
-
-youtube_has_actionable_offer() {
-  local body="$1"
-  python3 -c '
-import json
-import re
-import sys
-from urllib.parse import urlparse
-
-body = sys.stdin.read()
-decoder = json.JSONDecoder()
-assignments = re.compile(
-    r"(?:\b(?:var|let|const)\s+)?ytInitialData\s*=\s*"
-    r"|window\s*\[\s*[\"\x27]ytInitialData[\"\x27]\s*\]\s*=\s*"
-)
-
-
-def walk(value):
-    yield value
-    if isinstance(value, dict):
-        for child in value.values():
-            yield from walk(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from walk(child)
-
-
-def premium_path(value):
-    if not isinstance(value, str) or not value:
-        return False
-    parsed = urlparse(value)
-    if parsed.hostname and parsed.hostname.lower() not in (
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com",
-    ):
-        return False
-    return parsed.path.rstrip("/") in ("/premium", "/premiumlite", "/premium/student")
-
-
-def purchase_action(on_tap):
-    for node in walk(on_tap):
-        if not isinstance(node, dict):
-            continue
-        flow = node.get("flowNextStepCommand")
-        if (
-            isinstance(flow, dict)
-            and flow.get("targetId") == "multi_step_purchase_flow"
-            and flow.get("stepId") == "plan_selection"
-        ):
-            return True
-        browse = node.get("browseEndpoint")
-        if (
-            isinstance(browse, dict)
-            and browse.get("browseId") == "SPunlimited"
-            and browse.get("canonicalBaseUrl") in ("/premium", "/premiumlite")
-        ):
-            return True
-        endpoint = node.get("urlEndpoint")
-        if isinstance(endpoint, dict) and premium_path(endpoint.get("url")):
-            return True
-    return False
-
-
-for match in assignments.finditer(body):
-    start = match.end()
-    if start >= len(body) or body[start] != "{":
-        continue
-    try:
-        document, _ = decoder.raw_decode(body[start:])
-    except (TypeError, ValueError):
-        continue
-    for node in walk(document):
-        if not isinstance(node, dict):
-            continue
-        if node.get("accessibilityId") != "id.ypc.offer.button":
-            continue
-        if node.get("state") != "BUTTON_VIEW_MODEL_STATE_ACTIVE":
-            continue
-        on_tap = node.get("onTap")
-        if on_tap and purchase_action(on_tap):
-            raise SystemExit(0)
 raise SystemExit(1)
 ' <<< "$body"
 }
@@ -2821,20 +2833,14 @@ raise SystemExit(1)
 youtube_has_unlock_signal() {
   local body="$1"
 
-  if youtube_has_actionable_offer "$body"; then
-    return 0
-  fi
-  if grep -Fqi 'premiumPurchaseButton' <<< "$body" \
+  # UnlockTests v0.0.48 supplies the button and monthly markers;
+  # RegionRestrictionCheck supplies ad-free; Clash Verge supplies SPunlimited.
+  grep -Fqi 'premiumPurchaseButton' <<< "$body" \
     || grep -Fqi 'manageSubscriptionButton' <<< "$body" \
-    || grep -Fqi 'purchaseButtonOverride' <<< "$body" \
-    || grep -Fqi 'Start trial' <<< "$body" \
-    || grep -Fqi 'ad-free' <<< "$body" \
     || grep -Fqi '/month' <<< "$body" \
     || grep -Fq '/月' <<< "$body" \
-    || grep -Eq '"browseId"[[:space:]]*:[[:space:]]*"SPunlimited"' <<< "$body"; then
-    return 0
-  fi
-  return 1
+    || grep -Fqi 'ad-free' <<< "$body" \
+    || grep -Eqi '"browseId"[[:space:]]*:[[:space:]]*"SPunlimited"' <<< "$body"
 }
 
 youtube_has_unavailable_signal() {
@@ -2845,16 +2851,20 @@ youtube_has_unavailable_signal() {
     || grep -Fqi 'Premium is not available in your region' <<< "$body"
 }
 
+extract_gemini_regions() {
+  local body="$1"
+
+  grep -oE '(,2,1,200,|\[1,null,null,[0-9]+,[0-9]+,)\\?"[A-Z]{3}\\?"' <<< "$body" \
+    | sed -E 's/\\//g; s/.*"([A-Z]{3})"/\1/' \
+    | awk '!seen[$0]++' \
+    || true
+}
+
 extract_gemini_region() {
   local body="$1"
   local regions count
 
-  regions="$(
-    grep -oE ',2,1,200,"[A-Z]{3}"' <<< "$body" \
-      | sed -E 's/.*"([A-Z]{3})"/\1/' \
-      | awk '!seen[$0]++' \
-      || true
-  )"
+  regions="$(extract_gemini_regions "$body")"
   [ -n "$regions" ] || return 1
   count="$(awk 'END { print NR }' <<< "$regions")"
   [ "$count" -eq 1 ] || return 2
@@ -2863,20 +2873,85 @@ extract_gemini_region() {
 
 gemini_region_is_blocked() {
   case "$1" in
-    CHN|RUS|BLR|CUB|IRN|PRK|SYR|HKG|MAC) return 0 ;;
+    AFG|CHN|RUS|BLR|CUB|IRN|PRK|SYR) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-evaluate_gemini_unlock() {
+gemini_region_is_supported() {
+  # UnlockTests v0.0.48 GeminiSupportCountry converted to alpha-3, with HKG/MAC
+  # added from Google's current Web support list. AFG is intentionally absent.
+  case "$1" in
+    ALA|ALB|DZA|ASM|AND|AGO|AIA|ATA|ATG|ARG|ARM|ABW|AUS|AUT|AZE) return 0 ;;
+    BHR|BGD|BRB|BEL|BLZ|BEN|BMU|BTN|BOL|BIH|BWA|BRA|IOT|VGB|BRN) return 0 ;;
+    BGR|BFA|BDI|CPV|KHM|CMR|CAN|BES|CYM|CAF|TCD|CHL|CXR|CCK|COL) return 0 ;;
+    COM|COK|CRI|CIV|HRV|CUW|CZE|COD|DNK|DJI|DMA|DOM|ECU|EGY|SLV) return 0 ;;
+    GNQ|ERI|EST|SWZ|ETH|FLK|FRO|FJI|FIN|FRA|GUF|PYF|ATF|GAB|GEO) return 0 ;;
+    DEU|GHA|GIB|GRC|GRL|GRD|GLP|GUM|GTM|GGY|GIN|GNB|GUY|HTI|HMD) return 0 ;;
+    HND|HUN|ISL|IND|IDN|IRQ|IRL|IMN|ISR|ITA|JAM|JPN|JEY|JOR|KAZ) return 0 ;;
+    KEN|KIR|XKS|KWT|KGZ|LAO|LVA|LBN|LSO|LBR|LBY|LIE|LTU|LUX|MDG) return 0 ;;
+    MWI|MYS|MDV|MLI|MLT|MHL|MTQ|MRT|MUS|MYT|MEX|FSM|MDA|MCO|MNG) return 0 ;;
+    MNE|MSR|MAR|MOZ|MMR|NAM|NRU|NPL|NLD|NCL|NZL|NIC|NER|NGA|NIU) return 0 ;;
+    NFK|MKD|MNP|NOR|OMN|PAK|PLW|PSE|PAN|PNG|PRY|PER|PHL|PCN|POL) return 0 ;;
+    PRT|PRI|QAT|CYP|COG|REU|ROU|RWA|BLM|SHN|KNA|LCA|MAF|SPM|VCT) return 0 ;;
+    WSM|SMR|STP|SAU|SEN|SRB|SYC|SLE|SGP|SXM|SVK|SVN|SLB|SOM|ZAF) return 0 ;;
+    SGS|KOR|SSD|ESP|LKA|SDN|SUR|SJM|SWE|CHE|TWN|TJK|TZA|THA|BHS) return 0 ;;
+    GMB|TLS|TGO|TKL|TON|TTO|TUN|TUR|TKM|TCA|TUV|VIR|UGA|UKR|ARE) return 0 ;;
+    GBR|USA|UMI|URY|UZB|VUT|VAT|VEN|VNM|WLF|ESH|YEM|ZMB|ZWE|HKG|MAC) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+extract_gemini_blocked_region() {
   local body="$1"
+  local region
+
+  while IFS= read -r region; do
+    if gemini_region_is_blocked "$region"; then
+      printf '%s\n' "$region"
+      return 0
+    fi
+  done < <(extract_gemini_regions "$body")
+  return 1
+}
+
+evaluate_gemini_unlock() {
+  local http_status="$1"
+  local final_url="$2"
+  local body="$3"
   local available=0
   local unavailable=0
   local region=""
+  local blocked_region=""
   local region_status=0
 
+  case "$http_status" in
+    [0-9][0-9][0-9]) ;;
+    *)
+      printf 'unknown|网络连接失败\n'
+      return 0
+      ;;
+  esac
+
+  if unlock_url_is_google_sorry "$final_url"; then
+    printf 'unknown|Google 风控页面\n'
+    return 0
+  fi
+
+  case "$http_status" in
+    403|451)
+      printf 'no|\n'
+      return 0
+      ;;
+    2[0-9][0-9]) ;;
+    *)
+      printf 'unknown|页面特征不明确\n'
+      return 0
+      ;;
+  esac
+
   if [ -z "$body" ]; then
-    printf 'unknown|网络连接失败\n'
+    printf 'unknown|页面特征不明确\n'
     return 0
   fi
 
@@ -2884,7 +2959,8 @@ evaluate_gemini_unlock() {
     || grep -Fq '45617354,null,true' <<< "$body"; then
     available=1
   fi
-  if grep -Fq '45631641,null,false' <<< "$body"; then
+  if grep -Fq '45631641,null,false' <<< "$body" \
+    || grep -Fq '45617354,null,false' <<< "$body"; then
     unavailable=1
   fi
 
@@ -2894,12 +2970,9 @@ evaluate_gemini_unlock() {
     region_status=$?
   fi
 
-  if [ "$available" -eq 1 ] && [ "$unavailable" -eq 1 ]; then
-    printf 'unknown|页面特征冲突\n'
-    return 0
-  fi
-  if [ "$available" -eq 1 ]; then
-    printf 'yes|\n'
+  blocked_region="$(extract_gemini_blocked_region "$body" 2>/dev/null || true)"
+  if [ -n "$blocked_region" ]; then
+    printf 'no|\n'
     return 0
   fi
 
@@ -2907,12 +2980,23 @@ evaluate_gemini_unlock() {
     printf 'unknown|地区信息冲突\n'
     return 0
   fi
+
+  if [ -n "$region" ] && gemini_region_is_supported "$region"; then
+    printf 'yes|\n'
+    return 0
+  fi
+
   if [ -n "$region" ]; then
-    if gemini_region_is_blocked "$region"; then
-      printf 'no|地区：%s\n' "$region"
-    else
-      printf 'yes|地区：%s\n' "$region"
-    fi
+    printf 'unknown|页面特征不明确\n'
+    return 0
+  fi
+
+  if [ "$available" -eq 1 ] && [ "$unavailable" -eq 1 ]; then
+    printf 'unknown|页面特征冲突\n'
+    return 0
+  fi
+  if [ "$available" -eq 1 ]; then
+    printf 'yes|\n'
     return 0
   fi
 
@@ -2925,20 +3009,31 @@ evaluate_gemini_unlock() {
 }
 
 probe_gemini_unlock() {
-  local body
-  body="$(curl_unlock_page "https://gemini.google.com/")"
-  evaluate_gemini_unlock "$body"
+  local response=""
+
+  if response="$(request_unlock_response curl_unlock_page "https://gemini.google.com/")" \
+    && parse_unlock_response "$response"; then
+    evaluate_gemini_unlock \
+      "$UNLOCK_RESPONSE_STATUS" "$UNLOCK_RESPONSE_FINAL_URL" "$UNLOCK_RESPONSE_BODY"
+  else
+    evaluate_gemini_unlock '' '' ''
+  fi
 }
 
 evaluate_youtube_premium_unlock() {
-  local body="$1"
+  local http_status="$1"
+  local final_url="$2"
+  local body="$3"
   local region=""
   local region_status=0
 
-  if [ -z "$body" ]; then
-    printf 'unknown|网络连接失败\n'
-    return 0
-  fi
+  case "$http_status" in
+    [0-9][0-9][0-9]) ;;
+    *)
+      printf 'unknown|网络连接失败\n'
+      return 0
+      ;;
+  esac
 
   if region="$(extract_youtube_region "$body" 2>/dev/null)"; then
     :
@@ -2946,36 +3041,53 @@ evaluate_youtube_premium_unlock() {
     region_status=$?
   fi
 
+  if unlock_url_host_is_google_cn "$final_url"; then
+    if [ -n "$region" ]; then
+      printf 'no|页面地区：%s\n' "$region"
+    else
+      printf 'no|页面地区：未知\n'
+    fi
+    return 0
+  fi
+
   if youtube_has_unavailable_signal "$body"; then
     if [ -n "$region" ]; then
-      printf 'no|地区：%s\n' "$region"
+      printf 'no|页面地区：%s\n' "$region"
     else
-      printf 'no|地区：未知\n'
+      printf 'no|页面地区：未知\n'
     fi
+    return 0
+  fi
+
+  case "$http_status" in
+    2[0-9][0-9]) ;;
+    *)
+      printf 'unknown|页面特征不明确\n'
+      return 0
+      ;;
+  esac
+
+  if [ -z "$body" ]; then
+    printf 'unknown|页面特征不明确\n'
     return 0
   fi
 
   if youtube_has_unlock_signal "$body"; then
     if [ -n "$region" ]; then
-      printf 'yes|地区：%s\n' "$region"
+      printf 'yes|页面地区：%s\n' "$region"
     else
       printf 'yes|\n'
     fi
     return 0
   fi
 
-  if grep -Fq 'www.google.cn' <<< "$body"; then
-    printf 'no|地区：CN\n'
-    return 0
-  fi
-
   if [ "$region_status" -eq 2 ]; then
-    printf 'unknown|地区信息冲突\n'
+    printf 'unknown|页面地区信息冲突\n'
     return 0
   fi
 
   if [ -n "$region" ]; then
-    printf 'yes|地区：%s\n' "$region"
+    printf 'unknown|页面地区：%s\n' "$region"
     return 0
   fi
 
@@ -2983,21 +3095,39 @@ evaluate_youtube_premium_unlock() {
 }
 
 probe_youtube_premium_unlock() {
-  local body
-  body="$(curl_unlock_page "https://www.youtube.com/premium")"
-  evaluate_youtube_premium_unlock "$body"
+  local response=""
+
+  if response="$(request_unlock_response curl_unlock_page "https://www.youtube.com/premium?hl=en")" \
+    && parse_unlock_response "$response"; then
+    evaluate_youtube_premium_unlock \
+      "$UNLOCK_RESPONSE_STATUS" "$UNLOCK_RESPONSE_FINAL_URL" "$UNLOCK_RESPONSE_BODY"
+  else
+    evaluate_youtube_premium_unlock '' '' ''
+  fi
 }
 
 probe_native_gemini_unlock() {
-  local body
-  body="$(native_https_request GET "https://gemini.google.com/" || true)"
-  evaluate_gemini_unlock "$body"
+  local response=""
+
+  if response="$(request_unlock_response native_unlock_page "https://gemini.google.com/")" \
+    && parse_unlock_response "$response"; then
+    evaluate_gemini_unlock \
+      "$UNLOCK_RESPONSE_STATUS" "$UNLOCK_RESPONSE_FINAL_URL" "$UNLOCK_RESPONSE_BODY"
+  else
+    evaluate_gemini_unlock '' '' ''
+  fi
 }
 
 probe_native_youtube_premium_unlock() {
-  local body
-  body="$(native_https_request GET "https://www.youtube.com/premium" || true)"
-  evaluate_youtube_premium_unlock "$body"
+  local response=""
+
+  if response="$(request_unlock_response native_unlock_page "https://www.youtube.com/premium?hl=en")" \
+    && parse_unlock_response "$response"; then
+    evaluate_youtube_premium_unlock \
+      "$UNLOCK_RESPONSE_STATUS" "$UNLOCK_RESPONSE_FINAL_URL" "$UNLOCK_RESPONSE_BODY"
+  else
+    evaluate_youtube_premium_unlock '' '' ''
+  fi
 }
 
 print_unlock_result() {
@@ -3319,10 +3449,17 @@ cmd_status() {
 }
 
 cmd_unlock_check() {
-  if run_unlock_checks; then
+  local strict_exit=0 unlock_rc=0
+
+  [ "${1:-}" = "--strict-exit" ] && strict_exit=1
+  run_unlock_checks || unlock_rc=$?
+  if [ "$unlock_rc" -eq 0 ]; then
     return 0
   fi
   warn_line "当前 WARP 出口未全部通过检测；可运行 warp-vps change-ip 更换注册后重试。"
+  if [ "$strict_exit" -eq 1 ]; then
+    return "$unlock_rc"
+  fi
   return 0
 }
 
@@ -3333,7 +3470,12 @@ cmd_native_unlock_check() {
 }
 
 cmd_change_ip() {
-  local attempt rotate_rc unlock_choice unlock_policy=any
+  local attempt rotate_rc unlock_choice unlock_policy=all policy_explicit=0
+
+  if [ "${1:-}" = "--policy" ]; then
+    unlock_policy="$2"
+    policy_explicit=1
+  fi
   require_root
   load_config
   command -v curl >/dev/null 2>&1 || die "找不到 curl，无法检测更换后的 WARP 出口"
@@ -3350,13 +3492,13 @@ cmd_change_ip() {
     die "当前项目管理的 WARP Client 不是可替换的 Free 注册，未执行 WARP IP 更换"
   fi
 
-  if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then
+  if [ "$policy_explicit" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then
     while true; do
-      printf '是否要求 Gemini 与 YouTube Premium 同时明确可用？[y/N]：' >&2
+      printf '是否要求 Gemini 与 YouTube Premium 同时明确可用？[Y/n]：' >&2
       read_input unlock_choice || die "无法读取解锁条件，未更换 WARP IP"
       case "$unlock_choice" in
-        y|Y|yes|Yes|YES) unlock_policy=all; break ;;
-        ''|n|N|no|No|NO) unlock_policy=any; break ;;
+        ''|[Yy]|[Yy][Ee][Ss]) unlock_policy=all; break ;;
+        [Nn]|[Nn][Oo]) unlock_policy=any; break ;;
         *) printf '输入无效，请输入 y 或 n。\n' >&2 ;;
       esac
     done
@@ -4307,8 +4449,10 @@ usage() {
   restart         重启 WARP 分流链路
   native-unlock-check
                   通过原生 IPv4（无 IPv4 时用 IPv6）检测 Gemini / YouTube Premium
-  unlock-check    只检测当前 IPv4 出口的 Gemini / YouTube Premium
-  change-ip       最多更换 10 次 WARP 注册；默认任一服务明确可用即停止
+  unlock-check [--strict-exit]
+                  检测当前 IPv4 出口；严格模式仅在两项均明确可用时成功退出
+  change-ip [--policy all|any]
+                  最多更换 10 次 WARP 注册；默认两项均明确可用才停止
   update          更新脚本和固定规则快照
   reinstall       非交互重装并保持当前模式
   reinstall [安装选项]
@@ -4382,8 +4526,29 @@ main() {
     status) [ "$#" -eq 0 ] || { cli_error "status 不接受参数"; return 2; }; cmd_status ;;
     test) [ "$#" -eq 0 ] || { cli_error "test 不接受参数"; return 2; }; cmd_test ;;
     native-unlock-check) [ "$#" -eq 0 ] || { cli_error "native-unlock-check 不接受参数"; return 2; }; cmd_native_unlock_check ;;
-    unlock-check) [ "$#" -eq 0 ] || { cli_error "unlock-check 不接受参数"; return 2; }; cmd_unlock_check ;;
-    change-ip) [ "$#" -eq 0 ] || { cli_error "change-ip 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_change_ip ;;
+    unlock-check)
+      if [ "$#" -eq 0 ]; then
+        cmd_unlock_check
+      elif [ "$#" -eq 1 ] && [ "$1" = "--strict-exit" ]; then
+        cmd_unlock_check "$1"
+      else
+        cli_error "unlock-check 只接受 --strict-exit"
+        return 2
+      fi
+      ;;
+    change-ip)
+      if [ "$#" -eq 0 ]; then
+        run_with_runtime_lock wait cmd_change_ip
+      elif [ "$#" -eq 2 ] && [ "$1" = "--policy" ]; then
+        case "$2" in
+          all|any) run_with_runtime_lock wait cmd_change_ip "$@" ;;
+          *) cli_error "change-ip 的 --policy 只接受 all 或 any"; return 2 ;;
+        esac
+      else
+        cli_error "change-ip 只接受 --policy all 或 --policy any"
+        return 2
+      fi
+      ;;
     restart) [ "$#" -eq 0 ] || { cli_error "restart 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_restart ;;
     update) [ "$#" -eq 0 ] || { cli_error "update 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_update ;;
     reinstall) cmd_reinstall "$@" ;;

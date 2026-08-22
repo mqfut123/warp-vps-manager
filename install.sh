@@ -2416,6 +2416,7 @@ main() {
   validate_repo_raw_base "$REPO_RAW_BASE"
 
   local selected_mode selected_scope warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
+  local post_install_unlock_choice
   local reusable_warp_port=""
   local reusable_redsocks_port=""
   local prompted_mode prompted_scope locked_mode locked_scope locked_warp_port locked_redsocks_port
@@ -2616,7 +2617,22 @@ main() {
   fi
 
   printf '\n安装已完成，以下 IPv4 出口解锁检测仅供参考，不影响安装结果：\n'
-  "$BIN_PATH" unlock-check || true
+  if "$BIN_PATH" unlock-check --strict-exit; then
+    return 0
+  fi
+
+  if [ "$INSTALL_NONINTERACTIVE" -eq 0 ] && interactive_terminal_available; then
+    printf '是否现在更换 WARP IP，直到 Gemini 与 YouTube Premium 都明确可用？[Y/n]：'
+    if read_input post_install_unlock_choice; then
+      case "$post_install_unlock_choice" in
+        ''|[Yy]|[Yy][Ee][Ss]) "$BIN_PATH" change-ip --policy all || true ;;
+        *) ;;
+      esac
+    else
+      printf '\n'
+    fi
+  fi
+  return 0
 }
 
 if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then

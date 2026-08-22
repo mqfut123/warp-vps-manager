@@ -975,8 +975,8 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   cmd_status() { calls="${calls}status "; }
   cmd_test() { calls="${calls}test "; }
   cmd_native_unlock_check() { calls="${calls}native-unlock-check "; }
-  cmd_unlock_check() { calls="${calls}unlock-check "; }
-  cmd_change_ip() { calls="${calls}change-ip "; }
+  cmd_unlock_check() { calls="${calls}unlock-check:$* "; }
+  cmd_change_ip() { calls="${calls}change-ip:$* "; }
   cmd_restart() { calls="${calls}restart "; }
   cmd_update() { calls="${calls}update "; }
   cmd_logs() { calls="${calls}logs "; }
@@ -993,14 +993,17 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   main test
   main native-unlock-check
   main unlock-check
+  main unlock-check --strict-exit
   main change-ip
+  main change-ip --policy all
+  main change-ip --policy any
   main restart
   main update
   main logs
   main uninstall --yes
   main reinstall --mode socks
   main switch wireguard --swap none
-  assert_eq 'status test native-unlock-check unlock-check lock:wait change-ip lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
+  assert_eq 'status test native-unlock-check unlock-check: unlock-check:--strict-exit lock:wait change-ip: lock:wait change-ip:--policy all lock:wait change-ip:--policy any lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
     "$calls" 'all public CLI commands must retain their dispatcher and arguments' || return 1
   assert_contains "$calls" 'reinstall:--mode socks ' \
     'noninteractive reinstall arguments must reach their dispatcher' || return 1
@@ -1026,8 +1029,8 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   cmd_status() { calls="${calls}status "; }
   cmd_test() { calls="${calls}test "; }
   cmd_native_unlock_check() { calls="${calls}native-unlock "; }
-  cmd_unlock_check() { calls="${calls}unlock "; }
-  cmd_change_ip() { calls="${calls}change-ip "; }
+  cmd_unlock_check() { calls="${calls}unlock:$* "; }
+  cmd_change_ip() { calls="${calls}change-ip:$* "; }
   cmd_restart() { calls="${calls}restart "; }
   cmd_update() { calls="${calls}update "; }
   cmd_logs() { calls="${calls}logs "; }
@@ -1042,13 +1045,43 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   install_systemd() { calls="${calls}systemd "; }
   run_with_runtime_lock() { shift; "$@"; }
 
-  for cmd in menu status test native-unlock-check unlock-check change-ip restart update logs heal apply start-rules stop-rules \
+  for cmd in menu status test native-unlock-check restart update logs heal apply start-rules stop-rules \
     configure-warp setup-wireguard preflight-wireguard wait-wireguard install-systemd help; do
     calls=''
     rc=0
     main "$cmd" unexpected >/dev/null 2>&1 || rc=$?
     assert_eq '2' "$rc" "$cmd must reject extra arguments" || return 1
     assert_eq '' "$calls" "$cmd must reject bad arguments before running its action" || return 1
+  done
+
+  calls=''
+  main unlock-check
+  main unlock-check --strict-exit
+  main change-ip
+  main change-ip --policy all
+  main change-ip --policy any
+  assert_eq \
+    'unlock: unlock:--strict-exit change-ip: change-ip:--policy all change-ip:--policy any ' \
+    "$calls" \
+    'unlock-check and change-ip must forward each supported option exactly' || return 1
+
+  local bad_spec
+  for bad_spec in \
+    'unlock-check unexpected' \
+    'unlock-check --strict-exit unexpected' \
+    'unlock-check --strict-exit --strict-exit' \
+    'unlock-check --policy all' \
+    'change-ip --policy' \
+    'change-ip --policy invalid' \
+    'change-ip --policy all unexpected' \
+    'change-ip --policy all --policy any' \
+    'change-ip unexpected'; do
+    calls=''
+    rc=0
+    # shellcheck disable=SC2086
+    main $bad_spec >/dev/null 2>&1 || rc=$?
+    assert_eq '2' "$rc" "$bad_spec must be rejected" || return 1
+    assert_eq '' "$calls" "$bad_spec must be rejected before running its action" || return 1
   done
 
   rc=0
@@ -5325,13 +5358,13 @@ test_change_ip_dispatches_each_mode_and_finishes_the_timer() {
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'wireguard:%s\n' "$1" >> "$event"; }
   rotate_socks_registration() { printf 'socks\n' >> "$event"; }
-  run_unlock_checks() { printf 'detect\n' >> "$event"; return 0; }
+  run_unlock_checks() { printf 'detect:%s\n' "$1" >> "$event"; return 0; }
 
   cmd_change_ip >/dev/null || {
     fail 'the first healthy WireGuard registration should complete change-ip'
     return 1
   }
-  assert_eq $'timer:begin\nwireguard:1\ndetect\ntimer:finish' "$(< "$event")" \
+  assert_eq $'timer:begin\nwireguard:1\ndetect:all\ntimer:finish' "$(< "$event")" \
     'WireGuard change-ip must rotate once, detect once and restore the timer' || return 1
 
   : > "$event"
@@ -5340,7 +5373,7 @@ test_change_ip_dispatches_each_mode_and_finishes_the_timer() {
     fail 'the first healthy Free Socks registration should complete change-ip'
     return 1
   }
-  assert_eq $'timer:begin\nsocks\ndetect\ntimer:finish' "$(< "$event")" \
+  assert_eq $'timer:begin\nsocks\ndetect:all\ntimer:finish' "$(< "$event")" \
     'Socks change-ip must use only its backend and restore the timer'
 }
 
@@ -5381,9 +5414,9 @@ test_change_ip_unlock_policy_prompt_contract() {
   rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
   run_unlock_checks() { printf 'policy:%s\n' "${1:-all}" >> "$event"; }
 
-  for supplied_answer in '' Y N; do
+  for supplied_answer in '' Y y yes Yes YES N n no No NO; do
     case "$supplied_answer" in
-      Y) expected_policy=all ;;
+      ''|Y|y|yes|Yes|YES) expected_policy=all ;;
       *) expected_policy=any ;;
     esac
     : > "$event"
@@ -5397,7 +5430,7 @@ test_change_ip_unlock_policy_prompt_contract() {
     }
     output="$(< "$output_file")"
     assert_contains "$output" \
-      '是否要求 Gemini 与 YouTube Premium 同时明确可用？[y/N]' \
+      '是否要求 Gemini 与 YouTube Premium 同时明确可用？[Y/n]' \
       'interactive change-ip must ask the explicit unlock strictness question' || return 1
     assert_eq \
       "$(printf 'read\ntimer:begin\nrotate:1\npolicy:%s\ntimer:finish' "$expected_policy")" \
@@ -5426,11 +5459,30 @@ test_change_ip_unlock_policy_prompt_contract() {
   answer_index=0
   tty_available=0
   cmd_change_ip > "$output_file" 2>&1 || {
-    fail 'noninteractive change-ip should use the any-service policy without prompting'
+    fail 'noninteractive change-ip should use the all-services policy without prompting'
     return 1
   }
-  assert_eq $'timer:begin\nrotate:1\npolicy:any\ntimer:finish' "$(< "$event")" \
-    'noninteractive change-ip must default to any explicit yes and skip input' || return 1
+  assert_eq $'timer:begin\nrotate:1\npolicy:all\ntimer:finish' "$(< "$event")" \
+    'noninteractive change-ip must default to all and skip input' || return 1
+
+  for expected_policy in all any; do
+    : > "$event"
+    : > "$output_file"
+    answers=(N)
+    answer_index=0
+    tty_available=1
+    cmd_change_ip --policy "$expected_policy" > "$output_file" 2>&1 || {
+      fail "explicit --policy $expected_policy should be accepted"
+      return 1
+    }
+    output="$(< "$output_file")"
+    assert_not_contains "$output" '[Y/n]' \
+      "explicit --policy $expected_policy must skip the interactive prompt" || return 1
+    assert_eq \
+      "$(printf 'timer:begin\nrotate:1\npolicy:%s\ntimer:finish' "$expected_policy")" \
+      "$(< "$event")" \
+      "explicit --policy $expected_policy must reach the shared aggregate" || return 1
+  done
 
   : > "$event"
   answers=()
@@ -5488,14 +5540,25 @@ test_change_ip_prompts_only_when_all_standard_fds_are_ttys() {
       fail "change-ip should remain noninteractive for descriptor shape <$fd_case>"
       return 1
     }
-    assert_eq $'timer:begin\nrotate:1\npolicy:any\ntimer:finish' "$(< "$event")" \
-      "descriptor shape <$fd_case> must default to any without reading the inherited TTY" || return 1
+    assert_eq $'timer:begin\nrotate:1\npolicy:all\ntimer:finish' "$(< "$event")" \
+      "descriptor shape <$fd_case> must default to all without reading the inherited TTY" || return 1
   done
+
+  fd0=1
+  fd1=1
+  fd2=1
+  : > "$event"
+  cmd_change_ip --policy any > "$output_file" 2>&1 || {
+    fail 'an explicit policy should remain noninteractive even with three TTY descriptors'
+    return 1
+  }
+  assert_eq $'timer:begin\nrotate:1\npolicy:any\ntimer:finish' "$(< "$event")" \
+    'an explicit policy must skip input and reach the shared aggregate'
 }
 
 test_change_ip_unlock_policy_controls_retry_success() {
   source_without_main "$MANAGER_SCRIPT"
-  local root event output_file scenario=gemini tty_available=0
+  local root event output_file output scenario=all tty_available=0
   root="$(mktemp -d)"
   event="$root/events"
   output_file="$root/output"
@@ -5520,45 +5583,60 @@ test_change_ip_unlock_policy_controls_retry_success() {
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
   probe_gemini_unlock() {
+    local round
     printf 'gemini\n' >> "$event"
-    if [ "$scenario" = youtube ]; then
-      printf 'no|页面标记为不可用\n'
-    else
-      printf 'yes|\n'
-    fi
+    round="$(grep -c '^gemini$' "$event")"
+    case "$scenario:$round" in
+      youtube:*) printf 'no|页面标记为不可用\n' ;;
+      *) printf 'yes|\n' ;;
+    esac
   }
   probe_youtube_premium_unlock() {
-    local calls
+    local round
     printf 'youtube\n' >> "$event"
-    calls="$(grep -c '^youtube$' "$event")"
-    case "$scenario:$calls" in
-      gemini:*|all:1) printf 'no|地区：US\n' ;;
-      *) printf 'yes|地区：US\n' ;;
+    round="$(grep -c '^youtube$' "$event")"
+    case "$scenario:$round" in
+      gemini:*|all:1) printf 'no|页面地区：US\n' ;;
+      *) printf 'yes|页面地区：US\n' ;;
     esac
   }
 
-  for scenario in gemini youtube; do
-    : > "$event"
-    tty_available=0
-    cmd_change_ip > "$output_file" 2>&1 || {
-      fail "noninteractive any-service policy should accept a ${scenario}-only yes"
-      return 1
-    }
-    assert_eq $'timer:begin\nrotate:1\ngemini\nyoutube\ntimer:finish' "$(< "$event")" \
-      "any-service policy must stop after a fresh ${scenario}-only yes" || return 1
-  done
-
   : > "$event"
   scenario=all
-  tty_available=1
-  cmd_change_ip > "$output_file" 2>&1 || {
-    fail 'strict policy should continue until both services explicitly pass'
+  tty_available=0
+  output="$(cmd_change_ip 2>&1)" || {
+    fail 'the noninteractive default should continue until both services explicitly pass'
     return 1
   }
   assert_eq \
-    $'read\ntimer:begin\nrotate:1\ngemini\nyoutube\nrotate:2\ngemini\nyoutube\ntimer:finish' \
+    $'timer:begin\nrotate:1\ngemini\nyoutube\nrotate:2\ngemini\nyoutube\ntimer:finish' \
     "$(< "$event")" \
-    'strict policy must reject one yes and stop only after a fresh two-yes result'
+    'the default all policy must reject one yes and stop only after a fresh two-yes result' || return 1
+  assert_contains "$output" 'Gemini 与 YouTube Premium 均已明确通过检测' \
+    'the default completion text must describe the all-services policy' || return 1
+
+  : > "$event"
+  scenario=all
+  cmd_change_ip --policy all > "$output_file" 2>&1 || {
+    fail 'explicit --policy all should use the same strict stop condition'
+    return 1
+  }
+  assert_eq \
+    $'timer:begin\nrotate:1\ngemini\nyoutube\nrotate:2\ngemini\nyoutube\ntimer:finish' \
+    "$(< "$event")" \
+    'explicit all must require a fresh two-yes result' || return 1
+
+  for scenario in gemini youtube; do
+    : > "$event"
+    output="$(cmd_change_ip --policy any 2>&1)" || {
+      fail "explicit any policy should accept a ${scenario}-only yes"
+      return 1
+    }
+    assert_eq $'timer:begin\nrotate:1\ngemini\nyoutube\ntimer:finish' "$(< "$event")" \
+      "any policy must stop after a fresh ${scenario}-only yes" || return 1
+    assert_contains "$output" 'Gemini 或 YouTube Premium 已有一项明确通过检测' \
+      'the any-policy completion text must describe one-service success' || return 1
+  done
 }
 
 test_change_ip_stops_at_ten_failed_unlock_results() {
@@ -5578,12 +5656,12 @@ test_change_ip_stops_at_ten_failed_unlock_results() {
   begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
-  run_unlock_checks() { printf 'detect\n' >> "$event"; return 1; }
+  run_unlock_checks() { printf 'detect:%s\n' "$1" >> "$event"; return 1; }
 
   cmd_change_ip >/dev/null || rc=$?
   assert_eq '1' "$rc" 'ten healthy but unsupported exits must return failure' || return 1
   rotations="$(grep -c '^rotate:' "$event")"
-  detections="$(grep -c '^detect$' "$event")"
+  detections="$(grep -c '^detect:all$' "$event")"
   assert_eq '10' "$rotations" 'change-ip must perform exactly ten bounded rotations' || return 1
   assert_eq '10' "$detections" 'every successful rotation must receive one fresh detection' || return 1
   assert_contains "$(< "$event")" 'rotate:10' \
@@ -6101,110 +6179,333 @@ test_noninteractive_swap_choices_and_failure_are_bounded() {
   done
 }
 
+unlock_response_fixture() {
+  local status="$1"
+  local final_url="$2"
+  local body="${3-}"
+
+  # Keep the transport envelope representation in one test helper. Tests consume
+  # it through parse_unlock_response and assert only the three semantic fields.
+  printf '%s\t%s\n%s' "$status" "$final_url" "$body"
+}
+
+assert_unlock_response_fields() {
+  local response="$1"
+  local expected_status="$2"
+  local expected_url="$3"
+  local expected_body="$4"
+  local message="$5"
+
+  parse_unlock_response "$response" || {
+    fail "$message: canonical response could not be parsed"
+    return 1
+  }
+  assert_eq "$expected_status" "$UNLOCK_RESPONSE_STATUS" "$message status" || return 1
+  assert_eq "$expected_url" "$UNLOCK_RESPONSE_FINAL_URL" "$message effective URL" || return 1
+  assert_eq "$expected_body" "$UNLOCK_RESPONSE_BODY" "$message body"
+}
+
 evaluate_gemini_fixture() {
   local homepage_fixture="$1"
   local expected="$2"
   local actual
 
-  actual="$(evaluate_gemini_unlock "$(cat "$homepage_fixture")")"
+  actual="$(evaluate_gemini_unlock 200 'https://gemini.google.com/' "$(cat "$homepage_fixture")")"
   assert_eq "$expected" "$actual" "Gemini fixture $(basename "$homepage_fixture")"
 }
 
 test_gemini_fixtures() {
   source_without_main "$MANAGER_SCRIPT"
+  local blocked region status
   declare -F evaluate_gemini_unlock >/dev/null || {
     fail 'evaluate_gemini_unlock is missing'
     return 1
   }
 
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/available.html" \
-    'yes|' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/china.html" \
-    'yes|' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/unavailable.html" \
-    'no|地区：CHN' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/available-no-region.html" \
-    'yes|' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/available-legacy-marker.html" \
-    'yes|' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/available.html" 'yes|' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/china.html" 'no|' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/unavailable.html" 'no|' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/available-no-region.html" 'yes|' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/available-legacy-marker.html" 'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/old-false-marker.html" \
     'unknown|页面标记不能确认是否可用' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/available-duplicate-region.html" \
-    'yes|' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/available-duplicate-region.html" 'yes|' || return 1
   evaluate_gemini_fixture \
     "${FIXTURE_DIR}/gemini/available-conflicting-region.html" \
-    'yes|' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/unknown.html" \
-    'unknown|页面特征不明确' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/generic.html" \
-    'unknown|页面特征不明确' || return 1
-  evaluate_gemini_fixture \
-    "${FIXTURE_DIR}/gemini/conflicting.html" \
-    'unknown|页面特征冲突' || return 1
-  assert_eq \
-    'yes|地区：USA' \
-    "$(evaluate_gemini_unlock ',2,1,200,"USA"')" \
-    'a supported Gemini region must be accepted without a marker' || return 1
-  assert_eq \
-    'yes|地区：AFG' \
-    "$(evaluate_gemini_unlock ',2,1,200,"AFG"')" \
-    'a non-blocked Gemini region must be accepted without a marker' || return 1
-  assert_eq \
-    'no|地区：CHN' \
-    "$(evaluate_gemini_unlock ',2,1,200,"CHN"')" \
-    'a blocked Gemini region without a positive marker must be rejected' || return 1
-  assert_eq \
-    'unknown|地区信息冲突' \
-    "$(evaluate_gemini_unlock ',2,1,200,"USA"],2,1,200,"CAN"')" \
-    'conflicting Gemini region-only signals must remain unknown' || return 1
-  assert_eq \
-    'unknown|网络连接失败' \
-    "$(evaluate_gemini_unlock '')" \
-    'empty Gemini response must remain unknown'
+    'unknown|地区信息冲突' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/unknown.html" 'unknown|页面特征不明确' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/generic.html" 'unknown|页面特征不明确' || return 1
+  evaluate_gemini_fixture "${FIXTURE_DIR}/gemini/conflicting.html" 'yes|' || return 1
+
+  assert_eq 'yes|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' ',2,1,200,"USA"')" \
+    'the legacy supported-region form must be accepted without a marker' || return 1
+  assert_eq 'yes|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' '[1,null,null,123,456,"CAN"]')" \
+    'the current supported-region form must be accepted without a marker' || return 1
+  assert_eq 'yes|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' \
+      ',2,1,200,"USA" [1,null,null,123,456,"USA"]')" \
+    'duplicate region values across both encodings must remain one supported region' || return 1
+  assert_eq 'yes|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' \
+      '45631641,null,true 45631641,null,false ,2,1,200,"USA"')" \
+    'a unique supported region must outrank conflicting marker evidence' || return 1
+
+  for blocked in AFG CHN RUS BLR CUB IRN PRK SYR; do
+    assert_eq 'no|' \
+      "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' \
+        "45631641,null,true [1,null,null,123,456,\"${blocked}\"]")" \
+      "blocked Gemini region $blocked must veto a positive marker" || return 1
+  done
+  for region in HKG MAC; do
+    assert_eq 'yes|' \
+      "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' \
+        "[1,null,null,123,456,\"${region}\"]")" \
+      "supported Gemini region $region must be accepted" || return 1
+  done
+
+  assert_eq 'unknown|地区信息冲突' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' \
+      ',2,1,200,"USA" [1,null,null,123,456,"CAN"] 45631641,null,true')" \
+    'different supported Gemini regions must remain unknown' || return 1
+  assert_eq 'no|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' \
+      ',2,1,200,"USA" [1,null,null,123,456,"AFG"] 45631641,null,true')" \
+    'a blocked region must outrank a conflicting supported region' || return 1
+  assert_eq 'unknown|页面特征不明确' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' ',2,1,200,"ZZZ"')" \
+    'an unrecognized three-letter region must not become positive' || return 1
+
+  assert_eq 'yes|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' '45631641,null,true')" \
+    'the current true marker must be accepted without a region' || return 1
+  assert_eq 'yes|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' '45617354,null,true')" \
+    'the legacy true marker must be accepted without a region' || return 1
+  assert_eq 'unknown|页面特征冲突' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' \
+      '45631641,null,true 45631641,null,false')" \
+    'true and false markers without a decisive region must remain unknown' || return 1
+  assert_eq 'unknown|页面标记不能确认是否可用' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' '45617354,null,false')" \
+    'a false-only marker must remain unknown' || return 1
+
+  assert_eq 'unknown|Google 风控页面' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/sorry/index?continue=x' \
+      '45631641,null,true ,2,1,200,"USA"')" \
+    'a /sorry/ effective path must veto positive evidence' || return 1
+  assert_eq 'unknown|Google 风控页面' \
+    "$(evaluate_gemini_unlock 403 'https://gemini.google.com/sorry/' '45631641,null,true')" \
+    'the /sorry/ path must take precedence over the 403 status' || return 1
+  assert_eq 'yes|' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/sorryness' '45631641,null,true')" \
+    'a path merely beginning with sorry must not trigger the risk-page veto' || return 1
+
+  for status in 403 451; do
+    assert_eq 'no|' \
+      "$(evaluate_gemini_unlock "$status" 'https://gemini.google.com/' \
+        '45631641,null,true ,2,1,200,"USA"')" \
+      "Gemini HTTP $status must be explicitly unavailable" || return 1
+  done
+  for status in 302 429 500; do
+    assert_eq 'unknown|页面特征不明确' \
+      "$(evaluate_gemini_unlock "$status" 'https://gemini.google.com/' \
+        '45631641,null,true ,2,1,200,"USA"')" \
+      "Gemini HTTP $status must not accept body positives" || return 1
+  done
+  assert_eq 'unknown|页面特征不明确' \
+    "$(evaluate_gemini_unlock 200 'https://gemini.google.com/' '')" \
+    'an empty successful Gemini page must be distinct from a transport failure' || return 1
+  assert_eq 'unknown|网络连接失败' \
+    "$(evaluate_gemini_unlock '' '' '')" \
+    'a missing canonical response must remain a network failure'
 }
 
-test_gemini_probes_use_one_homepage_request() {
+test_unlock_probes_accept_the_first_http_response() {
   source_without_main "$MANAGER_SCRIPT"
-  local request_log output calls
+  local request_log output probe_name expected url first_body second_body
   request_log="$(mktemp)"
 
   curl_unlock_page() {
-    printf '%s\n' "$*" >> "$request_log"
-    cat "${FIXTURE_DIR}/gemini/available.html"
+    local call_count
+    printf 'curl:%s\n' "$1" >> "$request_log"
+    call_count="$(wc -l < "$request_log" | tr -d ' ')"
+    if [ "$call_count" -eq 1 ]; then
+      unlock_response_fixture 200 "$1" "$first_body"
+    else
+      unlock_response_fixture 200 "$1" "$second_body"
+    fi
   }
-  output="$(probe_gemini_unlock)"
-  calls="$(< "$request_log")"
-  assert_eq 'yes|' "$output" \
-    'the ordinary Gemini probe must evaluate the homepage marker' || return 1
-  assert_eq 'https://gemini.google.com/' "$calls" \
-    'the ordinary Gemini probe must request only the homepage' || return 1
+  native_unlock_page() {
+    local call_count
+    printf 'native:%s\n' "$1" >> "$request_log"
+    call_count="$(wc -l < "$request_log" | tr -d ' ')"
+    if [ "$call_count" -eq 1 ]; then
+      unlock_response_fixture 200 "$1" "$first_body"
+    else
+      unlock_response_fixture 200 "$1" "$second_body"
+    fi
+  }
 
-  : > "$request_log"
-  native_https_request() {
-    printf '%s\n' "$*" >> "$request_log"
-    cat "${FIXTURE_DIR}/gemini/available.html"
+  for probe_name in \
+    probe_gemini_unlock \
+    probe_native_gemini_unlock \
+    probe_youtube_premium_unlock \
+    probe_native_youtube_premium_unlock; do
+    : > "$request_log"
+    case "$probe_name" in
+      *gemini*)
+        url='https://gemini.google.com/'
+        first_body='45631641,null,true'
+        second_body=',2,1,200,"CHN"'
+        expected='yes|'
+        ;;
+      *)
+        url='https://www.youtube.com/premium?hl=en'
+        first_body='"INNERTUBE_CONTEXT_GL":"US" ad-free'
+        second_body='Premium is not available in your country'
+        expected='yes|页面地区：US'
+        ;;
+    esac
+    output="$($probe_name)"
+    assert_eq "$expected" "$output" \
+      "$probe_name must evaluate its first successful HTTP response" || return 1
+    assert_eq '1' "$(wc -l < "$request_log" | tr -d ' ')" \
+      "$probe_name must not request a second successful page" || return 1
+    assert_contains "$(< "$request_log")" "$url" \
+      "$probe_name must use the canonical service URL" || return 1
+  done
+}
+
+test_unlock_transport_retries_only_transport_failures_once() {
+  source_without_main "$MANAGER_SCRIPT"
+  local request_log probe_name mode output expected first_status url body
+  request_log="$(mktemp)"
+
+  curl_unlock_page() { mock_unlock_transport curl "$1"; }
+  native_unlock_page() { mock_unlock_transport native "$1"; }
+  mock_unlock_transport() {
+    local transport="$1"
+    local request_url="$2"
+    local call_count
+    printf '%s:%s\n' "$transport" "$request_url" >> "$request_log"
+    call_count="$(wc -l < "$request_log" | tr -d ' ')"
+    case "$mode:$call_count" in
+      retry:1|fail:1|fail:2) return 28 ;;
+      *) unlock_response_fixture "$first_status" "$request_url" "$body" ;;
+    esac
   }
-  output="$(probe_native_gemini_unlock)"
-  calls="$(< "$request_log")"
-  assert_eq 'yes|' "$output" \
-    'the native Gemini probe must evaluate the homepage marker' || return 1
-  assert_eq 'GET https://gemini.google.com/' "$calls" \
-    'the native Gemini probe must request only the homepage'
+
+  for probe_name in \
+    probe_gemini_unlock \
+    probe_native_gemini_unlock \
+    probe_youtube_premium_unlock \
+    probe_native_youtube_premium_unlock; do
+    case "$probe_name" in
+      *gemini*)
+        url='https://gemini.google.com/'
+        body='45631641,null,true'
+        expected='yes|'
+        ;;
+      *)
+        url='https://www.youtube.com/premium?hl=en'
+        body='ad-free'
+        expected='yes|'
+        ;;
+    esac
+
+    : > "$request_log"
+    mode=retry
+    first_status=200
+    output="$($probe_name)"
+    assert_eq "$expected" "$output" \
+      "$probe_name must parse the response after one transport retry" || return 1
+    assert_eq '2' "$(wc -l < "$request_log" | tr -d ' ')" \
+      "$probe_name must retry one transport failure exactly once" || return 1
+
+    : > "$request_log"
+    mode=fail
+    output="$($probe_name)"
+    assert_eq 'unknown|网络连接失败' "$output" \
+      "$probe_name must report two transport failures as unknown" || return 1
+    assert_eq '2' "$(wc -l < "$request_log" | tr -d ' ')" \
+      "$probe_name must stop after two transport failures" || return 1
+  done
+
+  for probe_name in probe_gemini_unlock probe_native_youtube_premium_unlock; do
+    case "$probe_name" in
+      *gemini*) body='45631641,null,true'; first_status=403; expected='no|' ;;
+      *) body='ad-free'; first_status=500; expected='unknown|页面特征不明确' ;;
+    esac
+    : > "$request_log"
+    mode=http
+    output="$($probe_name)"
+    assert_eq "$expected" "$output" \
+      "$probe_name must evaluate a terminal HTTP error response" || return 1
+    assert_eq '1' "$(wc -l < "$request_log" | tr -d ' ')" \
+      "$probe_name must not retry an HTTP error response" || return 1
+  done
+}
+
+test_all_unlock_entrypoints_share_current_logic() {
+  local install_body command_body change_body probe_body combined_entrypoints name
+  install_body="$(function_body "$INSTALL_SCRIPT" main)"
+  command_body="$(function_body "$MANAGER_SCRIPT" cmd_unlock_check)"
+  change_body="$(function_body "$MANAGER_SCRIPT" cmd_change_ip)"
+
+  assert_contains "$install_body" '"$BIN_PATH" unlock-check --strict-exit' \
+    'installation completion must execute the installed strict unlock command' || return 1
+  assert_contains "$install_body" '"$BIN_PATH" change-ip --policy all || true' \
+    'an accepted installer prompt must delegate to the installed strict rotation command' || return 1
+  assert_contains "$command_body" 'run_unlock_checks' \
+    'the public unlock command must use the shared aggregate once' || return 1
+  assert_contains "$change_body" 'run_unlock_checks "$unlock_policy"' \
+    'change-ip must use the same shared evaluator and only vary its stop policy' || return 1
+
+  for name in \
+    probe_gemini_unlock \
+    probe_youtube_premium_unlock \
+    probe_native_gemini_unlock \
+    probe_native_youtube_premium_unlock; do
+    probe_body="$(function_body "$MANAGER_SCRIPT" "$name")"
+    assert_contains "$probe_body" 'request_unlock_response' \
+      "$name must use the common one-retry transport boundary" || return 1
+    assert_contains "$probe_body" 'parse_unlock_response' \
+      "$name must consume the same canonical response envelope" || return 1
+    case "$name" in
+      *gemini*)
+        assert_contains "$probe_body" 'evaluate_gemini_unlock' \
+          "$name must use the shared Gemini evaluator" || return 1
+        ;;
+      *)
+        assert_contains "$probe_body" 'evaluate_youtube_premium_unlock' \
+          "$name must use the shared YouTube evaluator" || return 1
+        ;;
+    esac
+  done
+
+  assert_file_not_matches "$MANAGER_SCRIPT" 'UNLOCK_SAMPLE_COUNT|collect_unlock_samples' \
+    'the manager must not retain the obsolete multi-sample path' || return 1
+  combined_entrypoints="${install_body}${command_body}${change_body}"
+  for name in \
+    '45631641' \
+    '45617354' \
+    'premiumPurchaseButton' \
+    'SPunlimited' \
+    'Premium is not available'; do
+    assert_not_contains "$combined_entrypoints" "$name" \
+      "entrypoints must not duplicate evaluator marker $name" || return 1
+  done
 }
 
 test_unlock_http_transport_ignores_environment_proxies() {
   source_without_main "$MANAGER_SCRIPT"
-  local request_log output
+  local request_log output response rc=0 simulated_status=200 simulated_url simulated_body curl_rc=0
   request_log="$(mktemp)"
+  simulated_url='https://example.invalid/final?region=US'
+  simulated_body=$'first line\nsecond line with 500\tmetadata-like text'
 
   curl() {
     {
@@ -6216,6 +6517,8 @@ test_unlock_http_transport_ignores_environment_proxies() {
       printf 'ALL_PROXY=%s\n' "${ALL_PROXY-}"
       printf 'arg=%s\n' "$@"
     } > "$request_log"
+    printf '%s\n%s\t%s' "$simulated_body" "$simulated_status" "$simulated_url"
+    return "$curl_rc"
   }
 
   http_proxy=http://127.0.0.1:18080 \
@@ -6224,8 +6527,12 @@ test_unlock_http_transport_ignores_environment_proxies() {
     HTTP_PROXY=http://127.0.0.1:28080 \
     HTTPS_PROXY=http://127.0.0.1:28443 \
     ALL_PROXY=socks5://127.0.0.1:2080 \
-    curl_unlock_page 'https://example.invalid/unlock' >/dev/null
+    response="$(curl_unlock_page 'https://example.invalid/unlock')"
   output="$(< "$request_log")"
+
+  assert_unlock_response_fields \
+    "$response" '200' "$simulated_url" "$simulated_body" \
+    'ordinary curl response' || return 1
 
   for proxy_name in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
     assert_contains "$output" "${proxy_name}=" \
@@ -6252,12 +6559,28 @@ test_unlock_http_transport_ignores_environment_proxies() {
   assert_not_contains "$output" 'arg=--cookie-jar' \
     'unlock requests must not create a shared cookie jar' || return 1
   assert_contains "$output" 'arg=https://example.invalid/unlock' \
-    'unlock request must preserve its target URL'
+    'unlock request must preserve its target URL' || return 1
+
+  for simulated_status in 404 500; do
+    response="$(curl_unlock_page 'https://example.invalid/unlock')" || {
+      fail "HTTP $simulated_status must remain a successful canonical response"
+      return 1
+    }
+    assert_unlock_response_fields \
+      "$response" "$simulated_status" "$simulated_url" "$simulated_body" \
+      "ordinary HTTP $simulated_status response" || return 1
+  done
+
+  curl_rc=28
+  rc=0
+  curl_unlock_page 'https://example.invalid/unlock' >/dev/null || rc=$?
+  assert_eq '1' "$rc" \
+    'a curl transport error must fail before producing a canonical HTTP response'
 }
 
 test_unlock_check_requires_both_services() {
   source_without_main "$MANAGER_SCRIPT"
-  local request_log case_spec mock_gemini_result mock_youtube_result expected_rc actual_rc calls
+  local request_log case_spec mock_gemini_result mock_youtube_result expected_strict_rc actual_rc calls output
   request_log="$(mktemp)"
 
   command() {
@@ -6277,19 +6600,33 @@ test_unlock_check_requires_both_services() {
   }
 
   for case_spec in \
-    'yes|;yes|地区：US;0' \
-    'yes|;no|地区：US;1' \
+    'yes|;yes|页面地区：US;0' \
+    'yes|;no|页面地区：US;1' \
     'yes|;unknown|页面特征不明确;1' \
-    'no|页面标记不能确认是否可用;yes|地区：US;1'; do
-    IFS=';' read -r mock_gemini_result mock_youtube_result expected_rc <<< "$case_spec"
+    'no|;yes|页面地区：US;1'; do
+    IFS=';' read -r mock_gemini_result mock_youtube_result expected_strict_rc <<< "$case_spec"
     : > "$request_log"
     actual_rc=0
-    run_unlock_checks >/dev/null || actual_rc=$?
-    assert_eq "$expected_rc" "$actual_rc" \
-      "unlock aggregate must require two explicit yes results: $case_spec" || return 1
+    output="$(cmd_unlock_check)" || actual_rc=$?
+    assert_eq '0' "$actual_rc" \
+      "the default public unlock check must remain advisory: $case_spec" || return 1
+    assert_contains "$output" 'Gemini：' 'the default command must print Gemini' || return 1
+    assert_contains "$output" 'YouTube Premium：' 'the default command must print YouTube' || return 1
+
+    actual_rc=0
+    output="$(cmd_unlock_check --strict-exit)" || actual_rc=$?
+    assert_eq "$expected_strict_rc" "$actual_rc" \
+      "strict unlock exit must require two explicit yes results: $case_spec" || return 1
+    if [ "$expected_strict_rc" -eq 0 ]; then
+      assert_not_contains "$output" 'warp-vps change-ip' \
+        'a strict two-service pass must not suggest replacing the exit' || return 1
+    else
+      assert_contains "$output" 'warp-vps change-ip' \
+        'a strict aggregate failure must retain the actionable replacement hint' || return 1
+    fi
     calls="$(< "$request_log")"
-    assert_eq $'gemini\nyoutube' "$calls" \
-      'each aggregate decision must issue one fresh request per service' || return 1
+    assert_eq $'gemini\nyoutube\ngemini\nyoutube' "$calls" \
+      'advisory and strict commands must each report both services exactly once' || return 1
   done
 }
 
@@ -6305,7 +6642,7 @@ test_unlock_policy_is_local_and_each_service_is_still_reported() {
   probe_gemini_unlock() { printf 'gemini\n' >> "$event"; printf 'yes|\n'; }
   probe_youtube_premium_unlock() {
     printf 'youtube\n' >> "$event"
-    printf 'no|地区：US\n'
+    printf 'no|页面地区：US\n'
   }
 
   any_output="$(run_unlock_checks any)" || any_rc=$?
@@ -6323,7 +6660,11 @@ test_unlock_policy_is_local_and_each_service_is_still_reported() {
     'unlock-check must continue to report YouTube Premium separately' || return 1
   assert_contains "$unlock_output" '当前 WARP 出口未全部通过检测' \
     'change-ip any policy must not weaken the standalone unlock-check aggregate' || return 1
-  assert_eq $'gemini\nyoutube\ngemini\nyoutube' "$(< "$event")" \
+  local strict_rc=0
+  cmd_unlock_check --strict-exit >/dev/null || strict_rc=$?
+  assert_eq '1' "$strict_rc" \
+    'strict-exit must expose the unchanged all-services aggregate status' || return 1
+  assert_eq $'gemini\nyoutube\ngemini\nyoutube\ngemini\nyoutube' "$(< "$event")" \
     'both policies must execute both fresh service probes'
 }
 
@@ -6341,14 +6682,22 @@ test_unlock_check_missing_curl_is_not_a_pass() {
     esac
   }
   probe_gemini_unlock() { printf 'gemini\n' >> "$request_log"; printf 'yes|\n'; }
-  probe_youtube_premium_unlock() { printf 'youtube\n' >> "$request_log"; printf 'yes|地区：US\n'; }
+  probe_youtube_premium_unlock() { printf 'youtube\n' >> "$request_log"; printf 'yes|页面地区：US\n'; }
 
-  output="$(run_unlock_checks)" || rc=$?
-  assert_eq '1' "$rc" 'missing curl must not be reported as a passed unlock check' || return 1
+  output="$(cmd_unlock_check)" || rc=$?
+  assert_eq '0' "$rc" 'the default command must remain advisory when curl is missing' || return 1
   assert_contains "$output" '找不到 curl' \
     'the missing transport dependency should remain actionable' || return 1
+  assert_contains "$output" 'warp-vps change-ip' \
+    'the default missing-curl result must retain the aggregate failure hint' || return 1
   assert_eq '' "$(< "$request_log")" \
-    'no service probe may run without the shared HTTP transport'
+    'no service probe may run without the shared HTTP transport' || return 1
+
+  rc=0
+  cmd_unlock_check --strict-exit >/dev/null || rc=$?
+  assert_eq '1' "$rc" 'strict-exit must fail when curl is missing' || return 1
+  assert_eq '' "$(< "$request_log")" \
+    'strict mode also must not probe without the shared transport'
 }
 
 test_unlock_check_skips_only_youtube_without_python() {
@@ -6367,18 +6716,26 @@ test_unlock_check_skips_only_youtube_without_python() {
   probe_gemini_unlock() { printf 'yes|\n'; }
   probe_youtube_premium_unlock() {
     printf 'called\n' > "$request_log"
-    printf 'yes|地区：US\n'
+    printf 'yes|页面地区：US\n'
   }
 
-  output="$(run_unlock_checks)" || rc=$?
-  assert_eq '1' "$rc" \
-    'missing Python must keep the two-service aggregate from passing' || return 1
+  output="$(cmd_unlock_check)" || rc=$?
+  assert_eq '0' "$rc" \
+    'the default command must remain advisory when Python is missing' || return 1
   assert_contains "$output" 'Gemini：可用' \
     'missing Python must not block the Python-free Gemini check' || return 1
   assert_contains "$output" '找不到 python3，无法检测 YouTube Premium' \
     'missing Python must explain why YouTube was skipped' || return 1
   [ ! -s "$request_log" ] || {
     fail 'YouTube probe must not run without its region parser dependency'
+    return 1
+  }
+
+  rc=0
+  cmd_unlock_check --strict-exit >/dev/null || rc=$?
+  assert_eq '1' "$rc" 'strict-exit must fail when YouTube cannot be checked' || return 1
+  [ ! -s "$request_log" ] || {
+    fail 'strict mode must also skip the YouTube probe without Python'
     return 1
   }
 }
@@ -6388,12 +6745,14 @@ evaluate_youtube_fixture() {
   local expected="$2"
   local actual
 
-  actual="$(evaluate_youtube_premium_unlock "$(cat "$fixture")")"
+  actual="$(evaluate_youtube_premium_unlock \
+    200 'https://www.youtube.com/premium?hl=en' "$(cat "$fixture")")"
   assert_eq "$expected" "$actual" "YouTube fixture $(basename "$fixture")"
 }
 
 test_youtube_fixtures() {
   source_without_main "$MANAGER_SCRIPT"
+  local fixture final_url marker negative status region_body
   declare -F evaluate_youtube_premium_unlock >/dev/null || {
     fail 'evaluate_youtube_premium_unlock is missing'
     return 1
@@ -6401,69 +6760,130 @@ test_youtube_fixtures() {
 
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-google-cn.html" \
-    'yes|地区：US' || return 1
-  evaluate_youtube_fixture \
-    "${FIXTURE_DIR}/youtube/available-us-unrelated-country.html" \
-    'yes|地区：US' || return 1
-  evaluate_youtube_fixture \
-    "${FIXTURE_DIR}/youtube/available-us.html" \
-    'yes|地区：US' || return 1
+    'yes|页面地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-generic-adfree.html" \
-    'yes|地区：US' || return 1
-  evaluate_youtube_fixture \
-    "${FIXTURE_DIR}/youtube/available-us-flow-offer.html" \
-    'yes|地区：US' || return 1
+    'yes|页面地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/available-us-premiumlite-browse.html" \
-    'yes|地区：US' || return 1
-  evaluate_youtube_fixture \
-    "${FIXTURE_DIR}/youtube/available-us-student-url.html" \
-    'yes|地区：US' || return 1
-  evaluate_youtube_fixture \
-    "${FIXTURE_DIR}/youtube/active-go-to-youtube.html" \
-    'yes|地区：US' || return 1
-  evaluate_youtube_fixture \
-    "${FIXTURE_DIR}/youtube/premium-navigation-outside-offer-button.html" \
-    'yes|地区：US' || return 1
+    'yes|页面地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-region.html" \
     'yes|' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/unavailable-conflicting-region.html" \
-    'no|地区：未知' || return 1
+    'no|页面地区：未知' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/conflicting-signals.html" \
-    'no|地区：US' || return 1
+    'no|页面地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-cn.html" \
-    'yes|地区：CN' || return 1
+    'unknown|页面地区：CN' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/unavailable-us.html" \
-    'no|地区：US' || return 1
-  assert_eq \
-    'no|地区：未知' \
-    "$(evaluate_youtube_premium_unlock 'Premium is not available in your country')" \
-    'an explicit unavailable response without a region must say that the region is unknown' || return 1
+    'no|页面地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/region-only.html" \
-    'yes|地区：US' || return 1
+    'unknown|页面地区：US' || return 1
   evaluate_youtube_fixture \
     "${FIXTURE_DIR}/youtube/offer-without-region.html" \
     'yes|' || return 1
+
   for marker in \
     'premiumPurchaseButton' \
     'manageSubscriptionButton' \
-    'purchaseButtonOverride' \
-    'Start trial' \
-    'ad-free' \
     '/month' \
     '/月' \
-    '"browseId": "SPunlimited"'; do
-    assert_eq \
-      'yes|' \
-      "$(evaluate_youtube_premium_unlock "$marker")" \
-      "YouTube Premium marker must be accepted: $marker" || return 1
+    'ad-free' \
+    '"browseId" : "SPunlimited"'; do
+    assert_eq 'yes|' \
+      "$(evaluate_youtube_premium_unlock 200 \
+        'https://www.youtube.com/premium?hl=en' "$marker")" \
+      "YouTube Premium marker must be accepted on 2xx: $marker" || return 1
+  done
+
+  for marker in \
+    '"otherKey":"SPunlimited"' \
+    '"browseId":"SPunlimitedX"' \
+    '"browseIdOther":"SPunlimited"'; do
+    assert_eq 'unknown|页面特征不明确' \
+      "$(evaluate_youtube_premium_unlock 200 \
+        'https://www.youtube.com/premium?hl=en' "$marker")" \
+      "an inexact SPunlimited signal must remain unknown: $marker" || return 1
+  done
+
+  local -a positives=(
+    'premiumPurchaseButton'
+    'manageSubscriptionButton'
+    '/month'
+    '/月'
+    'ad-free'
+    '"browseId":"SPunlimited"'
+  )
+  local -a negatives=(
+    'YouTube Premium is not available in your country'
+    'Premium is not available in your country'
+    'Premium is not available in your region'
+  )
+  local index
+  for ((index = 0; index < ${#positives[@]}; index++)); do
+    marker="${positives[$index]}"
+    negative="${negatives[$((index % ${#negatives[@]}))]}"
+    assert_eq 'no|页面地区：未知' \
+      "$(evaluate_youtube_premium_unlock 200 \
+        'https://www.youtube.com/premium?hl=en' "$marker $negative")" \
+      "explicit YouTube unavailability must veto marker $marker" || return 1
+  done
+
+  for status in 302 403 451 500; do
+    assert_eq 'unknown|页面特征不明确' \
+      "$(evaluate_youtube_premium_unlock "$status" \
+        'https://www.youtube.com/premium?hl=en' 'premiumPurchaseButton')" \
+      "YouTube HTTP $status must not accept a positive marker" || return 1
+  done
+  assert_eq 'no|页面地区：未知' \
+    "$(evaluate_youtube_premium_unlock 500 \
+      'https://www.youtube.com/premium?hl=en' \
+      'Premium is not available in your country ad-free')" \
+    'explicit YouTube unavailability must also veto a non-2xx page' || return 1
+
+  for final_url in \
+    'https://google.cn/' \
+    'https://www.google.cn/premium' \
+    'https://accounts.google.cn/path'; do
+    assert_eq 'no|页面地区：未知' \
+      "$(evaluate_youtube_premium_unlock 200 "$final_url" 'ad-free')" \
+      "a final google.cn host must veto a positive marker: $final_url" || return 1
+  done
+  for final_url in \
+    'https://google.cn.evil.invalid/' \
+    'https://evilgoogle.cn.invalid/'; do
+    assert_eq 'yes|' \
+      "$(evaluate_youtube_premium_unlock 200 "$final_url" 'ad-free')" \
+      "a google.cn lookalike host must not trigger the redirect veto: $final_url" || return 1
+  done
+
+  for fixture in \
+    available-us.html \
+    available-us-flow-offer.html \
+    available-us-student-url.html \
+    active-go-to-youtube.html \
+    premium-navigation-outside-offer-button.html; do
+    evaluate_youtube_fixture \
+      "${FIXTURE_DIR}/youtube/${fixture}" \
+      'unknown|页面地区：US' || return 1
+  done
+  evaluate_youtube_fixture \
+    "${FIXTURE_DIR}/youtube/available-us-unrelated-country.html" \
+    'unknown|页面地区信息冲突' || return 1
+
+  for marker in \
+    'purchaseButtonOverride' \
+    'Start trial'; do
+    assert_eq 'unknown|页面特征不明确' \
+      "$(evaluate_youtube_premium_unlock 200 \
+        'https://www.youtube.com/premium?hl=en' "$marker")" \
+      "an obsolete broad YouTube marker must remain unknown: $marker" || return 1
   done
   for region_body in \
     '"GL":"US"' \
@@ -6471,36 +6891,42 @@ test_youtube_fixtures() {
     '"country_code":"US"' \
     '"locationCountryCode":"US"' \
     '<span id="country-code">US</span>'; do
-    assert_eq \
-      'yes|地区：US' \
-      "$(evaluate_youtube_premium_unlock "$region_body")" \
-      "YouTube region signal must be accepted: $region_body" || return 1
+    assert_eq 'unknown|页面地区：US' \
+      "$(evaluate_youtube_premium_unlock 200 \
+        'https://www.youtube.com/premium?hl=en' "$region_body")" \
+      "YouTube region signal must be display-only: $region_body" || return 1
   done
-  for unavailable_text in \
-    'YouTube Premium is not available in your country' \
-    'Premium is not available in your country' \
-    'Premium is not available in your region'; do
-    assert_eq \
-      'no|地区：未知' \
-      "$(evaluate_youtube_premium_unlock "$unavailable_text Start trial ad-free")" \
-      "explicit YouTube unavailability must outrank positive text: $unavailable_text" || return 1
-  done
-  assert_eq \
-    'no|地区：CN' \
-    "$(evaluate_youtube_premium_unlock 'https://www.google.cn/')" \
-    'a Google China response without a Premium signal must be rejected' || return 1
-  assert_eq \
-    'unknown|地区信息冲突' \
-    "$(evaluate_youtube_premium_unlock '"INNERTUBE_CONTEXT_GL":"US","INNERTUBE_CONTEXT_GL":"CN"')" \
+  assert_eq 'unknown|页面地区信息冲突' \
+    "$(evaluate_youtube_premium_unlock 200 \
+      'https://www.youtube.com/premium?hl=en' \
+      '"INNERTUBE_CONTEXT_GL":"US","INNERTUBE_CONTEXT_GL":"CN"')" \
     'conflicting region-only YouTube signals must remain unknown' || return 1
-  assert_eq \
-    'unknown|页面特征不明确' \
-    "$(evaluate_youtube_premium_unlock 'YouTube Premium')" \
+  assert_eq 'unknown|页面地区信息冲突' \
+    "$(evaluate_youtube_premium_unlock 200 \
+      'https://www.youtube.com/premium?hl=en' \
+      '"INNERTUBE_CONTEXT_GL":"US","contentRegion":"CA"')" \
+    'conflicting YouTube regions across different keys must remain unknown' || return 1
+  assert_eq 'yes|' \
+    "$(evaluate_youtube_premium_unlock 200 \
+      'https://www.youtube.com/premium?hl=en' \
+      '"INNERTUBE_CONTEXT_GL":"US","contentRegion":"CA",ad-free')" \
+    'a positive marker may pass a cross-key region conflict without displaying a false region' || return 1
+  assert_eq 'no|页面地区：未知' \
+    "$(evaluate_youtube_premium_unlock 200 \
+      'https://www.youtube.com/premium?hl=en' \
+      '"INNERTUBE_CONTEXT_GL":"US","contentRegion":"CA",Premium is not available in your country')" \
+    'an explicit negative must veto a cross-key region conflict and keep the page region unknown' || return 1
+  assert_eq 'unknown|页面特征不明确' \
+    "$(evaluate_youtube_premium_unlock 200 \
+      'https://www.youtube.com/premium?hl=en' 'YouTube Premium')" \
     'a generic YouTube Premium title must not count as an unlock signal' || return 1
-  assert_eq \
-    'unknown|网络连接失败' \
-    "$(evaluate_youtube_premium_unlock '')" \
-    'empty YouTube response should remain unknown'
+  assert_eq 'unknown|页面特征不明确' \
+    "$(evaluate_youtube_premium_unlock 200 \
+      'https://www.youtube.com/premium?hl=en' '')" \
+    'an empty successful YouTube page must be distinct from a transport failure' || return 1
+  assert_eq 'unknown|网络连接失败' \
+    "$(evaluate_youtube_premium_unlock '' '' '')" \
+    'a missing canonical YouTube response must remain a network failure'
 }
 
 test_native_egress_selection() {
@@ -6571,10 +6997,12 @@ test_native_unlock_trace_behavior() {
         esac
         ;;
       *gemini.google.com*)
-        cat "${FIXTURE_DIR}/gemini/available.html"
+        unlock_response_fixture 200 'https://gemini.google.com/' \
+          "$(cat "${FIXTURE_DIR}/gemini/available.html")"
         ;;
       *youtube.com/premium*)
-        cat "${FIXTURE_DIR}/youtube/unavailable-us.html"
+        unlock_response_fixture 200 'https://www.youtube.com/premium?hl=en' \
+          "$(cat "${FIXTURE_DIR}/youtube/unavailable-us.html")"
         ;;
       *) return 1 ;;
     esac
@@ -6589,14 +7017,18 @@ test_native_unlock_trace_behavior() {
   assert_contains "$output" 'US' 'native trace output must show the observed Cloudflare region' || return 1
   assert_contains "$output" 'Gemini：可用' \
     'native Gemini output must reuse the homepage marker parser' || return 1
-  assert_contains "$output" 'YouTube Premium：不可用（地区：US）' \
+  assert_contains "$output" 'YouTube Premium：不可用（页面地区：US）' \
     'native YouTube output must reuse the existing parser and parsed region' || return 1
   assert_contains "$calls" 'gemini.google.com' 'the native check must request Gemini through the native transport' || return 1
   assert_eq '1' "$(grep -Fc 'gemini.google.com' <<< "$calls")" \
-    'the native check must request the Gemini homepage once' || return 1
+    'the native check must accept the first Gemini HTTP response' || return 1
   assert_not_contains "$calls" 'K4WWud' \
     'the native check must not request the Gemini location RPC' || return 1
   assert_contains "$calls" 'youtube.com/premium' 'the native check must request YouTube through the native transport' || return 1
+  assert_contains "$calls" 'youtube.com/premium?hl=en' \
+    'the native YouTube probe must use the canonical English page URL' || return 1
+  assert_eq '1' "$(grep -Fc 'youtube.com/premium?hl=en' <<< "$calls")" \
+    'the native check must accept the first YouTube HTTP response' || return 1
 
   : > "$request_log"
   trace_state=fail
@@ -6629,8 +7061,10 @@ test_native_unlock_trace_behavior() {
 
 test_native_https_request_mode_and_environment_contract() {
   source_without_main "$MANAGER_SCRIPT"
-  local transport_log output recorded
+  local transport_log output recorded mock_status=503 mock_url mock_body
   transport_log="$(mktemp)"
+  mock_url='https://example.invalid/final?region=US'
+  mock_body=$'native first line\nnative second line'
   http_proxy='http://lower-http.invalid:8080'
   https_proxy='http://lower-https.invalid:8080'
   all_proxy='socks5://lower-all.invalid:1080'
@@ -6649,8 +7083,13 @@ test_native_https_request_mode_and_environment_contract() {
       printf 'request|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "${7-}" "${8-}" "${9-}" "${10-}" "${11-}" "${12-}" \
         "${13-}" "${14-}" "${15-}" "${16-}" "${17-}" "${18-}"
+      printf 'output-mode|%s\n' "${20-}"
     } >> "$transport_log"
-    printf 'native-body\n'
+    if [ "${20-}" = unlock ]; then
+      unlock_response_fixture "$mock_status" "$mock_url" "$mock_body"
+    else
+      printf 'native-body\n'
+    fi
   }
 
   WARP_MODE=wireguard
@@ -6669,6 +7108,16 @@ test_native_https_request_mode_and_environment_contract() {
     'request|POST|https://example.invalid/path?q=1|x=1|4|198.51.100.10|eth0|51888|wireguard|0|0|3|7' \
     'WireGuard global mode must pass source binding, interface and bypass mark to Python' || return 1
 
+  output="$(native_https_request POST 'https://example.invalid/path?q=1' 'x=1' unlock)" || {
+    fail 'native unlock mode must preserve a terminal HTTP 503 response'
+    return 1
+  }
+  assert_unlock_response_fields \
+    "$output" "$mock_status" "$mock_url" "$mock_body" \
+    'native WireGuard canonical response' || return 1
+  assert_contains "$(< "$transport_log")" 'output-mode|unlock' \
+    'native unlock requests must explicitly select the canonical response mode' || return 1
+
   : > "$transport_log"
   WARP_MODE=socks
   WARP_SCOPE=global
@@ -6678,8 +7127,13 @@ test_native_https_request_mode_and_environment_contract() {
   NATIVE_IFACE=eth6
   NATIVE_SOURCE_IP=2001:db8:1::10
   id() { [ "$*" = '-g warp-redsocks' ] && printf '992\n'; }
-  output="$(native_https_request GET 'https://example.invalid/v6')"
-  assert_eq 'native-body' "$output" 'the Socks native wrapper must return the response body' || return 1
+  output="$(native_unlock_page 'https://example.invalid/v6')" || {
+    fail 'the Socks native unlock wrapper must return its canonical response'
+    return 1
+  }
+  assert_unlock_response_fields \
+    "$output" "$mock_status" "$mock_url" "$mock_body" \
+    'native Socks canonical response' || return 1
   recorded="$(< "$transport_log")"
   assert_contains "$recorded" \
     'request|GET|https://example.invalid/v6||6|2001:db8:1::10||0|socks|991|992|3|7' \
@@ -6746,6 +7200,14 @@ test_native_https_request_socket_redirect_and_deadline_contract() {
     'relative redirects must resolve against the current HTTPS URL' || return 1
   assert_contains "$body" 'status in (301, 302, 303) and current_method == "POST"' \
     '301/302/303 redirects must convert POST to GET without changing 307/308 semantics' || return 1
+  assert_contains "$body" 'if output_mode == "unlock":' \
+    'native unlock mode must preserve the terminal HTTP response' || return 1
+  assert_contains "$body" 'metadata = f"{status}\t{current_url}\n"' \
+    'native canonical responses must include status and final effective URL' || return 1
+  assert_contains "$body" 'metadata + response_body' \
+    'native canonical responses must retain the terminal response body' || return 1
+  assert_contains "$body" 'if status < 200 or status >= 300:' \
+    'ordinary native body requests must retain their existing 2xx requirement' || return 1
   assert_contains "$body" 'max_response_bytes = 8 * 1024 * 1024' \
     'native HTTPS must bound response memory' || return 1
   assert_contains "$body" '"Cache-Control": "no-cache"' \
@@ -6974,41 +7436,38 @@ test_http_probe_accepts_http_error_responses() {
 }
 
 test_install_unlock_check_is_post_success_and_nonblocking() {
-  local body complete_line disarm_line success_line unlock_line output rc=0
+  local body complete_line disarm_line release_line success_line unlock_line change_line
   body="$(function_body "$INSTALL_SCRIPT" main)"
   complete_line="$(line_number "$body" 'INSTALL_COMPLETE=1')"
   disarm_line="$(line_number "$body" 'trap - EXIT')"
+  release_line="$(line_number "$body" 'release_operation_lock')"
   success_line="$(line_number "$body" 'WARP VPS Manager 安装完成')"
-  unlock_line="$(line_number "$body" '"$BIN_PATH" unlock-check || true')"
-  for name in complete_line disarm_line success_line unlock_line; do
+  unlock_line="$(line_number "$body" '"$BIN_PATH" unlock-check --strict-exit')"
+  change_line="$(line_number "$body" '"$BIN_PATH" change-ip --policy all || true')"
+  for name in complete_line disarm_line release_line success_line unlock_line change_line; do
     [ -n "${!name}" ] || {
       fail "installer post-success marker is missing: $name"
       return 1
     }
   done
   if [ "$complete_line" -ge "$disarm_line" ] \
-    || [ "$disarm_line" -ge "$success_line" ] \
-    || [ "$success_line" -ge "$unlock_line" ]; then
-    fail 'unlock-check must run only after completion, trap disarm and success output'
+    || [ "$disarm_line" -ge "$release_line" ] \
+    || [ "$release_line" -ge "$success_line" ] \
+    || [ "$success_line" -ge "$unlock_line" ] \
+    || [ "$unlock_line" -ge "$change_line" ]; then
+    fail 'strict detection and optional rotation must run only after commit, unlock and success output'
     return 1
   fi
   assert_not_contains "$body" '"$BIN_PATH" status' \
     'installer completion must not be blocked by diagnostic status output' || return 1
   assert_not_contains "$body" '"$BIN_PATH" native-unlock-check' \
     'the native-exit unlock check must remain manual and never join installation completion' || return 1
-
-  source_without_main "$MANAGER_SCRIPT"
-  run_unlock_checks() { return 1; }
-  output="$(cmd_unlock_check)" || rc=$?
-  assert_eq '0' "$rc" \
-    'the public post-install unlock command must remain advisory' || return 1
-  assert_contains "$output" 'warp-vps change-ip' \
-    'an incomplete post-install result must offer the explicit IP replacement command' || return 1
-
-  run_unlock_checks() { return 0; }
-  output="$(cmd_unlock_check)"
-  assert_not_contains "$output" 'warp-vps change-ip' \
-    'a fully passed post-install result must not suggest replacing the working exit'
+  assert_contains "$body" 'if [ "$INSTALL_NONINTERACTIVE" -eq 0 ] && interactive_terminal_available' \
+    'only an interactive installation may read the replacement prompt' || return 1
+  assert_contains "$body" "''|[Yy]|[Yy][Ee][Ss])" \
+    'empty, Y and yes must be the only accepted installer answers' || return 1
+  assert_not_contains "$body" '输入无效' \
+    'other installer answers must exit instead of starting a second prompt loop'
 }
 
 test_old_runtime_restore_does_not_call_status() {
@@ -8896,15 +9355,21 @@ test_readme_documents_route_scope_contract() {
 }
 
 test_readme_documents_change_ip_contract() {
-  assert_file_matches "$README_FILE" 'warp-vps change-ip` \| 最多更换 10 次 WARP 注册' \
-    'README must expose the new bounded command' || return 1
-  assert_file_matches "$README_FILE" '未全部通过时只提示运行 `warp-vps change-ip`，不会在安装流程中自动更换' \
-    'README must distinguish the post-install prompt from explicit mutation' || return 1
+  assert_file_matches "$README_FILE" 'warp-vps change-ip \[--policy all\\\|any\]` \| 最多更换 10 次 WARP 注册' \
+    'README must expose the bounded command and its explicit policies' || return 1
+  assert_file_matches "$README_FILE" 'unlock-check \[--strict-exit\]' \
+    'README must expose the strict aggregate exit mode' || return 1
+  assert_file_matches "$README_FILE" '安装成功后会运行一次 `unlock-check --strict-exit`' \
+    'README must document the installed strict detector call' || return 1
+  assert_file_matches "$README_FILE" '提示为 `\[Y/n\]`.*回车或输入 Y / yes.*change-ip --policy all' \
+    'README must document every accepted post-install prompt answer' || return 1
+  assert_file_matches "$README_FILE" '其他输入或读取结束则不更换.*非交互安装不读取输入' \
+    'README must document declining, EOF and noninteractive installer branches' || return 1
   assert_file_matches "$README_FILE" '保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口' \
     'README must document the persisted mode, scope and port contract' || return 1
   assert_file_matches "$README_FILE" \
-    '交互运行时先询问是否要求两项都明确可用，默认只要任一项明确可用就停止，非交互运行也使用该默认值' \
-    'README must document both interactive and noninteractive change-ip defaults' || return 1
+    '默认停止策略为 `all`.*交互运行.*`\[Y/n\]`.*选择 n 改为任一项明确可用.*非交互运行同样默认 `all`' \
+    'README must document both interactive and noninteractive all-service defaults' || return 1
   assert_file_matches "$README_FILE" 'Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户' \
     'README must document the safe Socks account boundary' || return 1
 
@@ -8912,8 +9377,14 @@ test_readme_documents_change_ip_contract() {
   source_without_main "$MANAGER_SCRIPT"
   help_output="$(usage)"
   assert_contains "$help_output" \
-    'change-ip       最多更换 10 次 WARP 注册；默认任一服务明确可用即停止' \
-    'CLI help must expose the bounded replacement command and its default stop policy'
+    'unlock-check [--strict-exit]' \
+    'CLI help must expose strict unlock exit mode' || return 1
+  assert_contains "$help_output" \
+    'change-ip [--policy all|any]' \
+    'CLI help must expose both replacement policies' || return 1
+  assert_contains "$help_output" \
+    '默认两项均明确可用才停止' \
+    'CLI help must state the all-services default stop policy'
 }
 
 test_reinstall_accepts_legacy_socks_rule_cleanup() {
@@ -9242,7 +9713,8 @@ test_reinstall_quiesces_health_and_optional_backends() {
 
 test_main_executes_bidirectional_mode_switches() {
   source_without_main "$INSTALL_SCRIPT"
-  local target_mode previous_mode unlock_rc events backend_reusable prepare_calls udp_probe_log
+  local target_mode previous_mode unlock_rc change_ip_rc events backend_reusable prepare_calls udp_probe_log
+  local post_install_answer='' post_install_read_rc=0 prompt_tty=0 output output_file answer_spec
   target_mode=wireguard
   previous_mode=socks
   unlock_rc=124
@@ -9250,6 +9722,7 @@ test_main_executes_bidirectional_mode_switches() {
   backend_reusable=0
   prepare_calls=0
   udp_probe_log="$(mktemp)"
+  output_file="$(mktemp)"
   record_main_event() { events="${events}$1"$'\n'; }
   INSTALL_NONINTERACTIVE=1
   INSTALL_MODE_OPTION="$target_mode"
@@ -9262,7 +9735,14 @@ test_main_executes_bidirectional_mode_switches() {
   validate_repo_raw_base() { :; }
   acquire_operation_lock() { record_main_event 'lock:acquire'; }
   release_operation_lock() { record_main_event 'lock:release'; }
-  read_input() { fail 'the noninteractive main transaction must not read input'; }
+  read_input() {
+    record_main_event 'post-install:read'
+    [ "$post_install_read_rc" -eq 0 ] || return "$post_install_read_rc"
+    printf -v "$1" '%s' "$post_install_answer"
+  }
+  interactive_terminal_available() { [ "$prompt_tty" -eq 1 ]; }
+  select_route_scope() { printf 'google\n'; }
+  select_install_mode() { printf '%s\n' "$target_mode"; }
   prompt_install_mode() { fail 'the noninteractive main transaction must not prompt for a mode'; }
   probe_outbound_udp() { printf 'probe\n' >> "$udp_probe_log"; return 1; }
   collect_swap_choice() { :; }
@@ -9329,8 +9809,17 @@ test_main_executes_bidirectional_mode_switches() {
     esac
   }
   manager_mock() {
-    record_main_event "manager:$1"
-    [ "$1" != unlock-check ] || return "$unlock_rc"
+    record_main_event "manager:$*"
+    case "$1" in
+      unlock-check)
+        if [ "$unlock_rc" -ne 0 ]; then
+          printf '[warp-vps] 当前 WARP 出口未全部通过检测；可运行 warp-vps change-ip 更换注册后重试。\n'
+        fi
+        return "$unlock_rc"
+        ;;
+      change-ip) return "$change_ip_rc" ;;
+      *) return 0 ;;
+    esac
   }
   BIN_PATH=manager_mock
   systemctl() { record_main_event "systemctl:$*"; }
@@ -9369,6 +9858,12 @@ test_main_executes_bidirectional_mode_switches() {
     'the installer must serialize the transition before inspecting live ownership' || return 1
   assert_contains "$events" 'lock:release' \
     'a successful install must release its operation lock before the nonblocking unlock check' || return 1
+  assert_contains "$events" 'manager:unlock-check --strict-exit' \
+    'post-install diagnostics must call the installed strict command' || return 1
+  assert_not_contains "$events" 'post-install:read' \
+    'a noninteractive install must not read the post-install prompt' || return 1
+  assert_not_contains "$events" 'manager:change-ip' \
+    'a noninteractive install must not rotate the WARP registration' || return 1
   assert_eq '1' "$(grep -o 'stop:' <<< "$events" | wc -l | tr -d ' ')" \
     'a timed-out post-success unlock check must not trigger installation cleanup' || return 1
 
@@ -9464,7 +9959,98 @@ test_main_executes_bidirectional_mode_switches() {
   assert_not_contains "$events" 'manager:configure-warp' \
     'same-mode Socks reuse must not reconnect or re-register warp-svc' || return 1
   assert_eq '' "$(< "$udp_probe_log")" \
-    'noninteractive main transactions must not run the interactive UDP probe'
+    'noninteractive main transactions must not run the interactive UDP probe' || return 1
+
+  target_mode=wireguard
+  INSTALL_MODE_OPTION=wireguard
+  previous_mode=wireguard
+  backend_reusable=1
+  unlock_rc=1
+  change_ip_rc=1
+  INSTALL_NONINTERACTIVE=0
+  prompt_tty=1
+
+  for answer_spec in 'empty:' 'Y:Y' 'y:y' 'yes:yes' 'N:N' 'n:n' 'no:no' 'other:later'; do
+    post_install_answer="${answer_spec#*:}"
+    post_install_read_rc=0
+    events=''
+    INSTALL_COMPLETE=0
+    INSTALL_CLEANUP_ARMED=0
+    INSTALL_BACKEND_REUSED=0
+    INSTALL_RUNTIME_TOUCHED=0
+    INSTALL_FILES_ACTIVATED=0
+    TARGET_BACKEND_PREPARED=0
+    TARGET_CONFIG_PREPARED=0
+    TARGET_PREP_STARTED=0
+    HEALTH_AUTOMATION_PAUSED=0
+    PREVIOUS_HEALTH_TIMER_ACTIVE=0
+    : > "$output_file"
+    main > "$output_file" 2>&1 || {
+      fail "post-install prompt branch ${answer_spec%%:*} must not fail the completed installation"
+      return 1
+    }
+    output="$(< "$output_file")"
+    assert_contains "$events" 'manager:unlock-check --strict-exit' \
+      "post-install branch ${answer_spec%%:*} must run the strict detector" || return 1
+    assert_contains "$events" 'post-install:read' \
+      "post-install branch ${answer_spec%%:*} must read exactly once" || return 1
+    assert_contains "$output" 'warp-vps change-ip' \
+      "post-install branch ${answer_spec%%:*} must retain the strict command hint" || return 1
+    case "${answer_spec%%:*}" in
+      empty|Y|y|yes)
+        assert_contains "$events" 'manager:change-ip --policy all' \
+          "post-install answer ${answer_spec%%:*} must start strict rotation" || return 1
+        ;;
+      *)
+        assert_not_contains "$events" 'manager:change-ip' \
+          "post-install answer ${answer_spec%%:*} must exit without rotation" || return 1
+        ;;
+    esac
+  done
+
+  post_install_answer=''
+  post_install_read_rc=1
+  events=''
+  INSTALL_COMPLETE=0
+  INSTALL_CLEANUP_ARMED=0
+  INSTALL_BACKEND_REUSED=0
+  INSTALL_RUNTIME_TOUCHED=0
+  INSTALL_FILES_ACTIVATED=0
+  TARGET_BACKEND_PREPARED=0
+  TARGET_CONFIG_PREPARED=0
+  TARGET_PREP_STARTED=0
+  HEALTH_AUTOMATION_PAUSED=0
+  PREVIOUS_HEALTH_TIMER_ACTIVE=0
+  main >/dev/null || {
+    fail 'post-install EOF must not fail the completed installation'
+    return 1
+  }
+  assert_contains "$events" 'post-install:read' 'post-install EOF must attempt one read' || return 1
+  assert_not_contains "$events" 'manager:change-ip' 'post-install EOF must not rotate' || return 1
+
+  unlock_rc=0
+  post_install_read_rc=0
+  events=''
+  INSTALL_COMPLETE=0
+  INSTALL_CLEANUP_ARMED=0
+  INSTALL_BACKEND_REUSED=0
+  INSTALL_RUNTIME_TOUCHED=0
+  INSTALL_FILES_ACTIVATED=0
+  TARGET_BACKEND_PREPARED=0
+  TARGET_CONFIG_PREPARED=0
+  TARGET_PREP_STARTED=0
+  HEALTH_AUTOMATION_PAUSED=0
+  PREVIOUS_HEALTH_TIMER_ACTIVE=0
+  main >/dev/null || {
+    fail 'a strict post-install pass must finish normally'
+    return 1
+  }
+  assert_contains "$events" 'manager:unlock-check --strict-exit' \
+    'a strict pass must still use the installed detector' || return 1
+  assert_not_contains "$events" 'post-install:read' \
+    'a strict pass must skip the replacement prompt' || return 1
+  assert_not_contains "$events" 'manager:change-ip' \
+    'a strict pass must not rotate a working exit'
 }
 
 test_reinstall_mode_switch_uses_the_main_install_path() {
@@ -10454,9 +11040,11 @@ run_test 'custom Swap uses decimal input and releases failed allocation' test_cu
 run_test 'Swap rollback preserves unknown state and reverifies cleanup' test_swap_state_reader_and_rollback_failure_contract
 run_test 'noninteractive Swap choices and failures are bounded' test_noninteractive_swap_choices_and_failure_are_bounded
 run_test 'Gemini parser is covered by offline fixtures' test_gemini_fixtures
-run_test 'Gemini probes request only the homepage' test_gemini_probes_use_one_homepage_request
+run_test 'unlock probes accept the first successful HTTP response' test_unlock_probes_accept_the_first_http_response
+run_test 'unlock probes retry only transport failures once' test_unlock_transport_retries_only_transport_failures_once
+run_test 'all unlock entrypoints share the current detector' test_all_unlock_entrypoints_share_current_logic
 run_test 'unlock HTTP requests ignore environment proxies' test_unlock_http_transport_ignores_environment_proxies
-run_test 'unlock aggregate requires both services' test_unlock_check_requires_both_services
+run_test 'unlock advisory and strict exits preserve the all-services aggregate' test_unlock_check_requires_both_services
 run_test 'unlock policy stays local and reports each service' test_unlock_policy_is_local_and_each_service_is_still_reported
 run_test 'unlock check rejects a missing curl dependency' test_unlock_check_missing_curl_is_not_a_pass
 run_test 'unlock check skips only YouTube when Python is missing' test_unlock_check_skips_only_youtube_without_python
@@ -10471,7 +11059,7 @@ run_test 'runtime paths keep advisory diagnostics explicit' test_runtime_paths_k
 run_test 'test exit status follows only local state' test_cmd_test_returns_only_local_status
 run_test 'status and healthy timer checks remain local' test_status_and_healthy_timer_stay_local
 run_test 'HTTP probes accept error responses as reachable' test_http_probe_accepts_http_error_responses
-run_test 'install unlock check is post-success and nonblocking' test_install_unlock_check_is_post_success_and_nonblocking
+run_test 'install strict unlock and optional rotation are post-success' test_install_unlock_check_is_post_success_and_nonblocking
 run_test 'old runtime restore does not call status' test_old_runtime_restore_does_not_call_status
 run_test 'Google rule generation validates cloud subtraction' test_generator_validates_google_cloud_subtraction
 run_test 'rule metadata counts gate install and update' test_rule_metadata_counts_gate_install_and_update
