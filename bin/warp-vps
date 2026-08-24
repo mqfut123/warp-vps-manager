@@ -55,6 +55,7 @@ WG_ROTATION_ROLLBACK_ARMED=0
 WG_ROTATION_BACKUP=""
 WG_ROTATION_STAGE=""
 SOCKS_ROTATION_RECOVERY_ARMED=0
+OBSERVED_WARP_IPV4=""
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'
@@ -1777,8 +1778,13 @@ wait_for_socks_listen() {
 }
 
 socks_trace() {
-  curl --socks5-hostname "127.0.0.1:${WARP_SOCKS_PORT}" -fsS --connect-timeout 8 --max-time 15 \
-    https://www.cloudflare.com/cdn-cgi/trace
+  local connect_timeout="${1:-8}"
+  local max_time="${2:-15}"
+  http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
+    no_proxy='' NO_PROXY='' \
+    curl -q -4 --socks5 "127.0.0.1:${WARP_SOCKS_PORT}" \
+      --noproxy '' -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" \
+      https://www.cloudflare.com/cdn-cgi/trace
 }
 
 socks_ok() {
@@ -2686,6 +2692,179 @@ print(f"{ip_value}|{loc_value}|{warp_value}")
 '
 }
 
+wireguard_warp_public_ipv4() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$WG_IFACE" "${RULES_DIR}/google_ipv4.txt" <<'PY'
+import ipaddress
+import os
+import pathlib
+import signal
+import socket
+import struct
+import sys
+
+MAGIC_COOKIE = 0x2112A442
+
+
+def alarm_handler(_signum, _frame):
+    raise TimeoutError
+
+interface = sys.argv[1]
+rules_path = pathlib.Path(sys.argv[2])
+networks = []
+try:
+    for raw in rules_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        network = ipaddress.ip_network(line, strict=True)
+        if network.version != 4:
+            raise ValueError
+        networks.append(network)
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not networks:
+    raise SystemExit(1)
+
+signal.signal(signal.SIGALRM, alarm_handler)
+signal.alarm(8)
+try:
+    resolved = socket.getaddrinfo(
+        "stun.l.google.com",
+        19302,
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+        socket.IPPROTO_UDP,
+    )
+except (OSError, TimeoutError):
+    raise SystemExit(1)
+
+server = None
+seen = set()
+for _family, _socktype, _protocol, _canonical_name, address in resolved:
+    candidate = ipaddress.ip_address(address[0])
+    if candidate in seen:
+        continue
+    seen.add(candidate)
+    if candidate.is_global and any(candidate in network for network in networks):
+        server = address
+        break
+if server is None:
+    raise SystemExit(1)
+
+transaction_id = os.urandom(12)
+request = struct.pack("!HHI12s", 0x0001, 0, MAGIC_COOKIE, transaction_id)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+try:
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_BINDTODEVICE,
+        interface.encode("utf-8") + b"\0",
+    )
+    sock.settimeout(4)
+    sock.connect(server)
+    sock.send(request)
+    response = sock.recv(2048)
+except (AttributeError, OSError, TimeoutError):
+    raise SystemExit(1)
+finally:
+    sock.close()
+
+if len(response) < 20:
+    raise SystemExit(1)
+message_type, message_length, cookie, response_id = struct.unpack(
+    "!HHI12s", response[:20]
+)
+if (
+    message_type != 0x0101
+    or cookie != MAGIC_COOKIE
+    or response_id != transaction_id
+    or message_length % 4 != 0
+    or 20 + message_length != len(response)
+):
+    raise SystemExit(1)
+
+offset = 20
+message_end = len(response)
+cookie_bytes = struct.pack("!I", MAGIC_COOKIE)
+observed = None
+while offset + 4 <= message_end:
+    attribute_type, attribute_length = struct.unpack("!HH", response[offset : offset + 4])
+    value_start = offset + 4
+    value_end = value_start + attribute_length
+    if value_end > message_end:
+        raise SystemExit(1)
+    if attribute_type == 0x0020:
+        if attribute_length != 8:
+            raise SystemExit(1)
+        reserved, family, _xor_port, xor_address = struct.unpack(
+            "!BBH4s", response[value_start:value_end]
+        )
+        if reserved != 0 or family != 0x01:
+            raise SystemExit(1)
+        address_bytes = bytes(
+            value ^ mask for value, mask in zip(xor_address, cookie_bytes)
+        )
+        candidate = ipaddress.ip_address(address_bytes)
+        if candidate.version != 4 or not candidate.is_global:
+            raise SystemExit(1)
+        if observed is not None and observed != candidate:
+            raise SystemExit(1)
+        observed = candidate
+    offset = value_start + ((attribute_length + 3) // 4) * 4
+if offset != message_end or observed is None:
+    raise SystemExit(1)
+signal.alarm(0)
+print(observed)
+PY
+}
+
+socks_warp_public_ipv4() {
+  local trace fields trace_ip trace_region trace_warp
+  trace="$(socks_trace 4 8 2>/dev/null)" || return 1
+  fields="$(parse_cloudflare_trace <<< "$trace" 2>/dev/null)" || return 1
+  IFS='|' read -r trace_ip trace_region trace_warp <<< "$fields"
+  : "$trace_region"
+  case "$trace_warp" in on|plus) ;; *) return 1 ;; esac
+  python3 - "$trace_ip" <<'PY'
+import ipaddress
+import sys
+
+try:
+    observed = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if observed.version != 4 or not observed.is_global:
+    raise SystemExit(1)
+print(observed)
+PY
+}
+
+observe_warp_public_ipv4() {
+  case "$WARP_MODE" in
+    wireguard) wireguard_warp_public_ipv4 ;;
+    socks) socks_warp_public_ipv4 ;;
+    *) return 1 ;;
+  esac
+}
+
+print_warp_public_ipv4_value() {
+  local label="$1"
+  local value="${2:-}"
+  if [ -n "$value" ]; then
+    info_line "${label}：${value}"
+  else
+    warn_line "${label}：暂时无法获取"
+  fi
+}
+
+print_warp_public_ipv4() {
+  local label="$1"
+  OBSERVED_WARP_IPV4=""
+  OBSERVED_WARP_IPV4="$(observe_warp_public_ipv4 2>/dev/null || true)"
+  print_warp_public_ipv4_value "$label" "$OBSERVED_WARP_IPV4"
+}
+
 curl_unlock_page() {
   local url="$1"
   local raw metadata body status final_url
@@ -3443,9 +3622,22 @@ cmd_status() {
     info_line "WARP SOCKS 端口：${WARP_SOCKS_PORT}"
     info_line "本地转发端口：${REDSOCKS_PORT}"
   fi
+  print_warp_public_ipv4 "当前 WARP 公网 IPv4"
   info_line "更新地址：$(mask_repo_url "$REPO_RAW_BASE")"
   print_rule_summary || true
   run_self_check
+}
+
+cmd_ip() {
+  local observed_ip
+  require_root
+  load_config
+  if observed_ip="$(observe_warp_public_ipv4)" && [ -n "$observed_ip" ]; then
+    printf '%s\n' "$observed_ip"
+    return 0
+  fi
+  warn "当前 WARP 公网 IPv4 暂时无法获取"
+  return 1
 }
 
 cmd_unlock_check() {
@@ -3471,6 +3663,7 @@ cmd_native_unlock_check() {
 
 cmd_change_ip() {
   local attempt rotate_rc unlock_choice unlock_policy=all policy_explicit=0
+  local last_warp_ipv4=""
 
   if [ "${1:-}" = "--policy" ]; then
     unlock_policy="$2"
@@ -3504,6 +3697,7 @@ cmd_change_ip() {
     done
   fi
 
+  print_warp_public_ipv4 "更换前的 WARP 公网 IPv4"
   begin_runtime_maintenance || die "无法暂停健康检查，未更换 WARP IP"
   section "更换 WARP IP"
   if [ "$unlock_policy" = "all" ]; then
@@ -3530,8 +3724,11 @@ cmd_change_ip() {
       die "WARP IP 更换失败；已停止后续尝试"
     fi
 
+    print_warp_public_ipv4 "第 ${attempt} 次更换后的 WARP 公网 IPv4"
+    last_warp_ipv4="$OBSERVED_WARP_IPV4"
     if run_unlock_checks "$unlock_policy"; then
       finish_runtime_maintenance
+      print_warp_public_ipv4_value "最终 WARP 公网 IPv4" "$last_warp_ipv4"
       if [ "$unlock_policy" = "all" ]; then
         ok_line "WARP IP 更换完成，Gemini 与 YouTube Premium 均已明确通过检测"
       else
@@ -3545,6 +3742,7 @@ cmd_change_ip() {
   done
 
   finish_runtime_maintenance
+  print_warp_public_ipv4_value "最终 WARP 公网 IPv4" "$last_warp_ipv4"
   fail_line "已更换 ${CHANGE_IP_MAX_ATTEMPTS} 次，仍未达到所选停止条件"
   return 1
 }
@@ -4444,6 +4642,7 @@ usage() {
 
 常用命令：
   menu            打开交互式管理菜单；直接运行 warp-vps 效果相同
+  ip              输出当前 WARP 公网 IPv4
   status          快速检查本地运行态
   test            检查本地运行态并运行非阻塞外部诊断
   restart         重启 WARP 分流链路
@@ -4523,6 +4722,7 @@ main() {
   fi
   case "$cmd" in
     menu) [ "$#" -eq 0 ] || { cli_error "menu 不接受参数"; return 2; }; cmd_menu ;;
+    ip) [ "$#" -eq 0 ] || { cli_error "ip 不接受参数"; return 2; }; cmd_ip ;;
     status) [ "$#" -eq 0 ] || { cli_error "status 不接受参数"; return 2; }; cmd_status ;;
     test) [ "$#" -eq 0 ] || { cli_error "test 不接受参数"; return 2; }; cmd_test ;;
     native-unlock-check) [ "$#" -eq 0 ] || { cli_error "native-unlock-check 不接受参数"; return 2; }; cmd_native_unlock_check ;;
@@ -4569,7 +4769,7 @@ main() {
       if interactive_terminal_available; then
         cmd_menu
       else
-        cli_error "当前没有交互终端；请指定 status、test、native-unlock-check、unlock-check、change-ip、restart、update、reinstall、switch、logs 或 uninstall"
+        cli_error "当前没有交互终端；请指定 ip、status、test、native-unlock-check、unlock-check、change-ip、restart、update、reinstall、switch、logs 或 uninstall"
         return 2
       fi
       ;;

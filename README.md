@@ -38,7 +38,7 @@ Google 精准分流和全局 WARP 都可以搭配 WireGuard 或 Socks5，切换�
 - **全局走 WARP**：WireGuard 接管公网 IPv4、IPv6 与全部协议；Socks5 接管 VPS 主动发起的公网 IPv4 TCP。
 - **不改代理配置**：在系统出站层完成分流，无需修改 Xray、sing-box、Hysteria 或 3x-ui。
 - **两种运行模式**：WireGuard 完整承载双栈与 UDP；Socks5 适合更轻量的 TCP 透明代理。
-- **自带管理工具**：状态、诊断、解锁检测、WARP IP 更换、更新、切换模式、日志和卸载统一由 `warp-vps` 管理。
+- **自带管理工具**：WARP 公网 IPv4、状态、诊断、解锁检测、IP 更换、更新、切换模式、日志和卸载统一由 `warp-vps` 管理。
 
 WireGuard 全局模式让未绑定原生源地址的公网 IPv4、IPv6、TCP、UDP 和 QUIC 全部走 WARP；现有及新入站连接回包、显式绑定 VPS 原生源地址的流量和局域网路由保留原生路径。Socks5 不承载 UDP 或 IPv6；其全局模式接管 VPS 主动发起的公网 IPv4 TCP，入站连接回包保持原生路径，并继续拒绝 Google IPv4 UDP/443（QUIC）和 Google IPv6；其他非 Google UDP 与 IPv6 仍使用 VPS 原生出口。
 
@@ -75,7 +75,8 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 | 命令 | 用途 |
 |---|---|
-| `warp-vps status` | 查看配置、服务、接口、端口和分流服务运行态 |
+| `warp-vps ip` | 只输出当前 WARP 公网 IPv4，便于直接复制或用于脚本 |
+| `warp-vps status` | 查看当前 WARP 公网 IPv4、配置、服务、接口、端口和分流服务运行态 |
 | `warp-vps test` | 运行分流与外部连通性诊断 |
 | `warp-vps native-unlock-check` | 绕过 WARP 分流，检测原生出口的 Gemini 和 YouTube Premium |
 | `warp-vps unlock-check [--strict-exit]` | 检测当前 WARP IPv4 出口的 Gemini 和 YouTube Premium；严格退出模式仅在两项均明确可用时成功 |
@@ -90,13 +91,17 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 进入“重装或切换”后，可重新选择路由范围和 Socks5 / WireGuard 模式；运行模式直接回车保持当前模式。非交互重装未指定 `--scope` 时保留当前范围；全新非交互安装的路由范围默认使用 Google 精准分流，运行模式默认 WireGuard，可用 `--scope` 与 `--mode` 显式指定。
 
+安装完成、管理菜单和 `warp-vps status` 都会显示当前 WARP 公网 IPv4。`warp-vps ip` 成功时只向标准输出写入这个 IPv4；查询会沿当前 WireGuard 或 Socks5 的 WARP 路径执行，不把 VPS 原生公网 IP 当作 WARP IP。暂时无法确认时，交互界面显示“暂时无法获取”，不影响已完成的安装、菜单操作或本地运行状态检查。
+
 `native-unlock-check` 需要 root 且仅在主动运行时检测：取原生默认接口的第一个 global IPv4，没有 IPv4 时取第一个 global IPv6；通过同一路径显示 Cloudflare Trace 返回的公网 IP 和地区，再复用现有 Gemini、YouTube Premium 判断。它不会暂停服务、修改规则或加入安装后的自动检测；结果只供参考，不影响安装、更新、重启或健康检查。
 
 `unlock-check`、安装完成检测、`change-ip` 与 `native-unlock-check` 共用相同的页面判定。每项使用首个成功的 HTTP 响应，只有传输失败时才重试一次，不合并两份成功页面。Gemini 返回 403 / 451 或受限地区时显示不可用；否则，命中两个已知正向 marker 中任意一个，或页面返回受支持地区时显示可用，其余情况显示无法确认；Gemini 地区码只参与内部判断，不在结果中展示。YouTube Premium 的三种明确不可用文案或最终重定向到 `google.cn` 域名时优先显示不可用；否则，只有 HTTP 2xx 响应包含 `premiumPurchaseButton`、`manageSubscriptionButton`、月付标记、`ad-free` 或精确的 `SPunlimited` browseId 任一信号时才显示可用。YouTube 的页面地区只用于结果说明，不作为 Premium 可用证据；单纯 HTTP 成功或普通标题也不能证明解锁。检测请求不使用环境代理、Cookie 或本地缓存。单独运行 `unlock-check` 时仍会逐项显示结果；默认作为只读诊断返回成功，增加 `--strict-exit` 后只有两项都明确可用才返回成功。
 
-安装成功后会运行一次 `unlock-check --strict-exit`。两项均明确可用时直接结束；未全部通过时始终提示稍后可运行 `warp-vps change-ip`。交互安装会再询问是否立即更换，提示为 `[Y/n]`，直接回车或输入 Y / yes 会执行 `warp-vps change-ip --policy all`，其他输入或读取结束则不更换；非交互安装不读取输入，也不自动更换。检测或更换失败不会改变已经完成的安装结果。
+安装成功后会先显示当前 WARP 公网 IPv4，再运行一次 `unlock-check --strict-exit`。两项均明确可用时直接结束；未全部通过时始终提示稍后可运行 `warp-vps change-ip`。交互安装会再询问是否立即更换，提示为 `[Y/n]`，直接回车或输入 Y / yes 会执行 `warp-vps change-ip --policy all`，其他输入或读取结束则不更换；非交互安装不读取输入，也不自动更换。IP 查询、检测或更换失败不会改变已经完成的安装结果。
 
-`change-ip` 保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口，通过重新注册 WARP 获取新出口。默认停止策略为 `all`，要求 Gemini 与 YouTube Premium 均明确可用；交互运行且未指定策略时以 `[Y/n]` 确认该默认值，选择 n 改为任一项明确可用即可停止。非交互运行同样默认 `all`，自动化可通过 `--policy all` 或 `--policy any` 明确指定。每轮恢复当前数据面后立即复检，最多尝试 10 次。Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户。Socks5 全局范围更换注册时会先暂停项目透明分流，避免 WARP Client 注册请求被旧规则重定向；完成注册和本地代理配置后恢复原范围，并验证完整数据面。
+`change-ip` 保持当前 WireGuard / Socks5 模式、Google 精准 / 全局路由范围和 Socks5 端口，通过重新注册 WARP 获取新出口。执行时先显示更换前的 WARP 公网 IPv4；每次注册恢复数据面后，先显示该次更换后的实际 IPv4，再执行 Gemini 和 YouTube Premium 检测。即使该次没有达到停止条件并继续下一次，更换到的 IP 也会保留在输出中；成功或用完 10 次后会再次标明最后一轮的“最终 WARP 公网 IPv4”，不会为最终文案额外查询一次。某轮暂时无法获取 IP 时会如实显示，不沿用上一轮结果，也不阻止随后的解锁检测。
+
+默认停止策略为 `all`，要求 Gemini 与 YouTube Premium 均明确可用；交互运行且未指定策略时以 `[Y/n]` 确认该默认值，选择 n 改为任一项明确可用即可停止。非交互运行同样默认 `all`，自动化可通过 `--policy all` 或 `--policy any` 明确指定。每轮恢复当前数据面后立即复检，最多尝试 10 次。Socks5 模式只更换本项目管理的 Free 注册，不替换用户原有的 WARP Client、Unlimited 或组织账户。Socks5 全局范围更换注册时会先暂停项目透明分流，避免 WARP Client 注册请求被旧规则重定向；完成注册和本地代理配置后恢复原范围，并验证完整数据面。
 
 ## 卸载
 

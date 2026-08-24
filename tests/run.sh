@@ -858,6 +858,49 @@ test_installer_menu_maps_public_actions_and_recovers() {
     'successful, failed, and invalid ordinary actions should all return to the same menu'
 }
 
+test_installer_menu_ip_observation_is_advisory() {
+  source_without_main "$INSTALL_SCRIPT"
+  local event manager_rc=0 output rc=0
+  event="$(mktemp)"
+  BIN_PATH=menu_manager
+  menu_mode_label() { printf 'WireGuard\n'; }
+  menu_scope_label() { printf '精准分流 Google\n'; }
+  menu_manager() {
+    printf '%s\n' "$*" >> "$event"
+    [ "$manager_rc" -eq 0 ] && printf '8.8.8.8\n'
+    return "$manager_rc"
+  }
+
+  output="$(print_installer_menu)" || rc=$?
+  assert_eq '0' "$rc" 'a successful IP observation must not change menu rendering' || return 1
+  assert_eq 'ip' "$(< "$event")" \
+    'each menu render must invoke the installed IP observer exactly once' || return 1
+  assert_contains "$output" 'WARP 公网 IPv4：8.8.8.8' \
+    'the management menu must show the currently observed WARP IPv4' || return 1
+  assert_contains "$output" 'WARP VPS Manager 管理菜单' \
+    'IP output must remain part of the existing menu render' || return 1
+
+  : > "$event"
+  manager_rc=1
+  rc=0
+  output="$(print_installer_menu 2>&1)" || rc=$?
+  assert_eq '0' "$rc" 'an unavailable IP observation must remain advisory in the menu' || return 1
+  assert_eq 'ip' "$(< "$event")" \
+    'a failed menu observation must not retry or call another manager action' || return 1
+  assert_contains "$output" '  1. 查看本地运行状态' \
+    'an IP observation failure must not hide the management actions' || return 1
+
+  assert_contains "$output" 'WARP 公网 IPv4：暂时无法获取' \
+    'a failed menu observation must display an explicit unavailable value' || return 1
+
+  local helper_body
+  helper_body="$(function_body "$INSTALL_SCRIPT" menu_warp_public_ipv4)"
+  assert_contains "$helper_body" '"$BIN_PATH" ip' \
+    'the installer menu must reuse the installed manager IP command' || return 1
+  assert_contains "$helper_body" '|| true' \
+    'the menu IP helper must not become a menu availability gate'
+}
+
 test_restore_helpers_accept_already_absent_new_files() {
   local rollback_root="${FIXTURE_DIR}/rollback"
   local absent_live="${rollback_root}/live-does-not-exist"
@@ -973,6 +1016,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
 
   calls=''
   cmd_status() { calls="${calls}status "; }
+  cmd_ip() { calls="${calls}ip "; }
   cmd_test() { calls="${calls}test "; }
   cmd_native_unlock_check() { calls="${calls}native-unlock-check "; }
   cmd_unlock_check() { calls="${calls}unlock-check:$* "; }
@@ -990,6 +1034,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
     "$@"
   }
   main status
+  main ip
   main test
   main native-unlock-check
   main unlock-check
@@ -1003,7 +1048,7 @@ test_manager_menu_entry_preserves_explicit_cli_dispatch() {
   main uninstall --yes
   main reinstall --mode socks
   main switch wireguard --swap none
-  assert_eq 'status test native-unlock-check unlock-check: unlock-check:--strict-exit lock:wait change-ip: lock:wait change-ip:--policy all lock:wait change-ip:--policy any lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
+  assert_eq 'status ip test native-unlock-check unlock-check: unlock-check:--strict-exit lock:wait change-ip: lock:wait change-ip:--policy all lock:wait change-ip:--policy any lock:wait restart lock:wait update logs lock:wait uninstall:--yes reinstall:--mode socks switch:wireguard --swap none ' \
     "$calls" 'all public CLI commands must retain their dispatcher and arguments' || return 1
   assert_contains "$calls" 'reinstall:--mode socks ' \
     'noninteractive reinstall arguments must reach their dispatcher' || return 1
@@ -1027,6 +1072,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   require_root() { :; }
   interactive_terminal_available() { return 1; }
   cmd_status() { calls="${calls}status "; }
+  cmd_ip() { calls="${calls}ip "; }
   cmd_test() { calls="${calls}test "; }
   cmd_native_unlock_check() { calls="${calls}native-unlock "; }
   cmd_unlock_check() { calls="${calls}unlock:$* "; }
@@ -1045,7 +1091,7 @@ test_manager_noninteractive_commands_and_strict_arguments() {
   install_systemd() { calls="${calls}systemd "; }
   run_with_runtime_lock() { shift; "$@"; }
 
-  for cmd in menu status test native-unlock-check restart update logs heal apply start-rules stop-rules \
+  for cmd in menu status ip test native-unlock-check restart update logs heal apply start-rules stop-rules \
     configure-warp setup-wireguard preflight-wireguard wait-wireguard install-systemd help; do
     calls=''
     rc=0
@@ -4357,6 +4403,7 @@ test_status_reports_backend_and_route_scope() {
   print_rule_summary() { :; }
   run_self_check() { :; }
   mask_repo_url() { printf 'https://example.invalid/project\n'; }
+  print_warp_public_ipv4() { lines="${lines}$1：8.8.8.8"$'\n'; }
   REPO_RAW_BASE=https://example.invalid/project
   WG_IFACE=warp-vps-wg
   WARP_SOCKS_PORT=24000
@@ -4367,6 +4414,8 @@ test_status_reports_backend_and_route_scope() {
   cmd_status >/dev/null
   assert_contains "$lines" 'WireGuard' 'status must identify the WireGuard backend' || return 1
   assert_contains "$lines" '全局' 'status must identify the global routing scope' || return 1
+  assert_contains "$lines" '当前 WARP 公网 IPv4：8.8.8.8' \
+    'status must include the current WARP public IPv4 observation' || return 1
 
   lines=''
   WARP_SCOPE=google
@@ -4380,6 +4429,415 @@ test_status_reports_backend_and_route_scope() {
   assert_contains "$lines" 'Socks5' 'status must identify the Socks5 backend' || return 1
   assert_contains "$lines" '公网 IPv4 TCP' \
     'global Socks status must state its actual traffic boundary'
+}
+
+test_warp_public_ipv4_observer_validates_mode_specific_sources() {
+  source_without_main "$MANAGER_SCRIPT"
+  local trace_body output rc=0
+  WARP_MODE=socks
+  trace_body=$'ip=8.8.8.8\nloc=US\nwarp=on'
+  socks_trace() { printf '%s\n' "$trace_body"; }
+
+  output="$(observe_warp_public_ipv4)" || {
+    fail 'a WARP-on Socks trace with a global IPv4 must be observable'
+    return 1
+  }
+  assert_eq '8.8.8.8' "$output" \
+    'the observer stdout must contain only the normalized global IPv4' || return 1
+
+  trace_body=$'ip=1.1.1.1\nloc=US\nwarp=plus'
+  assert_eq '1.1.1.1' "$(observe_warp_public_ipv4)" \
+    'a WARP Plus Socks trace must use the same public IPv4 contract' || return 1
+
+  local rejected_trace
+  for rejected_trace in \
+    $'ip=8.8.8.8\nloc=US\nwarp=off' \
+    $'ip=10.0.0.1\nloc=US\nwarp=on' \
+    $'ip=2001:4860:4860::8888\nloc=US\nwarp=on' \
+    $'ip=not-an-ip\nloc=US\nwarp=on' \
+    $'loc=US\nwarp=on'; do
+    trace_body="$rejected_trace"
+    rc=0
+    output="$(observe_warp_public_ipv4 2>/dev/null)" || rc=$?
+    [ "$rc" -ne 0 ] || {
+      fail "an unproved Socks WARP IPv4 must be rejected: $rejected_trace"
+      return 1
+    }
+    assert_eq '' "$output" \
+      'a rejected Socks trace must not leak an address on stdout' || return 1
+  done
+
+  WARP_MODE=invalid
+  rc=0
+  output="$(observe_warp_public_ipv4 2>/dev/null)" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'an unknown runtime mode must not guess an IP observation path'
+    return 1
+  }
+  assert_eq '' "$output" 'an unknown mode must keep observer stdout empty'
+}
+
+test_socks_trace_cannot_bypass_the_owned_proxy() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event output real_curl root server_info atyp_file server_pid proxy_port
+  event="$(mktemp)"
+  real_curl="$(type -P curl)"
+  WARP_SOCKS_PORT=24000
+  curl() {
+    printf 'env:%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "${http_proxy-}" "${https_proxy-}" "${all_proxy-}" \
+      "${HTTP_PROXY-}" "${HTTPS_PROXY-}" "${ALL_PROXY-}" \
+      "${no_proxy-}" "${NO_PROXY-}" >> "$event"
+    printf 'arg:%q\n' "$@" >> "$event"
+    printf 'ip=8.8.8.8\nloc=US\nwarp=on\n'
+  }
+  http_proxy=http://127.0.0.1:18080
+  https_proxy=http://127.0.0.1:18443
+  all_proxy=socks5://127.0.0.1:1080
+  HTTP_PROXY=http://127.0.0.1:28080
+  HTTPS_PROXY=http://127.0.0.1:28443
+  ALL_PROXY=socks5://127.0.0.1:2080
+  no_proxy='*'
+  NO_PROXY='*'
+
+  output="$(socks_trace 3 4)" || {
+    fail 'the explicit WARP Socks trace should reach curl'
+    return 1
+  }
+  assert_contains "$output" 'warp=on' \
+    'the Socks trace must preserve the explicit proxy response' || return 1
+  assert_contains "$(< "$event")" 'env:|||||||' \
+    'the Socks trace process must receive no inherited proxy or no-proxy policy' || return 1
+  assert_contains "$(< "$event")" $'arg:--socks5\narg:127.0.0.1:24000' \
+    'the trace must use only the managed loopback Socks endpoint' || return 1
+  assert_contains "$(< "$event")" $'arg:--noproxy\narg:\'\'' \
+    'an inherited NO_PROXY wildcard must not bypass the explicit Socks endpoint' || return 1
+  assert_contains "$(< "$event")" $'arg:--connect-timeout\narg:3' \
+    'the caller-selected connection timeout must reach curl' || return 1
+  assert_contains "$(< "$event")" $'arg:--max-time\narg:4' \
+    'the caller-selected total timeout must reach curl' || return 1
+
+  root="$(mktemp -d)"
+  server_info="$root/server-port"
+  atyp_file="$root/atyp"
+  python3 - "$server_info" "$atyp_file" <<'PY' &
+import pathlib
+import socket
+import struct
+import sys
+
+
+def receive_exact(connection, length):
+    data = b""
+    while len(data) < length:
+        chunk = connection.recv(length - len(data))
+        if not chunk:
+            raise OSError("unexpected SOCKS EOF")
+        data += chunk
+    return data
+
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+listener.settimeout(5)
+pathlib.Path(sys.argv[1]).write_text(str(listener.getsockname()[1]), encoding="ascii")
+connection, _peer = listener.accept()
+connection.settimeout(5)
+version, method_count = receive_exact(connection, 2)
+methods = receive_exact(connection, method_count)
+if version != 5 or 0 not in methods:
+    raise OSError("unexpected SOCKS greeting")
+connection.sendall(b"\x05\x00")
+version, command, reserved, address_type = receive_exact(connection, 4)
+if (version, command, reserved) != (5, 1, 0):
+    raise OSError("unexpected SOCKS connect request")
+if address_type == 1:
+    receive_exact(connection, 4)
+elif address_type == 3:
+    receive_exact(connection, receive_exact(connection, 1)[0])
+elif address_type == 4:
+    receive_exact(connection, 16)
+else:
+    raise OSError("unknown SOCKS address type")
+receive_exact(connection, 2)
+pathlib.Path(sys.argv[2]).write_text(str(address_type), encoding="ascii")
+connection.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", 443))
+connection.close()
+listener.close()
+PY
+  server_pid=$!
+  for _attempt in $(seq 1 100); do
+    [ -s "$server_info" ] && break
+    sleep 0.02
+  done
+  [ -s "$server_info" ] || {
+    fail 'the local SOCKS handshake fixture did not become ready'
+    return 1
+  }
+  proxy_port="$(< "$server_info")"
+  WARP_SOCKS_PORT="$proxy_port"
+  curl() {
+    local args=("$@") last_index url
+    last_index=$((${#args[@]} - 1))
+    url="${args[$last_index]}"
+    unset 'args[$last_index]'
+    "$real_curl" "${args[@]}" \
+      --resolve 'www.cloudflare.com:443:192.0.2.10' "$url"
+  }
+  socks_trace 2 2 >/dev/null 2>&1 || true
+  wait "$server_pid" || {
+    fail 'the local SOCKS handshake fixture exited unsuccessfully'
+    return 1
+  }
+  assert_eq '1' "$(< "$atyp_file")" \
+    'the explicit Socks request must carry an IPv4 target instead of a proxy-resolved domain'
+}
+
+test_wireguard_public_ipv4_observer_uses_google_stun_and_bound_xor_parsing() {
+  source_without_main "$MANAGER_SCRIPT"
+  local body root output fixture rc=0
+  body="$(function_body "$MANAGER_SCRIPT" wireguard_warp_public_ipv4)"
+  [ -n "$body" ] || {
+    fail 'could not extract the WireGuard WARP IPv4 observer'
+    return 1
+  }
+  assert_contains "$body" 'stun.l.google.com' \
+    'WireGuard observation must use a Google destination that follows precise routing' || return 1
+  assert_contains "$body" '19302' \
+    'WireGuard observation must use the Google STUN service port' || return 1
+  assert_contains "$body" 'google_ipv4.txt' \
+    'resolved STUN targets must be checked against the project Google IPv4 rules' || return 1
+  assert_contains "$body" 'candidate.is_global and any(candidate in network for network in networks)' \
+    'WireGuard observation must select only a global target covered by the Google rules' || return 1
+  assert_contains "$body" 'socket.SO_BINDTODEVICE' \
+    'the STUN socket must bind to the managed WireGuard interface' || return 1
+  assert_contains "$body" 'signal.alarm(8)' \
+    'DNS resolution and the STUN exchange must share a bounded deadline' || return 1
+  assert_contains "$body" 'response_id != transaction_id' \
+    'the STUN response must match the request transaction' || return 1
+  assert_contains "$body" 'attribute_type == 0x0020' \
+    'the observer must parse the XOR-MAPPED-ADDRESS attribute' || return 1
+  assert_contains "$body" 'value ^ mask for value, mask in zip(xor_address, cookie_bytes)' \
+    'the observed IPv4 must be decoded with the STUN magic-cookie XOR' || return 1
+  assert_contains "$body" 'candidate.version != 4 or not candidate.is_global' \
+    'the decoded STUN address must be a global IPv4 before it is printed' || return 1
+
+  root="$(mktemp -d)"
+  mkdir -p "$root/rules"
+  printf '8.8.8.0/24\n' > "$root/rules/google_ipv4.txt"
+  cat > "$root/sitecustomize.py" <<'PY'
+import ipaddress
+import os
+import signal
+import socket
+import struct
+
+MAGIC_COOKIE = 0x2112A442
+MODE = os.environ.get("WARP_STUN_FIXTURE", "valid")
+
+if not hasattr(socket, "SO_BINDTODEVICE"):
+    socket.SO_BINDTODEVICE = 25
+
+if MODE == "timeout":
+    real_alarm = signal.alarm
+
+    def bounded_alarm(seconds):
+        return real_alarm(min(seconds, 1) if seconds else 0)
+
+    signal.alarm = bounded_alarm
+
+
+def fake_getaddrinfo(host, port, family, socktype, protocol):
+    if (host, port, family, socktype, protocol) != (
+        "stun.l.google.com",
+        19302,
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+        socket.IPPROTO_UDP,
+    ):
+        raise OSError("unexpected STUN target")
+    if MODE == "timeout":
+        signal.pause()
+        raise OSError("alarm did not interrupt DNS")
+    return [
+        (
+            socket.AF_INET,
+            socket.SOCK_DGRAM,
+            socket.IPPROTO_UDP,
+            "",
+            ("8.8.8.8", 19302),
+        )
+    ]
+
+
+class FakeSocket:
+    def __init__(self, family, socktype, protocol):
+        if (family, socktype, protocol) != (
+            socket.AF_INET,
+            socket.SOCK_DGRAM,
+            socket.IPPROTO_UDP,
+        ):
+            raise OSError("unexpected socket type")
+        self.bound = False
+        self.request = b""
+
+    def setsockopt(self, level, option, value):
+        if (
+            level != socket.SOL_SOCKET
+            or option != socket.SO_BINDTODEVICE
+            or value != b"warp-vps-wg\0"
+        ):
+            raise OSError("observer did not bind the managed interface")
+        self.bound = True
+
+    def settimeout(self, timeout):
+        if timeout != 4:
+            raise OSError("unexpected socket timeout")
+
+    def connect(self, address):
+        if not self.bound or address != ("8.8.8.8", 19302):
+            raise OSError("unexpected STUN connection")
+
+    def send(self, request):
+        message_type, message_length, cookie, _transaction_id = struct.unpack(
+            "!HHI12s", request
+        )
+        if message_type != 0x0001 or message_length != 0 or cookie != MAGIC_COOKIE:
+            raise OSError("invalid binding request")
+        self.request = request
+
+    def recv(self, _limit):
+        transaction_id = self.request[8:20]
+        if MODE == "wrong-transaction":
+            transaction_id = b"x" * 12
+        mapped_text = "10.0.0.1" if MODE == "private" else "8.8.8.8"
+        mapped = ipaddress.ip_address(mapped_text).packed
+        cookie_bytes = struct.pack("!I", MAGIC_COOKIE)
+        xor_address = bytes(value ^ mask for value, mask in zip(mapped, cookie_bytes))
+        body = struct.pack("!HHBBH4s", 0x0020, 8, 0, 1, 0, xor_address)
+        if MODE == "malformed-tail":
+            body += struct.pack("!HH", 0x8022, 4)
+        return struct.pack(
+            "!HHI12s", 0x0101, len(body), MAGIC_COOKIE, transaction_id
+        ) + body
+
+    def close(self):
+        pass
+
+
+socket.getaddrinfo = fake_getaddrinfo
+socket.socket = FakeSocket
+PY
+  WG_IFACE=warp-vps-wg
+  RULES_DIR="$root/rules"
+
+  output="$(PYTHONPATH="$root" WARP_STUN_FIXTURE=valid wireguard_warp_public_ipv4)" || {
+    fail 'a valid bound XOR-MAPPED IPv4 fixture must be parsed by the production probe'
+    return 1
+  }
+  assert_eq '8.8.8.8' "$output" \
+    'the executed STUN parser must return only the decoded global IPv4' || return 1
+
+  for fixture in malformed-tail wrong-transaction private timeout; do
+    rc=0
+    output="$(PYTHONPATH="$root" WARP_STUN_FIXTURE="$fixture" \
+      wireguard_warp_public_ipv4 2>/dev/null)" || rc=$?
+    [ "$rc" -ne 0 ] || {
+      fail "the production STUN probe must reject fixture: $fixture"
+      return 1
+    }
+    assert_eq '' "$output" \
+      "a rejected STUN fixture must not leak an IPv4: $fixture" || return 1
+  done
+}
+
+test_warp_public_ipv4_display_and_cli_contract() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event output_file stderr_file output rc=0 observed='8.8.8.8'
+  event="$(mktemp)"
+  output_file="$(mktemp)"
+  stderr_file="$(mktemp)"
+  observe_warp_public_ipv4() {
+    printf 'observe\n' >> "$event"
+    [ -n "$observed" ] || return 1
+    printf '%s\n' "$observed"
+  }
+
+  OBSERVED_WARP_IPV4='1.1.1.1'
+  print_warp_public_ipv4 '当前 WARP 公网 IPv4' > "$output_file" 2>&1 || {
+    fail 'a successful display observation must remain advisory'
+    return 1
+  }
+  assert_eq '8.8.8.8' "$OBSERVED_WARP_IPV4" \
+    'the display helper must expose the observation to its caller' || return 1
+  assert_contains "$(< "$output_file")" '当前 WARP 公网 IPv4：8.8.8.8' \
+    'the display helper must pair its label with the observed address' || return 1
+
+  observed=''
+  OBSERVED_WARP_IPV4='1.1.1.1'
+  : > "$output_file"
+  print_warp_public_ipv4 '当前 WARP 公网 IPv4' > "$output_file" 2>&1 || {
+    fail 'an unavailable display observation must still return success'
+    return 1
+  }
+  assert_eq '' "$OBSERVED_WARP_IPV4" \
+    'an unavailable observation must clear a stale earlier address' || return 1
+  assert_contains "$(< "$output_file")" '当前 WARP 公网 IPv4：暂时无法获取' \
+    'an unavailable observation must be explicit in user output' || return 1
+
+  : > "$event"
+  observed='8.8.8.8'
+  require_root() { printf 'root\n' >> "$event"; }
+  load_config() { printf 'config\n' >> "$event"; }
+  output="$(cmd_ip 2> "$stderr_file")" || {
+    fail 'warp-vps ip must return a successful observation'
+    return 1
+  }
+  assert_eq '8.8.8.8' "$output" \
+    'warp-vps ip stdout must contain only the raw IPv4 value' || return 1
+  assert_eq $'root\nconfig\nobserve' "$(< "$event")" \
+    'the public IP command must require root and load config before observation' || return 1
+  assert_eq '' "$(< "$stderr_file")" \
+    'a successful IP command must not add explanatory stderr output' || return 1
+
+  : > "$event"
+  : > "$stderr_file"
+  observed=''
+  rc=0
+  output="$(cmd_ip 2> "$stderr_file")" || rc=$?
+  [ "$rc" -ne 0 ] || {
+    fail 'warp-vps ip must fail when no WARP IPv4 can be observed'
+    return 1
+  }
+  assert_eq '' "$output" 'a failed IP command must keep stdout machine-readable and empty' || return 1
+  assert_contains "$(< "$stderr_file")" '当前 WARP 公网 IPv4 暂时无法获取' \
+    'a failed IP command must explain the unavailable observation on stderr'
+}
+
+test_status_ip_observation_is_advisory() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event output rc=0
+  event="$(mktemp)"
+  WARP_MODE=wireguard
+  WARP_SCOPE=google
+  WG_IFACE=warp-vps-wg
+  REPO_RAW_BASE=https://example.invalid/project
+  require_root() { printf 'root\n' >> "$event"; }
+  load_config() { printf 'config\n' >> "$event"; }
+  observe_warp_public_ipv4() { printf 'observe\n' >> "$event"; return 1; }
+  print_rule_summary() { :; }
+  mask_repo_url() { printf '%s\n' "$1"; }
+  run_self_check() { printf 'self-check\n' >> "$event"; return 7; }
+
+  output="$(cmd_status 2>&1)" || rc=$?
+  assert_eq '7' "$rc" \
+    'status exit must continue to follow the local self-check result' || return 1
+  assert_contains "$output" '当前 WARP 公网 IPv4：暂时无法获取' \
+    'status must show an unavailable IP observation without hiding it' || return 1
+  assert_eq $'root\nconfig\nobserve\nself-check' "$(< "$event")" \
+    'status must continue from an unavailable IP observation to its local self-check'
 }
 
 test_wireguard_global_runtime_avoids_state_output_parsers() {
@@ -5358,14 +5816,25 @@ test_change_ip_dispatches_each_mode_and_finishes_the_timer() {
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'wireguard:%s\n' "$1" >> "$event"; }
   rotate_socks_registration() { printf 'socks\n' >> "$event"; }
+  print_warp_public_ipv4() {
+    case "$1" in
+      更换前*) OBSERVED_WARP_IPV4=8.8.8.8 ;;
+      *) OBSERVED_WARP_IPV4=1.1.1.1 ;;
+    esac
+    printf 'ip:%s:%s\n' "$1" "$OBSERVED_WARP_IPV4" >> "$event"
+  }
+  print_warp_public_ipv4_value() { printf 'ip:%s:%s\n' "$1" "$2" >> "$event"; }
   run_unlock_checks() { printf 'detect:%s\n' "$1" >> "$event"; return 0; }
 
   cmd_change_ip >/dev/null || {
     fail 'the first healthy WireGuard registration should complete change-ip'
     return 1
   }
-  assert_eq $'timer:begin\nwireguard:1\ndetect:all\ntimer:finish' "$(< "$event")" \
-    'WireGuard change-ip must rotate once, detect once and restore the timer' || return 1
+  assert_eq \
+    $'ip:更换前的 WARP 公网 IPv4:8.8.8.8\ntimer:begin\nwireguard:1\nip:第 1 次更换后的 WARP 公网 IPv4:1.1.1.1\ndetect:all\ntimer:finish\nip:最终 WARP 公网 IPv4:1.1.1.1' \
+    "$(< "$event")" \
+    'WireGuard change-ip must observe before and after rotation, detect, then reuse the final IP' \
+    || return 1
 
   : > "$event"
   mode=socks
@@ -5373,8 +5842,10 @@ test_change_ip_dispatches_each_mode_and_finishes_the_timer() {
     fail 'the first healthy Free Socks registration should complete change-ip'
     return 1
   }
-  assert_eq $'timer:begin\nsocks\ndetect:all\ntimer:finish' "$(< "$event")" \
-    'Socks change-ip must use only its backend and restore the timer'
+  assert_eq \
+    $'ip:更换前的 WARP 公网 IPv4:8.8.8.8\ntimer:begin\nsocks\nip:第 1 次更换后的 WARP 公网 IPv4:1.1.1.1\ndetect:all\ntimer:finish\nip:最终 WARP 公网 IPv4:1.1.1.1' \
+    "$(< "$event")" \
+    'Socks change-ip must use only its backend and retain the same observation order'
 }
 
 test_change_ip_unlock_policy_prompt_contract() {
@@ -5412,6 +5883,7 @@ test_change_ip_unlock_policy_prompt_contract() {
   begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  print_warp_public_ipv4() { OBSERVED_WARP_IPV4=8.8.8.8; }
   run_unlock_checks() { printf 'policy:%s\n' "${1:-all}" >> "$event"; }
 
   for supplied_answer in '' Y y yes Yes YES N n no No NO; do
@@ -5524,6 +5996,7 @@ test_change_ip_prompts_only_when_all_standard_fds_are_ttys() {
   begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  print_warp_public_ipv4() { OBSERVED_WARP_IPV4=8.8.8.8; }
   run_unlock_checks() { printf 'policy:%s\n' "${1:-all}" >> "$event"; }
 
   cmd_change_ip > "$output_file" 2>&1 || {
@@ -5582,6 +6055,7 @@ test_change_ip_unlock_policy_controls_retry_success() {
   begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  print_warp_public_ipv4() { OBSERVED_WARP_IPV4=8.8.8.8; }
   probe_gemini_unlock() {
     local round
     printf 'gemini\n' >> "$event"
@@ -5639,10 +6113,11 @@ test_change_ip_unlock_policy_controls_retry_success() {
   done
 }
 
-test_change_ip_stops_at_ten_failed_unlock_results() {
+test_change_ip_observes_each_rotation_before_unlock_and_reuses_final_value() {
   source_without_main "$MANAGER_SCRIPT"
-  local event rc=0 rotations detections
+  local event output_file output query_number unlock_round observation_scenario=success rc=0
   event="$(mktemp)"
+  output_file="$(mktemp)"
 
   command() {
     [ "$1" = '-v' ] || return 1
@@ -5656,16 +6131,113 @@ test_change_ip_stops_at_ten_failed_unlock_results() {
   begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  observe_warp_public_ipv4() {
+    query_number="$(grep -c '^observe:' "$event" || true)"
+    query_number=$((query_number + 1))
+    printf 'observe:%s\n' "$query_number" >> "$event"
+    case "$observation_scenario:$query_number" in
+      fail-round:2) return 1 ;;
+      *:1) printf '8.8.8.8\n' ;;
+      *:2) printf '1.1.1.1\n' ;;
+      *) printf '9.9.9.9\n' ;;
+    esac
+  }
+  run_unlock_checks() {
+    unlock_round="$(grep -c '^unlock:' "$event" || true)"
+    unlock_round=$((unlock_round + 1))
+    printf 'unlock:%s\n' "$unlock_round" >> "$event"
+    [ "$unlock_round" -ge 2 ]
+  }
+
+  output="$(cmd_change_ip 2>&1)" || {
+    fail 'the second observed rotation should satisfy the mocked unlock policy'
+    return 1
+  }
+  assert_eq \
+    $'observe:1\ntimer:begin\nrotate:1\nobserve:2\nunlock:1\nrotate:2\nobserve:3\nunlock:2\ntimer:finish' \
+    "$(< "$event")" \
+    'every successful rotation must be observed before its unlock decision' || return 1
+  assert_contains "$output" '更换前的 WARP 公网 IPv4：8.8.8.8' \
+    'change-ip must display the pre-change observation' || return 1
+  assert_contains "$output" '第 1 次更换后的 WARP 公网 IPv4：1.1.1.1' \
+    'an unsuccessful unlock round must still leave its observed IP in the transcript' || return 1
+  assert_contains "$output" '第 2 次更换后的 WARP 公网 IPv4：9.9.9.9' \
+    'the successful unlock round must display its own fresh observation' || return 1
+  assert_contains "$output" '最终 WARP 公网 IPv4：9.9.9.9' \
+    'the final line must reuse the successful round observation' || return 1
+  assert_eq '3' "$(grep -c '^observe:' "$event")" \
+    'final output must not issue an additional public-IP query' || return 1
+
+  : > "$event"
+  : > "$output_file"
+  observation_scenario=fail-round
+  run_unlock_checks() { printf 'unlock:1\n' >> "$event"; return 0; }
+  cmd_change_ip > "$output_file" 2>&1 || {
+    fail 'an unavailable post-rotation observation must not block unlock success'
+    return 1
+  }
+  output="$(< "$output_file")"
+  assert_eq $'observe:1\ntimer:begin\nrotate:1\nobserve:2\nunlock:1\ntimer:finish' \
+    "$(< "$event")" \
+    'an unavailable IP must remain advisory and preserve rotation ordering' || return 1
+  assert_contains "$output" '第 1 次更换后的 WARP 公网 IPv4：暂时无法获取' \
+    'the failed round observation must not reuse the pre-change IP' || return 1
+  assert_contains "$output" '最终 WARP 公网 IPv4：暂时无法获取' \
+    'the final line must reuse the unavailable final-round value without querying again' || return 1
+  assert_eq '2' "$(grep -c '^observe:' "$event")" \
+    'an unavailable successful round must still avoid a final extra query'
+}
+
+test_change_ip_stops_at_ten_failed_unlock_results() {
+  source_without_main "$MANAGER_SCRIPT"
+  local event output_file output expected rc=0 rotations detections observations attempt query_number
+  event="$(mktemp)"
+  output_file="$(mktemp)"
+
+  command() {
+    [ "$1" = '-v' ] || return 1
+    case "$2" in curl|python3) return 0 ;; *) return 1 ;; esac
+  }
+  require_root() { :; }
+  load_config() { WARP_MODE=wireguard; }
+  required_runtime_units_ready() { return 0; }
+  test_quiet() { return 0; }
+  managed_wireguard_config_owned() { return 0; }
+  begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
+  finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
+  rotate_wireguard_registration() { printf 'rotate:%s\n' "$1" >> "$event"; }
+  observe_warp_public_ipv4() {
+    query_number="$(grep -c '^observe:' "$event" || true)"
+    query_number=$((query_number + 1))
+    printf 'observe:%s\n' "$query_number" >> "$event"
+    printf '8.8.4.%s\n' "$query_number"
+  }
   run_unlock_checks() { printf 'detect:%s\n' "$1" >> "$event"; return 1; }
 
-  cmd_change_ip >/dev/null || rc=$?
+  cmd_change_ip > "$output_file" 2>&1 || rc=$?
   assert_eq '1' "$rc" 'ten healthy but unsupported exits must return failure' || return 1
+  output="$(< "$output_file")"
   rotations="$(grep -c '^rotate:' "$event")"
   detections="$(grep -c '^detect:all$' "$event")"
+  observations="$(grep -c '^observe:' "$event")"
   assert_eq '10' "$rotations" 'change-ip must perform exactly ten bounded rotations' || return 1
   assert_eq '10' "$detections" 'every successful rotation must receive one fresh detection' || return 1
+  assert_eq '11' "$observations" \
+    'ten rotations require one pre-change and ten post-change observations, with no final query' \
+    || return 1
+  expected=$'observe:1\ntimer:begin'
+  for ((attempt = 1; attempt <= 10; attempt++)); do
+    expected="${expected}"$'\n'"rotate:${attempt}"$'\n'"observe:$((attempt + 1))"$'\n'"detect:all"
+  done
+  expected="${expected}"$'\n'"timer:finish"
+  assert_eq "$expected" "$(< "$event")" \
+    'each of ten attempts must observe after rotation and before unlock detection' || return 1
   assert_contains "$(< "$event")" 'rotate:10' \
     'the final allowed rotation must remain the live registration' || return 1
+  assert_contains "$output" '第 10 次更换后的 WARP 公网 IPv4：8.8.4.11' \
+    'the final attempted registration must show its observed IP' || return 1
+  assert_contains "$output" '最终 WARP 公网 IPv4：8.8.4.11' \
+    'an exhausted loop must reuse its last observed IP as the final IP' || return 1
   assert_eq '1' "$(grep -c '^timer:begin$' "$event")" \
     'the ten-attempt loop must pause health automation once' || return 1
   assert_eq '1' "$(grep -c '^timer:finish$' "$event")" \
@@ -5689,6 +6261,7 @@ test_change_ip_runtime_failure_stops_immediately() {
   begin_runtime_maintenance() { printf 'timer:begin\n' >> "$event"; }
   finish_runtime_maintenance() { printf 'timer:finish\n' >> "$event"; }
   rotate_socks_registration() { printf 'rotate\n' >> "$event"; return 1; }
+  print_warp_public_ipv4() { OBSERVED_WARP_IPV4=8.8.8.8; }
   run_unlock_checks() { printf 'detect\n' >> "$event"; return 0; }
 
   output="$(cmd_change_ip 2>&1)" || rc=$?
@@ -7282,6 +7855,8 @@ test_runtime_paths_keep_diagnostics_scoped() {
       "$name must not run external diagnostics" || return 1
     assert_not_contains "$body" 'run_native_unlock_checks' \
       "$name must not run native-exit unlock probes" || return 1
+    assert_not_contains "$body" 'observe_warp_public_ipv4' \
+      "$name must not run public-IP observation" || return 1
   done
 
   for name in start_rules cmd_restart restart_wireguard_runtime \
@@ -7297,6 +7872,8 @@ test_runtime_paths_keep_diagnostics_scoped() {
       "$name must not run advisory WARP unlock checks" || return 1
     assert_not_contains "$body" 'run_native_unlock_checks' \
       "$name must not run advisory native-exit unlock checks" || return 1
+    assert_not_contains "$body" 'observe_warp_public_ipv4' \
+      "$name must not run advisory public-IP observation" || return 1
   done
 
   for name in run_final_self_check start_previous_runtime; do
@@ -7328,7 +7905,9 @@ test_runtime_paths_keep_diagnostics_scoped() {
   assert_not_contains "$body" 'nft list chain' \
     'status must not parse human-readable nft rule output' || return 1
   assert_not_contains "$body" 'wireguard_global_routes_local_ok' \
-    'status must not parse global WireGuard nft or ip-rule output'
+    'status must not parse global WireGuard nft or ip-rule output' || return 1
+  assert_not_contains "$body" 'observe_warp_public_ipv4' \
+    'the local self-check must not turn public-IP observation into a health gate'
 }
 
 test_cmd_test_returns_only_local_status() {
@@ -7436,15 +8015,16 @@ test_http_probe_accepts_http_error_responses() {
 }
 
 test_install_unlock_check_is_post_success_and_nonblocking() {
-  local body complete_line disarm_line release_line success_line unlock_line change_line
+  local body complete_line disarm_line release_line success_line ip_line unlock_line change_line
   body="$(function_body "$INSTALL_SCRIPT" main)"
   complete_line="$(line_number "$body" 'INSTALL_COMPLETE=1')"
   disarm_line="$(line_number "$body" 'trap - EXIT')"
   release_line="$(line_number "$body" 'release_operation_lock')"
   success_line="$(line_number "$body" 'WARP VPS Manager 安装完成')"
+  ip_line="$(line_number "$body" 'menu_warp_public_ipv4')"
   unlock_line="$(line_number "$body" '"$BIN_PATH" unlock-check --strict-exit')"
   change_line="$(line_number "$body" '"$BIN_PATH" change-ip --policy all || true')"
-  for name in complete_line disarm_line release_line success_line unlock_line change_line; do
+  for name in complete_line disarm_line release_line success_line ip_line unlock_line change_line; do
     [ -n "${!name}" ] || {
       fail "installer post-success marker is missing: $name"
       return 1
@@ -7453,15 +8033,18 @@ test_install_unlock_check_is_post_success_and_nonblocking() {
   if [ "$complete_line" -ge "$disarm_line" ] \
     || [ "$disarm_line" -ge "$release_line" ] \
     || [ "$release_line" -ge "$success_line" ] \
-    || [ "$success_line" -ge "$unlock_line" ] \
+    || [ "$success_line" -ge "$ip_line" ] \
+    || [ "$ip_line" -ge "$unlock_line" ] \
     || [ "$unlock_line" -ge "$change_line" ]; then
-    fail 'strict detection and optional rotation must run only after commit, unlock and success output'
+    fail 'IP output, strict detection and optional rotation must run only after commit, unlock and success output'
     return 1
   fi
   assert_not_contains "$body" '"$BIN_PATH" status' \
     'installer completion must not be blocked by diagnostic status output' || return 1
   assert_not_contains "$body" '"$BIN_PATH" native-unlock-check' \
     'the native-exit unlock check must remain manual and never join installation completion' || return 1
+  assert_contains "$body" 'WARP 公网 IPv4：%s' \
+    'installation completion must display the advisory WARP IPv4 value' || return 1
   assert_contains "$body" 'if [ "$INSTALL_NONINTERACTIVE" -eq 0 ] && interactive_terminal_available' \
     'only an interactive installation may read the replacement prompt' || return 1
   assert_contains "$body" "''|[Yy]|[Yy][Ee][Ss])" \
@@ -9359,7 +9942,7 @@ test_readme_documents_change_ip_contract() {
     'README must expose the bounded command and its explicit policies' || return 1
   assert_file_matches "$README_FILE" 'unlock-check \[--strict-exit\]' \
     'README must expose the strict aggregate exit mode' || return 1
-  assert_file_matches "$README_FILE" '安装成功后会运行一次 `unlock-check --strict-exit`' \
+  assert_file_matches "$README_FILE" '安装成功后会先显示.*再运行一次 `unlock-check --strict-exit`' \
     'README must document the installed strict detector call' || return 1
   assert_file_matches "$README_FILE" '提示为 `\[Y/n\]`.*回车或输入 Y / yes.*change-ip --policy all' \
     'README must document every accepted post-install prompt answer' || return 1
@@ -9385,6 +9968,39 @@ test_readme_documents_change_ip_contract() {
   assert_contains "$help_output" \
     '默认两项均明确可用才停止' \
     'CLI help must state the all-services default stop policy'
+}
+
+test_readme_documents_ip_observability_contract() {
+  assert_file_matches "$README_FILE" \
+    'warp-vps ip` \| 只输出当前 WARP 公网 IPv4' \
+    'README must expose the machine-readable public IP command' || return 1
+  assert_file_matches "$README_FILE" \
+    '安装完成、管理菜单和 `warp-vps status` 都会显示当前 WARP 公网 IPv4' \
+    'README must name every automatic IP-observation surface' || return 1
+  assert_file_matches "$README_FILE" \
+    '`warp-vps ip` 成功时只向标准输出写入这个 IPv4' \
+    'README must preserve raw stdout for command reuse' || return 1
+  assert_file_matches "$README_FILE" \
+    '沿当前 WireGuard 或 Socks5 的 WARP 路径执行，不把 VPS 原生公网 IP 当作 WARP IP' \
+    'README must distinguish the WARP observation from the native VPS exit' || return 1
+  assert_file_matches "$README_FILE" \
+    '先显示更换前的 WARP 公网 IPv4.*每次注册恢复数据面后，先显示该次更换后的实际 IPv4，再执行 Gemini' \
+    'README must document the pre-change and per-attempt observation order' || return 1
+  assert_file_matches "$README_FILE" \
+    '没有达到停止条件并继续下一次，更换到的 IP 也会保留在输出中' \
+    'README must state that a rejected unlock round still reports its IP' || return 1
+  assert_file_matches "$README_FILE" \
+    '最终 WARP 公网 IPv4.*不会为最终文案额外查询一次' \
+    'README must explain that final output reuses the last round observation' || return 1
+  assert_file_matches "$README_FILE" \
+    '暂时无法获取 IP.*不沿用上一轮结果，也不阻止随后的解锁检测' \
+    'README must document advisory observation failure without stale IP reuse' || return 1
+
+  local help_output
+  source_without_main "$MANAGER_SCRIPT"
+  help_output="$(usage)"
+  assert_contains "$help_output" 'ip              输出当前 WARP 公网 IPv4' \
+    'CLI help must expose the public IP command'
 }
 
 test_reinstall_accepts_legacy_socks_rule_cleanup() {
@@ -10936,6 +11552,7 @@ run_test 'installed-host detection requires command and config' test_project_ins
 run_test 'installer noninteractive entry never reads TTY' test_installer_noninteractive_entry_never_reads_tty
 run_test 'real no-TTY installer requests return immediately' test_real_no_tty_installer_requests_are_bounded
 run_test 'management menu maps public actions and recovers' test_installer_menu_maps_public_actions_and_recovers
+run_test 'management menu IP observation is advisory' test_installer_menu_ip_observation_is_advisory
 run_test 'rollback accepts originally absent files that remain absent' test_restore_helpers_accept_already_absent_new_files
 run_test 'terminal menu actions do not run stale code' test_installer_menu_terminal_actions_do_not_run_stale_code
 run_test 'manager menu entry preserves explicit CLI dispatch' test_manager_menu_entry_preserves_explicit_cli_dispatch
@@ -11002,6 +11619,11 @@ run_test 'WireGuard global native-source rules and stop are symmetric' test_wire
 run_test 'WireGuard global enables marked reverse-path checks' test_wireguard_global_src_valid_mark_boundary
 run_test 'WireGuard global cleanup ownership is exact' test_wireguard_global_cleanup_ownership_is_exact
 run_test 'status reports backend and route scope' test_status_reports_backend_and_route_scope
+run_test 'WARP public IPv4 observer validates mode-specific sources' test_warp_public_ipv4_observer_validates_mode_specific_sources
+run_test 'Socks trace cannot bypass the owned proxy' test_socks_trace_cannot_bypass_the_owned_proxy
+run_test 'WireGuard public IPv4 uses bound Google STUN XOR parsing' test_wireguard_public_ipv4_observer_uses_google_stun_and_bound_xor_parsing
+run_test 'WARP public IPv4 display and CLI preserve their contracts' test_warp_public_ipv4_display_and_cli_contract
+run_test 'status keeps public IPv4 observation advisory' test_status_ip_observation_is_advisory
 run_test 'WireGuard global runtime avoids display parsers' test_wireguard_global_runtime_avoids_state_output_parsers
 run_test 'Socks nft output blocks only Google QUIC' test_socks_nft_render_blocks_google_quic_only
 run_test 'Socks runtime accepts the v0.1.11 rule shape' test_socks_runtime_accepts_v0111_rule_shape
@@ -11026,6 +11648,7 @@ run_test 'change-ip dispatches each mode and restores the timer' test_change_ip_
 run_test 'change-ip unlock policy prompt handles defaults choices retries and EOF' test_change_ip_unlock_policy_prompt_contract
 run_test 'change-ip prompts only when all standard descriptors are TTYs' test_change_ip_prompts_only_when_all_standard_fds_are_ttys
 run_test 'change-ip unlock policy controls retry success' test_change_ip_unlock_policy_controls_retry_success
+run_test 'change-ip observes every rotation and reuses the final value' test_change_ip_observes_each_rotation_before_unlock_and_reuses_final_value
 run_test 'change-ip stops after ten failed unlock results' test_change_ip_stops_at_ten_failed_unlock_results
 run_test 'change-ip runtime failure stops immediately' test_change_ip_runtime_failure_stops_immediately
 run_test 'Socks readiness rejects unowned and invalid listeners' test_socks_local_readiness_rejects_unowned_or_invalid_listeners
@@ -11103,6 +11726,7 @@ run_test 'post-delete daemon reload failure is only a warning' test_uninstall_da
 run_test 'README documents all uninstall modes' test_readme_documents_all_uninstall_modes
 run_test 'README documents route scope behavior' test_readme_documents_route_scope_contract
 run_test 'README documents the change-ip contract' test_readme_documents_change_ip_contract
+run_test 'README documents IP observability' test_readme_documents_ip_observability_contract
 run_test 'reinstall accepts legacy Socks cleanup' test_reinstall_accepts_legacy_socks_rule_cleanup
 run_test 'reinstall quiesces health and optional backends' test_reinstall_quiesces_health_and_optional_backends
 run_test 'main executes both mode switches and ignores unlock failures' test_main_executes_bidirectional_mode_switches

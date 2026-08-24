@@ -2130,10 +2130,21 @@ menu_scope_label() {
   esac
 }
 
+menu_warp_public_ipv4() {
+  local observed_ip
+  observed_ip="$("$BIN_PATH" ip 2>/dev/null || true)"
+  if [ -n "$observed_ip" ]; then
+    printf '%s\n' "$observed_ip"
+  else
+    printf '暂时无法获取\n'
+  fi
+}
+
 print_installer_menu() {
   printf '\nWARP VPS Manager 管理菜单\n'
   printf '当前模式：%s\n' "$(menu_mode_label)"
   printf '路由范围：%s\n' "$(menu_scope_label)"
+  printf 'WARP 公网 IPv4：%s\n' "$(menu_warp_public_ipv4)"
   printf '  1. 查看本地运行状态\n'
   printf '  2. 运行完整诊断\n'
   printf '  3. 检测原生出口 Gemini / YouTube Premium 解锁\n'
@@ -2604,8 +2615,9 @@ main() {
   else
     printf '路由范围：精准分流 Google 服务\n'
   fi
+  printf 'WARP 公网 IPv4：%s\n' "$(menu_warp_public_ipv4)"
   printf '交互菜单：warp-vps\n'
-  printf '显式命令：warp-vps {status|test|native-unlock-check|unlock-check|change-ip|restart|update|reinstall|switch|logs|uninstall}\n'
+  printf '显式命令：warp-vps {ip|status|test|native-unlock-check|unlock-check|change-ip|restart|update|reinstall|switch|logs|uninstall}\n'
   if [ "$selected_mode" = "socks" ] && [ "$selected_scope" = "global" ]; then
     printf 'Socks5 全局模式会把 VPS 主动发起的公网 IPv4 TCP 透明转发到 WARP；入站连接回包保持原生路径，Google IPv4 UDP/443（QUIC）和 Google IPv6 继续拒绝。\n'
   elif [ "$selected_mode" = "socks" ]; then
