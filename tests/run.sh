@@ -837,7 +837,7 @@ test_real_no_tty_installer_requests_are_bounded() {
 test_installer_menu_maps_public_actions_and_recovers() {
   source_without_main "$INSTALL_SCRIPT"
   local answer_index=0 calls='' renders=0
-  local answers=('1' '' '2' '' '3' '' '4' '' '5' '' '8' '' '10' '' '11' '0')
+  local answers=('1' '' '2' '' '3' '' '4' '' '5' '' '8' '' '10' '' '13' '0')
   require_root() { :; }
   print_installer_menu() { renders=$((renders + 1)); }
   read_input() {
@@ -873,7 +873,7 @@ test_installer_menu_ip_observation_is_advisory() {
 
   output="$(print_installer_menu)" || rc=$?
   assert_eq '0' "$rc" 'a successful IP observation must not change menu rendering' || return 1
-  assert_eq 'ip' "$(< "$event")" \
+  assert_eq $'ip\nauto-update status' "$(< "$event")" \
     'each menu render must invoke the installed IP observer exactly once' || return 1
   assert_contains "$output" 'WARP 公网 IPv4：8.8.8.8' \
     'the management menu must show the currently observed WARP IPv4' || return 1
@@ -885,8 +885,8 @@ test_installer_menu_ip_observation_is_advisory() {
   rc=0
   output="$(print_installer_menu 2>&1)" || rc=$?
   assert_eq '0' "$rc" 'an unavailable IP observation must remain advisory in the menu' || return 1
-  assert_eq 'ip' "$(< "$event")" \
-    'a failed menu observation must not retry or call another manager action' || return 1
+  assert_eq $'ip\nauto-update status' "$(< "$event")" \
+    'a failed IP observation must not retry while the menu also reads the update setting' || return 1
   assert_contains "$output" '  1. 查看本地运行状态' \
     'an IP observation failure must not hide the management actions' || return 1
 
@@ -8296,7 +8296,7 @@ test_update_rollback_restores_existing_and_missing_files() {
   APP_DIR="$root/app"
   RULES_DIR="$APP_DIR/rules"
   BIN_PATH="$root/warp-vps"
-  mkdir -p "$APP_DIR/bin" "$RULES_DIR" "$stage/bin" "$stage/rules"
+  mkdir -p "$APP_DIR/bin" "$RULES_DIR" "$stage/bin" "$stage/rules" "$stage/scripts"
   printf 'old-install\n' > "$APP_DIR/install.sh"
 
   backup_current_installation "$backup" || {
@@ -8305,6 +8305,7 @@ test_update_rollback_restores_existing_and_missing_files() {
   }
   printf 'new-install\n' > "$stage/install.sh"
   printf 'new-manager\n' > "$stage/bin/warp-vps"
+  printf '# generator fixture\n' > "$stage/scripts/generate-google-rules.py"
   printf '8.8.8.0/24\n' > "$stage/rules/google_ipv4.txt"
   printf '2001:4860::/32\n' > "$stage/rules/google_ipv6.txt"
   printf '{"ipv4_count":1,"ipv6_count":1}\n' > "$stage/rules/rules.meta.json"
@@ -8330,7 +8331,7 @@ test_update_rollback_restores_existing_and_missing_files() {
       return 1
     fi
   done
-  for label in app-manager rules-ipv4 rules-ipv6 rules-meta command; do
+  for label in app-manager rule-generator rules-ipv4 rules-ipv6 rules-meta command; do
     [ -f "$backup/failed-new/$label" ] || {
       fail "rollback did not preserve the displaced new file for diagnostics: $label"
       return 1
@@ -9085,6 +9086,8 @@ test_uninstall_quiesces_health_before_backends() {
   systemctl() {
     systemctl_calls="${systemctl_calls}$*\n"
     case "$*" in
+      'disable --now warp-vps-rules-update.timer'|'stop warp-vps-rules-update.service'|\
+      'clean --what=state warp-vps-rules-update.timer') ;;
       'stop warp-vps-health.timer') [ "$timer_stuck" -eq 1 ] || timer_active=0 ;;
       'stop warp-vps-health.service')
         health_active=0
@@ -10454,6 +10457,7 @@ test_main_executes_bidirectional_mode_switches() {
   }
   interactive_terminal_available() { [ "$prompt_tty" -eq 1 ]; }
   select_route_scope() { printf 'google\n'; }
+  select_rules_auto_update() { printf 'off\n'; }
   select_install_mode() { printf '%s\n' "$target_mode"; }
   prompt_install_mode() { fail 'the noninteractive main transaction must not prompt for a mode'; }
   probe_outbound_udp() { printf 'probe\n' >> "$udp_probe_log"; return 1; }
@@ -11658,6 +11662,161 @@ test_public_install_contract_and_downloads_are_bounded() {
     'README must not describe Google QUIC as using the native VPS exit'
 }
 
+test_rules_auto_update_choices() {
+  source_without_main "$INSTALL_SCRIPT"
+  local root answer='' output rc=0 enabled=0
+  root="$(mktemp -d)"
+  CONFIG_FILE="$root/config.env"
+  read_input() { printf -v "$1" '%s' "$answer"; }
+  systemctl() { [ "$enabled" -eq 1 ]; }
+  output="$(select_rules_auto_update 2>/dev/null)"
+  assert_eq on "$output" 'fresh interactive install must enable daily rules on Enter' || return 1
+  answer=n
+  assert_eq off "$(select_rules_auto_update 2>/dev/null)" 'n must disable daily rules' || return 1
+  answer=Y
+  assert_eq on "$(select_rules_auto_update 2>/dev/null)" 'Y must enable daily rules' || return 1
+  read_input() { return 1; }
+  output="$(select_rules_auto_update 2>&1)" || rc=$?
+  assert_eq 1 "$rc" 'EOF must not silently enable automation' || return 1
+  INSTALL_NONINTERACTIVE=1
+  assert_eq on "$(select_rules_auto_update)" 'fresh unattended install defaults on' || return 1
+  : > "$CONFIG_FILE"
+  assert_eq off "$(select_rules_auto_update)" 'an existing disabled timer stays disabled' || return 1
+  enabled=1
+  assert_eq on "$(select_rules_auto_update)" 'an existing enabled timer stays enabled' || return 1
+  parse_install_options --non-interactive --auto-update off || return 1
+  assert_eq off "$(select_rules_auto_update)" 'explicit off overrides an enabled timer' || return 1
+  for answer in '--auto-update on' '--non-interactive --auto-update maybe' \
+    '--non-interactive --auto-update' '--non-interactive --auto-update on --auto-update off'; do
+    # Deliberately split a fixed, local argument fixture.
+    # shellcheck disable=SC2086
+    if parse_install_options $answer >/dev/null 2>&1; then
+      fail "invalid auto-update arguments were accepted: $answer"
+      return 1
+    fi
+  done
+}
+
+test_rules_update_preserves_runtime_and_recovers() {
+  source_without_main "$MANAGER_SCRIPT"
+  local root file events='' fetch_failed=0 start_failed=0 active=1 output rc=0
+  root="$(mktemp -d)"
+  APP_DIR="$root/app"
+  RULES_DIR="$APP_DIR/rules"
+  STATE_DIR="$root/state"
+  BIN_PATH=rules_manager
+  WARP_MODE=wireguard
+  WARP_SCOPE=google
+  mkdir -p "$RULES_DIR" "$root/official"
+  printf '8.8.8.0/24\n' > "$RULES_DIR/google_ipv4.txt"
+  printf '2001:4860::/32\n' > "$RULES_DIR/google_ipv6.txt"
+  printf '{"ipv4_count":1,"ipv6_count":1}\n' > "$RULES_DIR/rules.meta.json"
+  cp "$RULES_DIR/"* "$root/official/"
+  require_root() { :; }
+  load_config() { :; }
+  python3() {
+    [ "$fetch_failed" -eq 0 ] || return 1
+    [ "$1" = "$APP_DIR/scripts/generate-google-rules.py" ] || return 1
+    cp "$root/official/"* "$3/"
+  }
+  service_active() { [ "$active" -eq 1 ]; }
+  begin_runtime_maintenance() { events="${events}pause "; }
+  finish_runtime_maintenance() { events="${events}resume "; }
+  rules_manager() { events="${events}$* "; }
+  systemctl() {
+    events="${events}$* "
+    if [ "$1" = reload ] && [ "$start_failed" -eq 1 ]; then
+      start_failed=0
+      return 1
+    fi
+  }
+  output="$(cmd_update_rules)" || return 1
+  assert_contains "$output" '没有变化' 'unchanged ranges must be reported as a no-op' || return 1
+  # Run in this shell to inspect all service effects.
+  cmd_update_rules >/dev/null || return 1
+  assert_eq '' "$events" 'unchanged ranges must not pause services or rules' || return 1
+  fetch_failed=1
+  cmd_update_rules >/dev/null 2>&1 || rc=$?
+  assert_eq 1 "$rc" 'a source failure must fail the update' || return 1
+  assert_eq '' "$events" 'source failure must not touch services' || return 1
+  assert_eq '8.8.8.0/24' "$(< "$RULES_DIR/google_ipv4.txt")" 'source failure keeps current rules' || return 1
+  fetch_failed=0
+  printf '8.8.4.0/24\n' > "$root/official/google_ipv4.txt"
+  cmd_update_rules >/dev/null || return 1
+  assert_eq 'pause stop-rules reload warp-vps.service resume ' "$events" \
+    'changed rules reload routing only, preserving the WARP backend' || return 1
+  assert_eq '8.8.4.0/24' "$(< "$RULES_DIR/google_ipv4.txt")" 'new ranges must become active' || return 1
+  events=''
+  start_failed=1
+  printf '8.8.8.0/24\n' > "$root/official/google_ipv4.txt"
+  rc=0
+  cmd_update_rules >/dev/null 2>&1 || rc=$?
+  assert_eq 1 "$rc" 'routing activation failure must be reported' || return 1
+  assert_eq '8.8.4.0/24' "$(< "$RULES_DIR/google_ipv4.txt")" 'failed activation must restore old ranges' || return 1
+  assert_eq 'pause stop-rules reload warp-vps.service stop-rules reload warp-vps.service resume ' \
+    "$events" 'failed new routes must be cleared before old files are restored' || return 1
+  events=''
+  active=0
+  cmd_update_rules >/dev/null || return 1
+  assert_eq '' "$events" 'updating a paused installation must keep it paused' || return 1
+  active=1
+  WARP_SCOPE=global
+  printf '8.8.4.0/24\n' > "$root/official/google_ipv4.txt"
+  cmd_update_rules >/dev/null || return 1
+  assert_eq '' "$events" 'global WireGuard does not need routing changes for a Google list update' || return 1
+  WARP_MODE=socks
+  printf '8.8.8.0/24\n' > "$root/official/google_ipv4.txt"
+  cmd_update_rules >/dev/null || return 1
+  assert_contains "$events" 'reload warp-vps.service' 'global Socks must refresh its Google protocol rules' || return 1
+  for file in "$STATE_DIR/downloads/"* "$STATE_DIR/rollback/"*; do
+    [ "${file##*/}" = rules-update ] || { fail 'daily updates must reuse bounded staging and backup directories'; return 1; }
+  done
+}
+
+test_auto_update_dispatch_and_menu() {
+  source_without_main "$MANAGER_SCRIPT"
+  local calls='' rc=0
+  require_root() { :; }
+  cmd_update_rules() { calls="${calls}rules "; }
+  cmd_auto_update() { calls="${calls}auto:$1 "; }
+  run_with_runtime_lock() { calls="${calls}lock:$1 "; shift; "$@"; }
+  main update-rules
+  main auto-update on
+  main auto-update off
+  main auto-update status
+  assert_eq 'lock:wait rules lock:wait auto:on lock:wait auto:off auto:status ' "$calls" \
+    'mutations must share the runtime lock, while status remains read-only' || return 1
+  calls=''
+  main update-rules extra >/dev/null 2>&1 || rc=$?
+  assert_eq 2 "$rc" 'unexpected rule update arguments must fail before mutation' || return 1
+  rc=0
+  main auto-update extra >/dev/null 2>&1 || rc=$?
+  assert_eq 2 "$rc" 'invalid timer actions must fail before mutation' || return 1
+  assert_eq '' "$calls" 'invalid arguments must not take a lock or invoke an action' || return 1
+
+  source_without_main "$INSTALL_SCRIPT"
+  local answer_index=0 enabled=0
+  local answers=('11' '' '12' '' '12' '' '0')
+  calls=''
+  require_root() { :; }
+  print_installer_menu() { :; }
+  read_input() { printf -v "$1" '%s' "${answers[$answer_index]}"; answer_index=$((answer_index + 1)); }
+  systemctl() { [ "$enabled" -eq 1 ]; }
+  BIN_PATH=menu_rules_manager
+  menu_rules_manager() {
+    calls="${calls}$* "
+    if [ "$1" = auto-update ]; then
+      if [ "$2" = on ]; then enabled=1; else enabled=0; fi
+    fi
+  }
+  installer_menu >/dev/null || return 1
+  assert_eq 'update-rules auto-update on auto-update off ' "$calls" \
+    'the panel must invoke the shared rule updater and toggle the real timer state'
+}
+
+run_test 'daily rules install choices preserve existing settings' test_rules_auto_update_choices
+run_test 'rule refresh handles no-op failure rollback and both scopes' test_rules_update_preserves_runtime_and_recovers
+run_test 'rule update CLI and panel share the same actions' test_auto_update_dispatch_and_menu
 run_test 'install mode retries after invalid input' test_install_mode_reprompts
 run_test 'explicit install mode numbers remain stable' test_install_mode_keeps_explicit_numbers
 run_test 'fresh install mode default follows UDP evidence' test_fresh_install_mode_default_follows_udp_probe

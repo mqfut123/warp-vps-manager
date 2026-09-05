@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Generate fixed Google consumer-service CIDR snapshots.
-
-The project intentionally ships static rule files. Maintainers run this script
-locally, review the diff, then publish the updated snapshot to GitHub.
-"""
+"""Generate Google service CIDRs from the official Google and Cloud ranges."""
 
 from __future__ import annotations
 
@@ -21,7 +17,8 @@ CLOUD_URL = "https://www.gstatic.com/ipranges/cloud.json"
 
 
 def load_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=30) as response:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=30) as response:
         return json.loads(response.read())
 
 

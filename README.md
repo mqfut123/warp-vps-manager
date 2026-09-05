@@ -16,7 +16,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/mqfut123/warp-vps-manager/main/install.sh)
 ```
 
-全新交互安装默认选择 **Google 精准分流 + 1G Swap**，并根据出站 UDP 探测结果建议 WireGuard 或 Socks5。检测到已有项目安装时，再运行同一命令会进入管理菜单。
+全新交互安装默认选择 **Google 精准分流 + 1G Swap**，并根据出站 UDP 探测结果建议 WireGuard 或 Socks5。安装时会询问是否每天自动更新 Google IP 规则，提示为 `[Y/n]`，直接回车开启。检测到已有项目安装时，再运行同一命令会进入管理菜单。
 
 <details>
 <summary>安装默认值与 Swap 选项</summary>
@@ -100,7 +100,10 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 | `warp-vps unlock-check [--strict-exit]` | 检测当前 WARP IPv4 出口的 Gemini 和 YouTube Premium；严格退出模式仅在两项均明确可用时成功 |
 | `warp-vps change-ip [--policy all\|any]` | 最多更换 10 次 WARP 注册；默认两项服务均明确可用才停止 |
 | `warp-vps restart` | 重启 WARP 分流链路 |
-| `warp-vps update` | 更新程序与 Google IP 规则；不安装或升级运行依赖，旧版规则差异不会阻止更新 |
+| `warp-vps update` | 更新程序，保留当前 Google IP 规则；不安装或升级运行依赖 |
+| `warp-vps update-rules` | 立即从 Google 官方获取并更新 IP 规则 |
+| `warp-vps auto-update on` / `off` | 开启 / 关闭每天自动更新 Google IP 规则 |
+| `warp-vps auto-update status` | 查看规则自动更新设置 |
 | `warp-vps reinstall --scope global` | 保持运行模式并切换到全局 WARP |
 | `warp-vps reinstall --scope google` | 保持运行模式并切回 Google 精准分流 |
 | `warp-vps switch wireguard` | 切换到 WireGuard |
@@ -138,6 +141,18 @@ WireGuard 配置固定使用 `wgcf v2.2.32`，不会动态追随 GitHub `latest`
 
 ## IP 规则来源
 
-规则来自 Google 官方的 [公网 IP 列表](https://www.gstatic.com/ipranges/goog.json)，并排除 [Google Cloud 客户外部 IP](https://www.gstatic.com/ipranges/cloud.json)。维护者生成并审核固定快照后随项目发布；运行 `warp-vps update` 即可获取已发布的最新规则，不会在 VPS 上直接采用尚未审核的 Google 实时列表。
+规则来自 Google 官方的 [公网 IP 列表](https://www.gstatic.com/ipranges/goog.json)，并排除 [Google Cloud 客户外部 IP](https://www.gstatic.com/ipranges/cloud.json)。安装包附带初始规则；开启自动更新后，VPS 每天直接获取官方数据并重新生成规则，无需等待项目发布新的列表。
+
+运行 `warp-vps` 打开管理菜单：选项 **11** 立即更新规则，选项 **12** 开启或关闭自动更新。程序更新仍使用选项 **6**，不会覆盖本机已经更新过的规则。
+
+自动更新使用系统当地时间，每天午夜安排一次，并随机延迟最多 30 分钟；关机期间错过的任务在下次启动后补跑。规则没有变化时不重载分流；获取失败时保留现有规则，应用失败时恢复原规则。只更新规则时保留当前 WARP 注册和运行模式。
+
+全新非交互安装默认开启自动更新，可通过 `--auto-update off` 关闭；重装或切换模式默认保留当前开关，也可显式指定 `--auto-update on` 或 `off`。旧版通过 `warp-vps update` 升级后，可在菜单中开启，或运行 `warp-vps auto-update on`。
+
+查看最近一次自动更新结果：
+
+```bash
+journalctl -u warp-vps-rules-update.service -n 30 --no-pager
+```
 
 本项目使用 [MIT License](LICENSE)。

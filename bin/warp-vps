@@ -1618,6 +1618,12 @@ stop_rules_for_uninstall() {
 install_systemd() {
   require_root
   load_config
+  # Releases before the rule updater do not stage this existing repository asset.
+  if [ ! -f "${APP_DIR}/scripts/generate-google-rules.py" ]; then
+    install -d -m 0755 "${APP_DIR}/scripts" "${STATE_DIR}/downloads"
+    download_update_asset "scripts/generate-google-rules.py" "${STATE_DIR}/downloads/generate-google-rules.py"
+    install -m 0644 "${STATE_DIR}/downloads/generate-google-rules.py" "${APP_DIR}/scripts/generate-google-rules.py"
+  fi
   install -d -m 0755 "$ETC_DIR"
   if [ "$WARP_MODE" = "socks" ]; then
     render_redsocks_conf
@@ -1663,6 +1669,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=${BIN_PATH} start-rules
 ExecStop=${BIN_PATH} stop-rules
+ExecReload=${BIN_PATH} apply
 
 [Install]
 WantedBy=multi-user.target
@@ -1687,6 +1694,30 @@ OnBootSec=2min
 OnUnitActiveSec=5min
 AccuracySec=30s
 Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > /etc/systemd/system/warp-vps-rules-update.service <<EOF
+[Unit]
+Description=WARP VPS Manager Google IP 规则更新
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} update-rules
+EOF
+
+  cat > /etc/systemd/system/warp-vps-rules-update.timer <<'EOF'
+[Unit]
+Description=每天更新 Google IP 规则
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
 
 [Install]
 WantedBy=timers.target
@@ -3875,6 +3906,7 @@ backup_current_installation() {
   install -d -m 0755 "${backup}/bin" "${backup}/rules" "${backup}/missing"
   backup_update_file "${APP_DIR}/install.sh" "${backup}/install.sh" app-install 0755 "$backup" || return 1
   backup_update_file "${APP_DIR}/bin/warp-vps" "${backup}/bin/warp-vps" app-manager 0755 "$backup" || return 1
+  backup_update_file "${APP_DIR}/scripts/generate-google-rules.py" "${backup}/generate-google-rules.py" rule-generator 0644 "$backup" || return 1
   backup_update_file "${RULES_DIR}/google_ipv4.txt" "${backup}/rules/google_ipv4.txt" rules-ipv4 0644 "$backup" || return 1
   backup_update_file "${RULES_DIR}/google_ipv6.txt" "${backup}/rules/google_ipv6.txt" rules-ipv6 0644 "$backup" || return 1
   backup_update_file "${RULES_DIR}/rules.meta.json" "${backup}/rules/rules.meta.json" rules-meta 0644 "$backup" || return 1
@@ -3896,8 +3928,10 @@ backup_update_file() {
 
 activate_update_stage() {
   local stage="$1"
+  install -d -m 0755 "${APP_DIR}/scripts" || return 1
   install -m 0755 "${stage}/install.sh" "${APP_DIR}/install.sh" || return 1
   install -m 0755 "${stage}/bin/warp-vps" "${APP_DIR}/bin/warp-vps" || return 1
+  install -m 0644 "${stage}/scripts/generate-google-rules.py" "${APP_DIR}/scripts/generate-google-rules.py" || return 1
   install -m 0644 "${stage}/rules/google_ipv4.txt" "${RULES_DIR}/google_ipv4.txt" || return 1
   install -m 0644 "${stage}/rules/google_ipv6.txt" "${RULES_DIR}/google_ipv6.txt" || return 1
   install -m 0644 "${stage}/rules/rules.meta.json" "${RULES_DIR}/rules.meta.json" || return 1
@@ -3909,6 +3943,7 @@ restore_update_backup() {
   install -d -m 0755 "${backup}/failed-new" || return 1
   restore_update_file "${APP_DIR}/install.sh" "${backup}/install.sh" app-install 0755 "$backup" || return 1
   restore_update_file "${APP_DIR}/bin/warp-vps" "${backup}/bin/warp-vps" app-manager 0755 "$backup" || return 1
+  restore_update_file "${APP_DIR}/scripts/generate-google-rules.py" "${backup}/generate-google-rules.py" rule-generator 0644 "$backup" || return 1
   restore_update_file "${RULES_DIR}/google_ipv4.txt" "${backup}/rules/google_ipv4.txt" rules-ipv4 0644 "$backup" || return 1
   restore_update_file "${RULES_DIR}/google_ipv6.txt" "${backup}/rules/google_ipv6.txt" rules-ipv6 0644 "$backup" || return 1
   restore_update_file "${RULES_DIR}/rules.meta.json" "${backup}/rules/rules.meta.json" rules-meta 0644 "$backup" || return 1
@@ -3960,13 +3995,14 @@ cmd_update() {
   stage="${STATE_DIR}/downloads/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   backup="${STATE_DIR}/rollback/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   section "正在更新"
-  info_line "正在从 GitHub 同步脚本和固定规则快照"
-  install -d -m 0755 "${stage}/bin" "${stage}/rules"
+  info_line "正在从 GitHub 更新程序，保留当前 Google IP 规则"
+  install -d -m 0755 "${stage}/bin" "${stage}/rules" "${stage}/scripts"
   download_update_asset "install.sh" "${stage}/install.sh"
   download_update_asset "bin/warp-vps" "${stage}/bin/warp-vps"
-  download_update_asset "rules/google_ipv4.txt" "${stage}/rules/google_ipv4.txt"
-  download_update_asset "rules/google_ipv6.txt" "${stage}/rules/google_ipv6.txt"
-  download_update_asset "rules/rules.meta.json" "${stage}/rules/rules.meta.json"
+  download_update_asset "scripts/generate-google-rules.py" "${stage}/scripts/generate-google-rules.py"
+  install -m 0644 "${RULES_DIR}/google_ipv4.txt" "${stage}/rules/google_ipv4.txt"
+  install -m 0644 "${RULES_DIR}/google_ipv6.txt" "${stage}/rules/google_ipv6.txt"
+  install -m 0644 "${RULES_DIR}/rules.meta.json" "${stage}/rules/rules.meta.json"
   validate_update_stage "$stage"
   backup_current_installation "$backup" || die "无法备份当前安装，更新已中止"
   begin_runtime_maintenance || die "无法暂停健康检查，更新未修改运行态"
@@ -4021,6 +4057,76 @@ cmd_update() {
     die "更新失败，已恢复旧版本和原运行态"
   fi
   die "更新失败，且恢复旧版本后运行态仍无法重新加载，请运行 warp-vps logs 查看日志"
+}
+
+cmd_update_rules() {
+  require_root
+  load_config
+  local stage="${STATE_DIR}/downloads/rules-update"
+  local backup="${STATE_DIR}/rollback/rules-update"
+  local file reload=0 failed=0
+  local -a files=(google_ipv4.txt google_ipv6.txt rules.meta.json)
+  section "更新 Google IP 规则"
+  install -d -m 0755 "$stage" "$backup" || return 1
+  python3 "${APP_DIR}/scripts/generate-google-rules.py" --output "$stage" \
+    || { warn "获取 Google 官方规则失败，当前规则保持不变"; return 1; }
+  if cmp -s "$stage/google_ipv4.txt" "$RULES_DIR/google_ipv4.txt" \
+    && cmp -s "$stage/google_ipv6.txt" "$RULES_DIR/google_ipv6.txt"; then
+    ok_line "Google IP 规则没有变化"
+    return 0
+  fi
+  for file in "${files[@]}"; do
+    install -m 0644 "$RULES_DIR/$file" "$backup/$file" || return 1
+  done
+  if service_active warp-vps.service \
+    && { [ "$WARP_MODE" = "socks" ] || [ "$WARP_SCOPE" = "google" ]; }; then
+    reload=1
+    begin_runtime_maintenance || return 1
+    "$BIN_PATH" stop-rules || return 1
+  fi
+  for file in "${files[@]}"; do
+    install -m 0644 "$stage/$file" "$RULES_DIR/$file" || { failed=1; break; }
+  done
+  if [ "$failed" -eq 0 ] && [ "$reload" -eq 1 ]; then
+    systemctl reload warp-vps.service || failed=1
+  fi
+  if [ "$failed" -eq 1 ]; then
+    if [ "$reload" -eq 1 ]; then
+      "$BIN_PATH" stop-rules || return 1
+    fi
+    for file in "${files[@]}"; do
+      install -m 0644 "$backup/$file" "$RULES_DIR/$file" || return 1
+    done
+    if [ "$reload" -eq 1 ]; then
+      systemctl reload warp-vps.service || return 1
+      finish_runtime_maintenance
+    fi
+    warn "规则更新失败，已恢复原规则"
+    return 1
+  fi
+  [ "$reload" -eq 0 ] || finish_runtime_maintenance
+  ok_line "Google IP 规则已更新"
+}
+
+cmd_auto_update() {
+  require_root
+  case "$1" in
+    on)
+      systemctl enable --now warp-vps-rules-update.timer || return 1
+      ok_line "已开启每天自动更新 Google IP 规则"
+      ;;
+    off)
+      systemctl disable --now warp-vps-rules-update.timer || return 1
+      ok_line "已关闭 Google IP 规则自动更新"
+      ;;
+    status)
+      if systemctl is-enabled --quiet warp-vps-rules-update.timer; then
+        printf '已开启（每天）\n'
+      else
+        printf '已关闭\n'
+      fi
+      ;;
+  esac
 }
 
 cmd_heal() {
@@ -4346,6 +4452,8 @@ verify_project_units_for_uninstall() {
   local unit
   local wg_unit="wg-quick@${WG_IFACE}.service"
   local -a stop_units=(
+    warp-vps-rules-update.timer
+    warp-vps-rules-update.service
     warp-vps-health.timer
     warp-vps-health.service
     warp-vps.service
@@ -4353,6 +4461,7 @@ verify_project_units_for_uninstall() {
     "$wg_unit"
   )
   local -a enabled_units=(
+    warp-vps-rules-update.timer
     warp-vps-health.timer
     warp-vps.service
     warp-vps-redsocks.service
@@ -4373,6 +4482,9 @@ verify_project_units_for_uninstall() {
 stop_project_units_for_uninstall() {
   local unit
   local wg_unit="wg-quick@${WG_IFACE}.service"
+  systemctl disable --now warp-vps-rules-update.timer >/dev/null 2>&1 || true
+  systemctl stop warp-vps-rules-update.service >/dev/null 2>&1 || true
+  systemctl clean --what=state warp-vps-rules-update.timer >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.service >/dev/null 2>&1 || true
   systemctl stop warp-vps-health.timer >/dev/null 2>&1 || true
@@ -4581,6 +4693,9 @@ cmd_uninstall() {
   print_remove_target_if_exists /etc/systemd/system/warp-vps.service
   print_remove_target_if_exists /etc/systemd/system/warp-vps-health.service
   print_remove_target_if_exists /etc/systemd/system/warp-vps-health.timer
+  print_remove_target_if_exists /etc/systemd/system/warp-vps-rules-update.service
+  print_remove_target_if_exists /etc/systemd/system/warp-vps-rules-update.timer
+  print_remove_target_if_exists /etc/systemd/system/timers.target.wants/warp-vps-rules-update.timer
   print_remove_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service
   print_remove_target_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service
   print_remove_target_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer
@@ -4614,6 +4729,9 @@ cmd_uninstall() {
   remove_file_if_exists /etc/systemd/system/warp-vps.service
   remove_file_if_exists /etc/systemd/system/warp-vps-health.service
   remove_file_if_exists /etc/systemd/system/warp-vps-health.timer
+  remove_file_if_exists /etc/systemd/system/warp-vps-rules-update.service
+  remove_file_if_exists /etc/systemd/system/warp-vps-rules-update.timer
+  remove_file_if_exists /etc/systemd/system/timers.target.wants/warp-vps-rules-update.timer
   remove_file_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps-redsocks.service
   remove_file_if_exists /etc/systemd/system/multi-user.target.wants/warp-vps.service
   remove_file_if_exists /etc/systemd/system/timers.target.wants/warp-vps-health.timer
@@ -4652,10 +4770,12 @@ usage() {
                   检测当前 IPv4 出口；严格模式仅在两项均明确可用时成功退出
   change-ip [--policy all|any]
                   最多更换 10 次 WARP 注册；默认两项均明确可用才停止
-  update          更新脚本和固定规则快照
+  update          更新程序，保留当前 Google IP 规则
+  update-rules    从 Google 官方更新 IP 规则
+  auto-update on|off|status  开启、关闭或查看每日规则自动更新
   reinstall       非交互重装并保持当前模式
   reinstall [安装选项]
-                  非交互重装；支持 --mode、--scope、--swap、--socks-port
+                  非交互重装；支持 --mode、--scope、--swap、--socks-port、--auto-update
   switch wireguard|socks [安装选项]
                   非交互切换模式；复用同一安装事务
   logs            查看最近日志
@@ -4751,6 +4871,15 @@ main() {
       ;;
     restart) [ "$#" -eq 0 ] || { cli_error "restart 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_restart ;;
     update) [ "$#" -eq 0 ] || { cli_error "update 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_update ;;
+    update-rules) [ "$#" -eq 0 ] || { cli_error "update-rules 不接受参数"; return 2; }; run_with_runtime_lock wait cmd_update_rules ;;
+    auto-update)
+      [ "$#" -eq 1 ] || { cli_error "auto-update 需要 on、off 或 status"; return 2; }
+      case "$1" in
+        on|off) run_with_runtime_lock wait cmd_auto_update "$1" ;;
+        status) cmd_auto_update status ;;
+        *) cli_error "auto-update 只接受 on、off 或 status"; return 2 ;;
+      esac
+      ;;
     reinstall) cmd_reinstall "$@" ;;
     switch) cmd_switch "$@" ;;
     logs) [ "$#" -eq 0 ] || { cli_error "logs 不接受参数"; return 2; }; cmd_logs ;;

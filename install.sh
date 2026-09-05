@@ -58,6 +58,7 @@ INSTALL_SCOPE_OPTION=""
 INSTALL_SWAP_OPTION=""
 INSTALL_SWAP_EXPLICIT=0
 INSTALL_SOCKS_PORT_OPTION=""
+INSTALL_AUTO_UPDATE_OPTION=""
 
 log() { printf '[warp-vps] %s\n' "$*"; }
 die() { printf '[warp-vps] 错误：%s\n' "$*" >&2; exit 1; }
@@ -1494,9 +1495,10 @@ validate_existing_config() {
 
 stage_project_files() {
   PROJECT_STAGE_DIR="${STATE_DIR}/install-stage-$$"
-  install -d -m 0755 "$PROJECT_STAGE_DIR" "$PROJECT_STAGE_DIR/bin" "$PROJECT_STAGE_DIR/rules"
+  install -d -m 0755 "$PROJECT_STAGE_DIR" "$PROJECT_STAGE_DIR/bin" "$PROJECT_STAGE_DIR/rules" "$PROJECT_STAGE_DIR/scripts"
   fetch_asset "install.sh" "$PROJECT_STAGE_DIR/install.sh" 0755
   fetch_asset "bin/warp-vps" "$PROJECT_STAGE_DIR/bin/warp-vps" 0755
+  fetch_asset "scripts/generate-google-rules.py" "$PROJECT_STAGE_DIR/scripts/generate-google-rules.py" 0644
   fetch_asset "rules/google_ipv4.txt" "$PROJECT_STAGE_DIR/rules/google_ipv4.txt" 0644
   fetch_asset "rules/google_ipv6.txt" "$PROJECT_STAGE_DIR/rules/google_ipv6.txt" 0644
   fetch_asset "rules/rules.meta.json" "$PROJECT_STAGE_DIR/rules/rules.meta.json" 0644
@@ -1514,6 +1516,7 @@ backup_project_files() {
     "$PROJECT_BACKUP_DIR/missing" || return 1
   backup_project_file "${APP_DIR}/install.sh" "$PROJECT_BACKUP_DIR/app/install.sh" app-install 0755 || return 1
   backup_project_file "${APP_DIR}/bin/warp-vps" "$PROJECT_BACKUP_DIR/app/bin/warp-vps" app-manager 0755 || return 1
+  backup_project_file "${APP_DIR}/scripts/generate-google-rules.py" "$PROJECT_BACKUP_DIR/generate-google-rules.py" rule-generator 0644 || return 1
   backup_project_file "$WGCF_BIN" "$PROJECT_BACKUP_DIR/app/bin/wgcf" wgcf-binary 0755 || return 1
   backup_project_file "${APP_DIR}/rules/google_ipv4.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv4.txt" rules-ipv4 0644 || return 1
   backup_project_file "${APP_DIR}/rules/google_ipv6.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv6.txt" rules-ipv6 0644 || return 1
@@ -1531,6 +1534,10 @@ backup_project_files() {
     "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.service" unit-health 0644 || return 1
   backup_project_file /etc/systemd/system/warp-vps-health.timer \
     "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.timer" unit-health-timer 0644 || return 1
+  backup_project_file /etc/systemd/system/warp-vps-rules-update.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-rules-update.service" unit-rules-update 0644 || return 1
+  backup_project_file /etc/systemd/system/warp-vps-rules-update.timer \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-rules-update.timer" unit-rules-timer 0644 || return 1
 }
 
 backup_project_file() {
@@ -1547,9 +1554,10 @@ backup_project_file() {
 
 activate_project_files() {
   [ -n "$PROJECT_STAGE_DIR" ] || return 1
-  install -d -m 0755 "$APP_DIR" "$APP_DIR/bin" "$APP_DIR/rules" "$ETC_DIR" || return 1
+  install -d -m 0755 "$APP_DIR" "$APP_DIR/bin" "$APP_DIR/rules" "$APP_DIR/scripts" "$ETC_DIR" || return 1
   install -m 0755 "$PROJECT_STAGE_DIR/install.sh" "$APP_DIR/install.sh" || return 1
   install -m 0755 "$PROJECT_STAGE_DIR/bin/warp-vps" "$APP_DIR/bin/warp-vps" || return 1
+  install -m 0644 "$PROJECT_STAGE_DIR/scripts/generate-google-rules.py" "$APP_DIR/scripts/generate-google-rules.py" || return 1
   install -m 0644 "$PROJECT_STAGE_DIR/rules/google_ipv4.txt" "$APP_DIR/rules/google_ipv4.txt" || return 1
   install -m 0644 "$PROJECT_STAGE_DIR/rules/google_ipv6.txt" "$APP_DIR/rules/google_ipv6.txt" || return 1
   install -m 0644 "$PROJECT_STAGE_DIR/rules/rules.meta.json" "$APP_DIR/rules/rules.meta.json" || return 1
@@ -1561,6 +1569,7 @@ restore_project_files() {
   install -d -m 0755 "$PROJECT_BACKUP_DIR/failed-new" || return 1
   restore_project_file "$APP_DIR/install.sh" "$PROJECT_BACKUP_DIR/app/install.sh" app-install 0755 || return 1
   restore_project_file "$APP_DIR/bin/warp-vps" "$PROJECT_BACKUP_DIR/app/bin/warp-vps" app-manager 0755 || return 1
+  restore_project_file "$APP_DIR/scripts/generate-google-rules.py" "$PROJECT_BACKUP_DIR/generate-google-rules.py" rule-generator 0644 || return 1
   restore_project_file "$WGCF_BIN" "$PROJECT_BACKUP_DIR/app/bin/wgcf" wgcf-binary 0755 || return 1
   restore_project_file "$APP_DIR/rules/google_ipv4.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv4.txt" rules-ipv4 0644 || return 1
   restore_project_file "$APP_DIR/rules/google_ipv6.txt" "$PROJECT_BACKUP_DIR/app/rules/google_ipv6.txt" rules-ipv6 0644 || return 1
@@ -1578,6 +1587,10 @@ restore_project_files() {
     "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.service" unit-health 0644 || return 1
   restore_project_file /etc/systemd/system/warp-vps-health.timer \
     "$PROJECT_BACKUP_DIR/systemd/warp-vps-health.timer" unit-health-timer 0644 || return 1
+  restore_project_file /etc/systemd/system/warp-vps-rules-update.service \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-rules-update.service" unit-rules-update 0644 || return 1
+  restore_project_file /etc/systemd/system/warp-vps-rules-update.timer \
+    "$PROJECT_BACKUP_DIR/systemd/warp-vps-rules-update.timer" unit-rules-timer 0644 || return 1
 }
 
 restore_project_file() {
@@ -2110,6 +2123,33 @@ enable_health_timer() {
   return 0
 }
 
+select_rules_auto_update() {
+  local choice default=on prompt='[Y/n]'
+  if [ -n "$INSTALL_AUTO_UPDATE_OPTION" ]; then
+    printf '%s\n' "$INSTALL_AUTO_UPDATE_OPTION"
+    return 0
+  fi
+  if [ -e "$CONFIG_FILE" ] \
+    && ! systemctl is-enabled --quiet warp-vps-rules-update.timer; then
+    default=off
+    prompt='[y/N]'
+  fi
+  if [ "$INSTALL_NONINTERACTIVE" -eq 1 ]; then
+    printf '%s\n' "$default"
+    return 0
+  fi
+  while true; do
+    printf '\n是否每天自动更新 Google IP 规则？%s：' "$prompt" >&2
+    read_input choice || die "无法读取输入，已退出安装"
+    case "$choice" in
+      '') printf '%s\n' "$default"; return 0 ;;
+      y|Y|yes|YES|Yes) printf 'on\n'; return 0 ;;
+      n|N|no|NO|No) printf 'off\n'; return 0 ;;
+      *) printf '请输入 y 或 n。\n' >&2 ;;
+    esac
+  done
+}
+
 project_installation_present() {
   [ -x "$BIN_PATH" ] && [ -e "$CONFIG_FILE" ]
 }
@@ -2149,16 +2189,19 @@ print_installer_menu() {
   printf '当前模式：%s\n' "$(menu_mode_label)"
   printf '路由范围：%s\n' "$(menu_scope_label)"
   printf 'WARP 公网 IPv4：%s\n' "$(menu_warp_public_ipv4)"
+  printf 'Google 规则自动更新：%s\n' "$("$BIN_PATH" auto-update status)"
   printf '  1. 查看本地运行状态\n'
   printf '  2. 运行完整诊断\n'
   printf '  3. 检测原生出口 Gemini / YouTube Premium 解锁\n'
   printf '  4. 检测当前 WARP 出口 Gemini / YouTube Premium 解锁\n'
   printf '  5. 重启分流链路\n'
-  printf '  6. 更新脚本和 Google IP 规则\n'
+  printf '  6. 更新程序\n'
   printf '  7. 重装或切换路由范围 / 运行模式\n'
   printf '  8. 查看最近日志\n'
   printf '  9. 卸载\n'
   printf ' 10. 更换 WARP IP\n'
+  printf ' 11. 立即更新 Google IP 规则\n'
+  printf ' 12. 开启 / 关闭 Google 规则自动更新\n'
   printf '  0. 退出\n'
 }
 
@@ -2256,12 +2299,24 @@ installer_menu() {
         run_menu_manager_action change-ip
         finish_menu_action "WARP IP 更换" || return 0
         ;;
+      11)
+        run_menu_manager_action update-rules
+        finish_menu_action "Google IP 规则更新" || return 0
+        ;;
+      12)
+        if systemctl is-enabled --quiet warp-vps-rules-update.timer; then
+          run_menu_manager_action auto-update off
+        else
+          run_menu_manager_action auto-update on
+        fi
+        finish_menu_action "自动更新设置" || return 0
+        ;;
       0)
         printf '已退出管理菜单。\n'
         return 0
         ;;
       *)
-        printf '输入无效，请输入 0-10。\n' >&2
+        printf '输入无效，请输入 0-12。\n' >&2
         ;;
     esac
   done
@@ -2275,7 +2330,7 @@ installer_usage() {
   install.sh --install
   install.sh --install --non-interactive [--mode keep|wireguard|socks]
              [--scope keep|google|global] [--swap auto|none|N]
-             [--socks-port auto|PORT]
+             [--socks-port auto|PORT] [--auto-update on|off]
 
   无参数 / --menu  需要终端；未安装时开始安装，已有安装时进入管理菜单
   --install         需要终端；进入安装、重装或模式切换流程
@@ -2284,6 +2339,7 @@ installer_usage() {
   --scope            选择路由范围；keep 仅适用于已有安装
   --swap             auto 严格创建 1G；N 为严格创建的 GiB；none 跳过；省略时失败且已清理则继续
   --socks-port       Socks5 使用自动空闲端口或指定端口
+  --auto-update      每天自动更新 Google IP 规则；全新默认 on，已有安装保留当前设置
 EOF
 }
 
@@ -2293,13 +2349,14 @@ installer_cli_error() {
 }
 
 parse_install_options() {
-  local seen_noninteractive=0 seen_mode=0 seen_scope=0 seen_swap=0 seen_port=0 value
+  local seen_noninteractive=0 seen_mode=0 seen_scope=0 seen_swap=0 seen_port=0 seen_auto_update=0 value
   INSTALL_NONINTERACTIVE=0
   INSTALL_MODE_OPTION=""
   INSTALL_SCOPE_OPTION=""
   INSTALL_SWAP_OPTION=""
   INSTALL_SWAP_EXPLICIT=0
   INSTALL_SOCKS_PORT_OPTION=""
+  INSTALL_AUTO_UPDATE_OPTION=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -2366,14 +2423,24 @@ parse_install_options() {
         seen_port=1
         shift 2
         ;;
+      --auto-update)
+        [ "$seen_auto_update" -eq 0 ] || { installer_cli_error "--auto-update 不能重复"; return 2; }
+        [ "$#" -ge 2 ] || { installer_cli_error "--auto-update 缺少参数"; return 2; }
+        case "$2" in
+          on|off) INSTALL_AUTO_UPDATE_OPTION="$2" ;;
+          *) installer_cli_error "--auto-update 只接受 on 或 off"; return 2 ;;
+        esac
+        seen_auto_update=1
+        shift 2
+        ;;
       *) installer_cli_error "未知安装参数：$1"; return 2 ;;
     esac
   done
 
   if [ "$INSTALL_NONINTERACTIVE" -eq 0 ] \
     && { [ "$seen_mode" -eq 1 ] || [ "$seen_scope" -eq 1 ] \
-      || [ "$seen_swap" -eq 1 ] || [ "$seen_port" -eq 1 ]; }; then
-    installer_cli_error "--mode、--scope、--swap 和 --socks-port 必须与 --non-interactive 一起使用"
+      || [ "$seen_swap" -eq 1 ] || [ "$seen_port" -eq 1 ] || [ "$seen_auto_update" -eq 1 ]; }; then
+    installer_cli_error "--mode、--scope、--swap、--socks-port 和 --auto-update 必须与 --non-interactive 一起使用"
     return 2
   fi
 }
@@ -2431,7 +2498,7 @@ main() {
   validate_repo_raw_base "$REPO_RAW_BASE"
 
   local selected_mode selected_scope warp_port redsocks_port redsocks_uid redsocks_group redsocks_bin
-  local post_install_unlock_choice
+  local post_install_unlock_choice selected_auto_update
   local reusable_warp_port=""
   local reusable_redsocks_port=""
   local prompted_mode prompted_scope locked_mode locked_scope locked_warp_port locked_redsocks_port
@@ -2449,6 +2516,7 @@ main() {
   collect_swap_choice
   selected_scope="$(select_route_scope "$prompted_scope")"
   selected_mode="$(select_install_mode "$prompted_mode" "$selected_scope")"
+  selected_auto_update="$(select_rules_auto_update)"
   TARGET_MODE="$selected_mode"
   if [ "$selected_mode" = "wireguard" ] && [ -n "$INSTALL_SOCKS_PORT_OPTION" ]; then
     installer_cli_error "WireGuard 模式不能使用 --socks-port"
@@ -2604,6 +2672,9 @@ main() {
   INSTALL_CLEANUP_ARMED=0
   trap - EXIT
   release_operation_lock
+
+  "$BIN_PATH" auto-update "$selected_auto_update" \
+    || log "规则自动更新设置未完成；可在管理菜单中重新设置"
 
   printf '\nWARP VPS Manager 安装完成。\n'
   if [ "$selected_mode" = "socks" ]; then
