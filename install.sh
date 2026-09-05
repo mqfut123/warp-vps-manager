@@ -1352,7 +1352,7 @@ read_previous_wireguard_runtime() {
   PREVIOUS_MODE=""
   [ -r "$CONFIG_FILE" ] || return 0
 
-  local line value
+  local line value config=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       WARP_MODE=*)
@@ -1368,13 +1368,15 @@ read_previous_wireguard_runtime() {
         fi
         ;;
       WG_CONFIG=*)
-        value="${line#*=}"
-        if valid_runtime_path "$value"; then
-          PREVIOUS_WG_CONFIG="$value"
-        fi
+        config="${line#*=}"
         ;;
     esac
   done < "$CONFIG_FILE"
+  if valid_runtime_path "$config"; then
+    PREVIOUS_WG_CONFIG="$config"
+  else
+    PREVIOUS_WG_CONFIG="/etc/wireguard/${PREVIOUS_WG_IFACE}.conf"
+  fi
   return 0
 }
 
@@ -1473,7 +1475,7 @@ PY
 validate_existing_config() {
   [ -e "$CONFIG_FILE" ] || return 0
   [ -r "$CONFIG_FILE" ] || die "现有配置无法读取，未修改当前运行态：$CONFIG_FILE"
-  local line mode="" iface="warp-vps-wg" config="/etc/wireguard/warp-vps-wg.conf"
+  local line mode="" iface="warp-vps-wg" config=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       WARP_MODE=*) mode="${line#*=}" ;;
@@ -1482,8 +1484,10 @@ validate_existing_config() {
     esac
   done < "$CONFIG_FILE"
   [ "$mode" = "wireguard" ] || return 0
+  iface="${iface:-warp-vps-wg}"
   valid_runtime_iface "$iface" \
     || die "现有 WireGuard 网卡名无效，未修改当前运行态：$iface"
+  config="${config:-/etc/wireguard/${iface}.conf}"
   valid_runtime_path "$config" \
     || die "现有 WireGuard 配置路径无效，未修改当前运行态：$config"
 }

@@ -942,7 +942,7 @@ select_working_wireguard_endpoint() {
     fi
     ipv4_ready=0
     for attempt in 1 2; do
-      if curl -4 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
+      if curl -q -4 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
         --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
         https://www.google.com/generate_204; then
         ipv4_ready=1
@@ -957,7 +957,7 @@ select_working_wireguard_endpoint() {
     case "$after4" in ''|*[!0-9]*) continue ;; esac
     [ "$after4" -gt "$before" ] || continue
 
-    if ! curl -6 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
+    if ! curl -q -6 -sS --noproxy '*' --connect-timeout "$WG_PREFLIGHT_CONNECT_TIMEOUT" \
       --max-time "$WG_PREFLIGHT_MAX_TIME" -o /dev/null \
       https://www.google.com/generate_204; then
       warn_line "该对端的隧道内 Google IPv6 未返回：${endpoint}"
@@ -2871,7 +2871,7 @@ curl_unlock_page() {
 
   if ! raw="$(
     http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
-      curl -4 --noproxy '*' -sSL \
+      curl -q -4 --noproxy '*' -sSL \
       --connect-timeout "$UNLOCK_CONNECT_TIMEOUT" --max-time "$UNLOCK_MAX_TIME" \
       -A "$UNLOCK_TEST_UA" \
       -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
@@ -3408,7 +3408,7 @@ google_http_probe() {
   local family="$1"
   http_proxy='' https_proxy='' all_proxy='' HTTP_PROXY='' HTTPS_PROXY='' ALL_PROXY='' \
     no_proxy='*' NO_PROXY='*' \
-    curl "$family" --noproxy '*' -sS --connect-timeout 5 --max-time 12 -o /dev/null \
+    curl -q "$family" --noproxy '*' -sS --connect-timeout 5 --max-time 12 -o /dev/null \
       https://www.google.com/generate_204 >/dev/null 2>&1
 }
 

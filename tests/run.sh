@@ -3277,6 +3277,9 @@ test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
     esac
   }
   curl() {
+    assert_eq '-q' "$1" \
+      'endpoint probes must ignore user curlrc before interpreting other options' || return 1
+    shift
     curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
     [ "$mock_current_endpoint" = '162.159.192.1:500' ] || return 28
     case "$1" in
@@ -3308,6 +3311,9 @@ test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
   curl_calls=''
   candidates=$'162.159.192.1:2408\n[2606:4700:d0::a29f:c001]:2408'
   curl() {
+    assert_eq '-q' "$1" \
+      'endpoint probes must ignore user curlrc before interpreting other options' || return 1
+    shift
     curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
     [ "$mock_current_endpoint" = '[2606:4700:d0::a29f:c001]:2408' ] || return 28
     case "$1" in
@@ -3328,6 +3334,9 @@ test_wireguard_endpoint_selection_falls_back_and_requires_dual_stack() {
   mock_received=0
   candidates='162.159.192.1:2408'
   curl() {
+    assert_eq '-q' "$1" \
+      'endpoint probes must ignore user curlrc before interpreting other options' || return 1
+    shift
     if [ "$1" = '-4' ]; then mock_received=512; return 0; fi
     return 28
   }
@@ -3361,6 +3370,9 @@ test_wireguard_endpoint_selection_retries_the_same_endpoint() {
     esac
   }
   curl() {
+    assert_eq '-q' "$1" \
+      'endpoint probes must ignore user curlrc before interpreting other options' || return 1
+    shift
     curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
     [ "$mock_current_endpoint" = '162.159.192.1:2408' ] || return 28
     case "$1" in
@@ -3394,6 +3406,9 @@ test_wireguard_endpoint_selection_retries_the_same_endpoint() {
   curl_calls=''
   candidates='162.159.192.1:2408'
   curl() {
+    assert_eq '-q' "$1" \
+      'endpoint probes must ignore user curlrc before interpreting other options' || return 1
+    shift
     curl_calls="${curl_calls}${mock_current_endpoint} $1"$'\n'
     return 28
   }
@@ -3422,6 +3437,9 @@ test_wireguard_endpoint_selection_requires_handshake_and_receive() {
     esac
   }
   curl() {
+    assert_eq '-q' "$1" \
+      'endpoint probes must ignore user curlrc before interpreting other options' || return 1
+    shift
     case "$1" in
       -4) mock_received=256 ;;
       -6) mock_received=512 ;;
@@ -3445,6 +3463,9 @@ test_wireguard_endpoint_selection_requires_handshake_and_receive() {
 
   mock_received=0
   curl() {
+    assert_eq '-q' "$1" \
+      'endpoint probes must ignore user curlrc before interpreting other options' || return 1
+    shift
     if [ "$1" = '-4' ]; then
       mock_received=256
     fi
@@ -3456,9 +3477,9 @@ test_wireguard_endpoint_selection_requires_handshake_and_receive() {
   fi
 
   body="$(function_body "$MANAGER_SCRIPT" select_working_wireguard_endpoint)"
-  assert_contains "$body" 'curl -4 -sS' \
+  assert_contains "$body" 'curl -q -4 -sS' \
     'an IPv4 HTTP response of any status must prove transport reachability' || return 1
-  assert_contains "$body" 'curl -6 -sS' \
+  assert_contains "$body" 'curl -q -6 -sS' \
     'an IPv6 HTTP response of any status must prove transport reachability' || return 1
   assert_contains "$body" "--noproxy '*'" \
     'endpoint validation must bypass environment proxies' || return 1
@@ -3466,9 +3487,9 @@ test_wireguard_endpoint_selection_requires_handshake_and_receive() {
     'endpoint failures must identify the tunneled address family' || return 1
   assert_contains "$body" '隧道内 Google IPv6 未返回' \
     'endpoint failures must identify the tunneled address family' || return 1
-  assert_not_contains "$body" 'curl -4 -fsS' \
+  assert_not_contains "$body" 'curl -q -4 -fsS' \
     'HTTP policy errors must not be confused with an IPv4 transport failure' || return 1
-  assert_not_contains "$body" 'curl -6 -fsS' \
+  assert_not_contains "$body" 'curl -q -6 -fsS' \
     'HTTP policy errors must not be confused with an IPv6 transport failure'
 }
 
@@ -7081,6 +7102,8 @@ test_unlock_http_transport_ignores_environment_proxies() {
   simulated_body=$'first line\nsecond line with 500\tmetadata-like text'
 
   curl() {
+    assert_eq '-q' "$1" \
+      'unlock requests must ignore user curlrc' || return 1
     {
       printf 'http_proxy=%s\n' "${http_proxy-}"
       printf 'https_proxy=%s\n' "${https_proxy-}"
@@ -7149,6 +7172,77 @@ test_unlock_http_transport_ignores_environment_proxies() {
   curl_unlock_page 'https://example.invalid/unlock' >/dev/null || rc=$?
   assert_eq '1' "$rc" \
     'a curl transport error must fail before producing a canonical HTTP response'
+}
+
+test_http_probes_ignore_user_curl_config() {
+  local curl_config_dir
+  curl_config_dir="$(mktemp -d)"
+  python3 - "$MANAGER_SCRIPT" "$curl_config_dir" <<'PY'
+import http.server
+import os
+import pathlib
+import subprocess
+import sys
+import threading
+
+manager, config_dir = sys.argv[1:]
+config_dir = pathlib.Path(config_dir)
+output_file = config_dir / "redirected-body"
+(config_dir / ".curlrc").write_text(
+    'cookie = "test_cookie=synthetic"\n'
+    'header = "X-Test-Curlrc: synthetic"\n'
+    'fail\n'
+    f'output = "{output_file}"\n',
+    encoding="utf-8",
+)
+requests = []
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        requests.append((self.headers.get("Cookie"), self.headers.get("X-Test-Curlrc")))
+        body = b"45631641,null,true"
+        self.send_response(int(self.path.strip("/")))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        pass
+
+with http.server.HTTPServer(("127.0.0.1", 0), Handler) as server:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    environment = dict(os.environ, CURL_HOME=str(config_dir))
+    try:
+        for status in (200, 403, 429):
+            url = f"http://127.0.0.1:{server.server_port}/{status}"
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; curl_unlock_page "$2"', "test", manager, url],
+                env=environment, capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0, (status, result.stderr)
+            assert result.stdout == f"{status}\t{url}\n45631641,null,true", result.stdout
+            # Keep the production probe arguments; replace only its remote URL.
+            probe = '''source "$1"
+curl() {
+  local args=("$@")
+  args[${#args[@]}-1]="$WARP_TEST_URL"
+  command curl "${args[@]}"
+}
+google_http_probe -4
+'''
+            result = subprocess.run(
+                ["bash", "-c", probe, "test", manager],
+                env=dict(environment, WARP_TEST_URL=url),
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0, (status, result.stderr)
+        assert requests == [(None, None)] * 6, requests
+        assert not output_file.exists(), "curlrc must not redirect probe output"
+    finally:
+        server.shutdown()
+        thread.join()
+PY
 }
 
 test_unlock_check_requires_both_services() {
@@ -7982,6 +8076,8 @@ test_http_probe_accepts_http_error_responses() {
   source_without_main "$MANAGER_SCRIPT"
   local curl_calls='' curl_environment='' simulated_http_status=429 arg
   curl() {
+    assert_eq '-q' "$1" \
+      'connectivity probes must ignore user curlrc fail settings' || return 1
     curl_calls="${curl_calls}$*\n"
     curl_environment="${http_proxy-}|${https_proxy-}|${all_proxy-}|${HTTP_PROXY-}|${HTTPS_PROXY-}|${ALL_PROXY-}|${no_proxy-}|${NO_PROXY-}"
     for arg in "$@"; do
@@ -11345,6 +11441,37 @@ test_reused_socks_post_restart_failure_restores_old_redsocks() {
     'the post-restart failure should report successful old-runtime restoration'
 }
 
+test_reinstall_wireguard_config_defaults_match_manager() {
+  local root configured_path configured_iface expected_path actual_path
+  root="$(mktemp -d)"
+  for configured_iface in custom-wg '' absent; do
+    for configured_path in absent '' /etc/wireguard/explicit.conf; do
+      printf 'WARP_MODE=wireguard\n' > "$root/config.env"
+      if [ "$configured_iface" != absent ]; then
+        printf 'WG_IFACE=%s\n' "$configured_iface" >> "$root/config.env"
+      fi
+      if [ "$configured_path" != absent ]; then
+        printf 'WG_CONFIG=%s\n' "$configured_path" >> "$root/config.env"
+      fi
+      expected_path="$(
+        source_without_main "$MANAGER_SCRIPT"
+        CONFIG_FILE="$root/config.env"
+        load_config
+        printf '%s\n' "$WG_CONFIG"
+      )" || return 1
+      actual_path="$(
+        source_without_main "$INSTALL_SCRIPT"
+        CONFIG_FILE="$root/config.env"
+        validate_existing_config
+        read_previous_wireguard_runtime
+        printf '%s\n' "$PREVIOUS_WG_CONFIG"
+      )" || return 1
+      assert_eq "$expected_path" "$actual_path" \
+        'reinstall and manager must resolve the same WireGuard config' || return 1
+    done
+  done
+}
+
 test_reinstall_stops_previous_custom_wireguard_runtime() {
   source_without_main "$INSTALL_SCRIPT"
   CONFIG_FILE="${FIXTURE_DIR}/config/custom-wireguard.env"
@@ -11667,6 +11794,7 @@ run_test 'unlock probes accept the first successful HTTP response' test_unlock_p
 run_test 'unlock probes retry only transport failures once' test_unlock_transport_retries_only_transport_failures_once
 run_test 'all unlock entrypoints share the current detector' test_all_unlock_entrypoints_share_current_logic
 run_test 'unlock HTTP requests ignore environment proxies' test_unlock_http_transport_ignores_environment_proxies
+run_test 'HTTP probes ignore user curlrc cookies output and fail settings' test_http_probes_ignore_user_curl_config
 run_test 'unlock advisory and strict exits preserve the all-services aggregate' test_unlock_check_requires_both_services
 run_test 'unlock policy stays local and reports each service' test_unlock_policy_is_local_and_each_service_is_still_reported
 run_test 'unlock check rejects a missing curl dependency' test_unlock_check_missing_curl_is_not_a_pass
@@ -11745,6 +11873,7 @@ run_test 'partial activation failure restores the old runtime' test_partial_acti
 run_test 'service activation failure restores the old runtime' test_service_activation_failure_invokes_old_runtime_restore
 run_test 'reused Socks post-restart failure restores old redsocks' test_reused_socks_post_restart_failure_restores_old_redsocks
 run_test 'reinstall stops the previous custom WireGuard runtime' test_reinstall_stops_previous_custom_wireguard_runtime
+run_test 'reinstall WireGuard config defaults match the manager' test_reinstall_wireguard_config_defaults_match_manager
 run_test 'WireGuard uninstall can delete its stuck interface' test_wireguard_uninstall_has_interface_fallback
 run_test 'wgcf maps MIPS and s390x assets' test_wgcf_mips_and_s390x_asset_mapping
 run_test 'main is the single public project source' test_main_is_the_single_public_update_source
