@@ -10,6 +10,8 @@ permissions:
 jobs:
   shell-regressions:
     name: Shell regressions (${{ matrix.arch }})
+    # GitHub-hosted runners serve the public mirror. The private development repository runs dev-ci.yml on the NAS instead.
+    if: ${{ !github.event.repository.private }}
     strategy:
       fail-fast: false
       matrix:

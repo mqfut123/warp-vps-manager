@@ -3,6 +3,5 @@ __pycache__/
 *.pyc
 *.tmp
 *.log
-
-/localwork/
-/cowork
+/.codex-worktrees/
+/.codex-tmp/
